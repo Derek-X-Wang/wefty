@@ -28,6 +28,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -224,7 +225,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 			points[name] = offset + value
 		}
 		// Only one settle branch runs per call; record which one (#1479).
-		for _, name := range []string{"frame_baseline", "frame_update_seen", "frame_update_timeout", "capture_reopened"} {
+		for _, name := range []string{"frame_baseline", "frame_update_seen", "frame_update_timeout", "capture_drained"} {
 			if value, ok := reply.Debug.Phases[name]; ok {
 				points[name] = offset + value
 			}
@@ -258,6 +259,51 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		return ownerFabric.Dial(ctx, network, host)
 	}}
 	defer transport.CloseIdleConnections()
+	// Prove the CLI's timeout capture on this Seat's x11vnc, through the node
+	// front door (#1484). Run after SC-1 so the colour page cannot affect its
+	// timings. The page changes colour only through real control connections.
+	probeCtx, stopProbe := context.WithTimeout(ctx, 2*time.Minute)
+	ctrExec := func(ctx context.Context, execID string, script string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "ctr", append([]string{"--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", execID, "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place) + script}, args...)...)
+	}
+	inputCapture, probeErr := computerconformance.ProbeInputCapture(probeCtx, computerconformance.InputCaptureProbeOptions{
+		Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+			ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
+			if err != nil {
+				return nil, nil, err
+			}
+			stop := context.AfterFunc(ctx, func() { _ = ws.CloseNow() })
+			close := func() { stop(); _ = ws.CloseNow() }
+			ws.SetReadLimit(128 << 20)
+			client, err := rfbclient.Open(websocket.NetConn(ctx, ws, websocket.MessageBinary))
+			if err != nil {
+				close()
+				return nil, nil, err
+			}
+			return client, close, nil
+		},
+		Prepare: func(ctx context.Context, attempt int) (string, error) {
+			output, err := ctrExec(ctx, fmt.Sprintf("input-capture-colour-%d", attempt), computerconformance.InputCaptureProbeLaunchScript, "sh", computerconformance.InputCaptureProbeURL()).CombinedOutput()
+			return fmt.Sprintf("launch attempt=%d status=%v output=%s", attempt, err, output), err
+		},
+		Diagnostics: func(ctx context.Context) string {
+			output, err := ctrExec(ctx, fmt.Sprintf("input-capture-log-%d", time.Now().UnixNano()), computerconformance.InputCaptureProbeDiagnosticsScript).CombinedOutput()
+			return fmt.Sprintf("diagnostics status=%v output=%s", err, output)
+		},
+		Report: func(message string) { t.Log(message) },
+	})
+	stopProbe()
+	// The probe has logged every trial and its summary, including on errors.
+	seatMust(t, probeErr)
+	if stale := inputCapture.StaleCaptures(); stale > 0 {
+		t.Errorf("input-capture proof: %d C captures showed the screen from before a visible change", stale)
+	}
+	if conclusive := inputCapture.ConclusiveCaptures(); conclusive < computerconformance.InputCaptureMinConclusive {
+		t.Errorf("input-capture proof: only %d of 6 C trials were conclusive (need %d)", conclusive, computerconformance.InputCaptureMinConclusive)
+	}
+	if returned := inputCapture.ReturnedTimeoutCaptures(); returned < computerconformance.InputCaptureMinReturned {
+		t.Errorf("input-capture proof: only %d of 3 T trials timed out and returned (need %d)", returned, computerconformance.InputCaptureMinReturned)
+	}
 	// A person's Take control uses the real node tenure and real L1 event path.
 	ws, response, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/person/websockify", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, Subprotocols: []string{"binary"}})
 	seatMust(t, err)
@@ -303,6 +349,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	rss := screenLaneX11RSS(t, ctx, store, ready)
 	// Both observations are logged even when one exceeds its limit.
 	evidence, _ := json.MarshalIndent(map[string]any{
+		"input_capture":        inputCapture,
 		"sc1_phase_ms":         map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
 		"x11vnc_rss_kib":       rss,
 		"sc1_ms":               float64(sc1.Microseconds()) / 1000,
