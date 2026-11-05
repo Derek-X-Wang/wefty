@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,17 +31,16 @@ const (
 	// (rfb_banner to frame_baseline), the phase an x11vnc nap delays. #1479
 	// measured 15-130 ms with -nonap -sb 0 and 1025-1868 ms without.
 	IdleWakeBaselineGate = 500 * time.Millisecond
-	// x11vnc answers a held incremental request with a 1x1 heartbeat about
-	// every 5 s on an unchanged screen (scan.c ping_clients).
-	IdleWakePendingLimit = 10 * time.Second
+	// After the deadline the observer still compares an update already in
+	// flight for this long, then closes its connection.
+	IdleWakeGrace = time.Second
 )
 
 // IdleWakeObservation is what the lane saw before it timed the idle-wake call.
 type IdleWakeObservation struct {
 	SinceInput time.Duration   // from the test's last input to the timed call
-	FirstFrame time.Time       // when the observer's first full frame was complete
-	Observed   time.Duration   // first full frame to the last full check, all static
-	Updates    int             // incremental updates compared in between
+	Observed   time.Duration   // first full frame to the deadline, with no changed update
+	Updates    int             // completed updates compared; 0 is normal on a static screen
 	Changed    int             // differing pixels in the first update that changed
 	ChangedBox image.Rectangle // where they are
 	ChangedAt  time.Duration   // when that update arrived, after the first frame
@@ -63,22 +63,26 @@ func (o IdleWakeObservation) Premise() error {
 	return nil
 }
 
-// ObserveIdleScreen watches one view-role RFB connection until `until`. It
-// takes a full first frame with rfbclient, then reads every later update
-// itself and compares each update's pixels with the first frame as it
-// arrives, so a change that reverts before a later frame still counts.
-// rfbclient reports only whether an update arrived, and its frame captures
-// fold updates together, so neither can show this. x11vnc's 1x1 heartbeat on
-// an unchanged screen passes because its pixels match. At `until` it waits
-// up to IdleWakePendingLimit for the reply to its outstanding request, then,
-// with nothing outstanding, asks for the full screen and compares every
-// update until all pixels are covered. The caller closes wire afterwards;
-// that also bounds every read.
-func ObserveIdleScreen(wire io.ReadWriter, until time.Time) IdleWakeObservation {
-	return observeIdleScreen(wire, until, IdleWakePendingLimit)
+// ObserveIdleScreen watches one view-role RFB connection until `until`, then
+// for IdleWakeGrace more, and closes wire. It takes a full first frame with
+// rfbclient, then keeps one incremental request outstanding and compares
+// every completed update's pixels with the first frame as it arrives, so a
+// change that reverts before a later frame still counts. rfbclient reports
+// only whether an update arrived, and its frame captures fold updates
+// together, so neither can show this.
+//
+// There is no final full frame. x11vnc 0.9.16 sends no heartbeat without
+// -ping, so it may never answer a held request on a static screen; a fresh
+// view connection's first frame can be stale (#1484). Neither is needed: a
+// redraw does not reset the control role's no-framebuffer-data nap timer, so
+// the premise only has to show that the screen was not busy in the window.
+// An update still incomplete when the grace ends is ignored.
+func ObserveIdleScreen(wire io.ReadWriteCloser, until time.Time) IdleWakeObservation {
+	return observeIdleScreen(wire, until, time.Now, time.After)
 }
 
-func observeIdleScreen(wire io.ReadWriter, until time.Time, pendingLimit time.Duration) (observation IdleWakeObservation) {
+func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time.Time, after func(time.Duration) <-chan time.Time) (observation IdleWakeObservation) {
+	defer wire.Close() // After the grace this close ends the reader; that is the normal end.
 	client, err := rfbclient.Open(wire)
 	if err != nil {
 		observation.Err = err
@@ -89,8 +93,7 @@ func observeIdleScreen(wire io.ReadWriter, until time.Time, pendingLimit time.Du
 		observation.Err = err
 		return observation
 	}
-	firstAt := time.Now()
-	observation.FirstFrame = firstAt
+	firstAt := now()
 	// rfbclient reads the wire unbuffered and has no request outstanding
 	// after Frame, so the next byte on the wire starts a new server message.
 	updates := make(chan idleWakeUpdate)
@@ -109,88 +112,42 @@ func observeIdleScreen(wire io.ReadWriter, until time.Time, pendingLimit time.Du
 			}
 		}
 	}()
-	width, height := client.Width, client.Height
-	request := func(incremental bool) error {
-		message := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-		if incremental {
-			message[1] = 1
-		}
-		binary.BigEndian.PutUint16(message[6:], uint16(width))
-		binary.BigEndian.PutUint16(message[8:], uint16(height))
+	request := func() error {
+		message := []byte{3, 1, 0, 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint16(message[6:], uint16(client.Width))
+		binary.BigEndian.PutUint16(message[8:], uint16(client.Height))
 		_, err := wire.Write(message)
 		return err
 	}
-	changed := func(update idleWakeUpdate) bool {
-		if update.err != nil {
-			observation.Err = update.err
-			return true
-		}
-		if update.changed > 0 {
-			observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, time.Since(firstAt)
-			return true
-		}
-		return false
-	}
-	if observation.Err = request(true); observation.Err != nil {
+	if observation.Err = request(); observation.Err != nil {
 		return observation
 	}
-	deadline := time.NewTimer(time.Until(until))
-	defer deadline.Stop()
-watch:
+	deadline, grace := after(until.Sub(firstAt)), (<-chan time.Time)(nil)
 	for {
 		select {
 		case update := <-updates:
-			if changed(update) {
+			if update.err != nil {
+				observation.Err = update.err
+				return observation
+			}
+			if update.changed > 0 {
+				observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, now().Sub(firstAt)
 				return observation
 			}
 			observation.Updates++
 			if len(update.rects) == 0 {
 				time.Sleep(20 * time.Millisecond) // Pace empty replies.
 			}
-			if observation.Err = request(true); observation.Err != nil {
+			if observation.Err = request(); observation.Err != nil {
 				return observation
 			}
-		case <-deadline.C:
-			break watch
-		}
-	}
-	// One incremental request is outstanding. Compare its reply first, so the
-	// final full request is the only one outstanding and no earlier reply can
-	// complete the final check.
-	pending := time.NewTimer(pendingLimit)
-	defer pending.Stop()
-	select {
-	case update := <-updates:
-		if changed(update) {
+		case <-deadline:
+			deadline, grace = nil, after(IdleWakeGrace)
+		case <-grace:
+			observation.Observed = max(until.Sub(firstAt), 0)
 			return observation
 		}
-		observation.Updates++
-	case <-pending.C:
-		observation.Err = fmt.Errorf("observer: no reply to the pending request within %s", pendingLimit)
-		return observation
 	}
-	if observation.Err = request(false); observation.Err != nil {
-		return observation
-	}
-	seen, covered := make([]bool, width*height), 0
-	for covered < len(seen) {
-		update := <-updates
-		if changed(update) {
-			return observation
-		}
-		for _, rect := range update.rects {
-			for y := rect.Min.Y; y < rect.Max.Y; y++ {
-				for x := rect.Min.X; x < rect.Max.X; x++ {
-					if !seen[y*width+x] {
-						seen[y*width+x] = true
-						covered++
-					}
-				}
-			}
-		}
-	}
-	observation.Observed = time.Since(firstAt)
-	return observation
 }
 
 type idleWakeUpdate struct {
@@ -297,50 +254,29 @@ func TestIdleWakePremise(t *testing.T) {
 	}
 }
 
-// idleWakeFake is a scripted RFB server on a 4x3 screen. Its first full
-// request returns first, later ones last. Each incremental request gets the
-// next scripted update after its delay. Once the script ends, a request gets
-// a 1x1 heartbeat after heartbeat, as on x11vnc; with no heartbeat it is
-// held, and a later full request answers both at once, as LibVNCServer does.
+// idleWakeFake is an RFB server on a 4x3 screen, driven by its test. It
+// answers the full request with first and holds every incremental request,
+// as x11vnc does when nothing changed, until the test answers it.
 type idleWakeFake struct {
-	first, last color.RGBA
-	updates     []idleWakeFakeUpdate
-	heartbeat   time.Duration
-	firstDelay  time.Duration
+	wire     net.Conn
+	requests chan struct{} // one per incremental request received
+	held     int           // requests taken from requests but not answered
+	mu       sync.Mutex    // serializes writes
 }
 
-type idleWakeFakeUpdate struct {
-	rect   image.Rectangle
-	colour color.RGBA
-	delay  time.Duration
-}
-
-func (f idleWakeFake) serve(t *testing.T) net.Conn {
+func newIdleWakeFake(t *testing.T, first color.RGBA) (*idleWakeFake, net.Conn) {
 	t.Helper()
 	client, server := net.Pipe()
+	f := &idleWakeFake{wire: server, requests: make(chan struct{}, 16)}
 	done := make(chan struct{})
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close(); <-done })
 	go func() {
 		defer close(done)
 		defer server.Close()
-		read := func(n int) ([]byte, error) { p := make([]byte, n); _, err := io.ReadFull(server, p); return p, err }
-		send := func(update idleWakeFakeUpdate) bool {
-			r := update.rect
-			reply := make([]byte, 16, 16+r.Dx()*r.Dy()*4)
-			reply[3] = 1
-			for i, n := range []int{r.Min.X, r.Min.Y, r.Dx(), r.Dy()} {
-				binary.BigEndian.PutUint16(reply[4+i*2:], uint16(n))
-			}
-			for range r.Dx() * r.Dy() {
-				reply = append(reply, update.colour.B, update.colour.G, update.colour.R, 0)
-			}
-			_, err := server.Write(reply)
-			return err == nil
-		}
 		if !fakeRFBHandshake(server, 4, 3) {
 			return
 		}
-		fulls, next := 0, 0
+		read := func(n int) ([]byte, error) { p := make([]byte, n); _, err := io.ReadFull(server, p); return p, err }
 		for {
 			kind, err := read(1)
 			if err != nil {
@@ -356,31 +292,12 @@ func (f idleWakeFake) serve(t *testing.T) net.Conn {
 				}
 			case 3:
 				var p []byte
-				if p, err = read(9); err != nil {
-					return
-				}
-				if p[0] == 1 {
-					update := idleWakeFakeUpdate{image.Rect(0, 0, 1, 1), f.first, f.heartbeat}
-					if next < len(f.updates) {
-						update = f.updates[next]
-					} else if f.heartbeat == 0 {
-						continue
-					}
-					next++
-					time.Sleep(update.delay)
-					if !send(update) {
+				if p, err = read(9); err == nil {
+					if p[0] == 1 {
+						f.requests <- struct{}{}
+					} else if f.send(image.Rect(0, 0, 4, 3), first) != nil {
 						return
 					}
-					continue
-				}
-				colour := f.last
-				if fulls == 0 {
-					colour = f.first
-					time.Sleep(f.firstDelay)
-				}
-				fulls++
-				if !send(idleWakeFakeUpdate{rect: image.Rect(0, 0, 4, 3), colour: colour}) {
-					return
 				}
 			default:
 				t.Errorf("unexpected RFB client message %d", kind[0])
@@ -391,60 +308,133 @@ func (f idleWakeFake) serve(t *testing.T) net.Conn {
 			}
 		}
 	}()
-	return client
+	return f, client
+}
+
+func (f *idleWakeFake) send(r image.Rectangle, colour color.RGBA) error {
+	reply := make([]byte, 16, 16+r.Dx()*r.Dy()*4)
+	reply[3] = 1
+	for i, n := range []int{r.Min.X, r.Min.Y, r.Dx(), r.Dy()} {
+		binary.BigEndian.PutUint16(reply[4+i*2:], uint16(n))
+	}
+	for range r.Dx() * r.Dy() {
+		reply = append(reply, colour.B, colour.G, colour.R, 0)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, err := f.wire.Write(reply)
+	return err
+}
+
+// answer waits for a held incremental request and answers it.
+func (f *idleWakeFake) answer(t *testing.T, r image.Rectangle, colour color.RGBA) {
+	t.Helper()
+	if f.held > 0 {
+		f.held--
+	} else {
+		<-f.requests
+	}
+	if err := f.send(r, colour); err != nil {
+		t.Fatalf("fake update: %v", err)
+	}
+}
+
+// awaitRequest waits until the observer has asked again, so it has compared
+// the previous update.
+func (f *idleWakeFake) awaitRequest() { <-f.requests; f.held++ }
+
+// idleWakeTimers hands the observer channels that the test fires, so the
+// deadline and the grace never race the fake server's replies.
+type idleWakeTimers struct {
+	asked           chan time.Duration
+	deadline, grace chan time.Time
+	calls           int
+}
+
+func (w *idleWakeTimers) after(d time.Duration) <-chan time.Time {
+	w.calls++
+	w.asked <- d
+	if w.calls == 1 {
+		return w.deadline
+	}
+	return w.grace
 }
 
 func TestObserveIdleScreen(t *testing.T) {
 	a, b := color.RGBA{R: 24, G: 32, B: 48, A: 255}, color.RGBA{G: 255, A: 255}
-	heartbeat := idleWakeFakeUpdate{rect: image.Rect(0, 0, 1, 1), colour: a}
-	beat := 20 * time.Millisecond
-	window := 300 * time.Millisecond
+	base := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	until := base.Add(IdleWakeQuiet)
+	all := image.Rect(0, 0, 4, 3)
+	type env struct {
+		f      *idleWakeFake
+		timers *idleWakeTimers
+	}
+	type step func(*testing.T, env)
+	unchanged := func(r image.Rectangle) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, a); e.f.awaitRequest() }
+	}
+	changed := func(r image.Rectangle) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, b) }
+	}
+	deadline := func(t *testing.T, e env) {
+		<-e.timers.asked
+		e.timers.deadline <- until
+		if got := <-e.timers.asked; got != IdleWakeGrace {
+			t.Errorf("grace %s, want %s", got, IdleWakeGrace)
+		}
+	}
+	grace := func(t *testing.T, e env) { e.timers.grace <- until.Add(IdleWakeGrace) }
+	breakServer := func(t *testing.T, e env) { _ = e.f.wire.Close() }
 	for _, test := range []struct {
 		name     string
-		fake     idleWakeFake
-		until    time.Duration // from the start of the test
-		changed  int
+		firstAt  time.Time // when the observer's first full frame completes
+		steps    []step
+		after    step // runs once the observer has returned
 		updates  int
-		err      string
-		static   bool   // observed static from the first frame to the deadline
-		premise  string // the Premise error with lane timings, "" for nil
-		maxShort time.Duration
+		changed  int
+		observed time.Duration
+		premise  string // "" for nil
 	}{
-		// Unchanged heartbeats are compared and accepted.
-		{name: "heartbeats on a static screen", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, heartbeat, heartbeat}, heartbeat: beat}, until: window, updates: 4, static: true},
-		// B is seen when it arrives, though the screen and the last frame are A again.
-		{name: "A to B to A", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, {rect: image.Rect(1, 1, 3, 3), colour: b}, {rect: image.Rect(1, 1, 3, 3), colour: a}}, heartbeat: beat}, until: window, changed: 4, updates: 1, premise: "4 pixels in (1,1)-(3,3) changed"},
-		// A change seen only by the final full check still fails.
-		{name: "changed at the final check", fake: idleWakeFake{first: a, last: b, heartbeat: beat}, until: window, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed"},
-		// The pending request's unchanged full-screen reply must not complete
-		// the final check before the changed full reply is read.
-		{name: "unchanged pending reply then changed final", fake: idleWakeFake{first: a, last: b, updates: []idleWakeFakeUpdate{{rect: image.Rect(0, 0, 4, 3), colour: a, delay: window + 100*time.Millisecond}}, heartbeat: beat}, until: window, changed: 12, updates: 1, premise: "12 pixels in (0,0)-(4,3) changed"},
-		// A held request never passes.
-		{name: "no reply to the pending request", fake: idleWakeFake{first: a, last: a}, until: window, err: "observer: no reply to the pending request within 200ms", premise: "screen observer failed: observer: no reply"},
-		// The window starts at the first frame, not at the caller's clock.
-		{name: "delayed first frame", fake: idleWakeFake{first: a, last: a, firstDelay: 250 * time.Millisecond, heartbeat: beat}, until: window, maxShort: 200 * time.Millisecond, premise: "static screen for only"},
-		{name: "deadline already expired", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat}, heartbeat: beat}, until: -time.Second, maxShort: 200 * time.Millisecond, premise: "static screen for only"},
+		// (a) x11vnc holds every request on a static screen: nothing arrives.
+		{name: "static screen holds every request", firstAt: base, steps: []step{deadline, grace}, observed: IdleWakeQuiet},
+		// Unchanged updates are compared and counted, never required.
+		{name: "unchanged updates", firstAt: base, steps: []step{unchanged(image.Rect(0, 0, 1, 1)), unchanged(all), deadline, unchanged(all), grace}, updates: 3, observed: IdleWakeQuiet},
+		// (b) B is seen when it arrives, though A would follow.
+		{name: "A to B to A", firstAt: base, steps: []step{unchanged(image.Rect(0, 0, 1, 1)), changed(image.Rect(1, 1, 3, 3))}, updates: 1, changed: 4, premise: "4 pixels in (1,1)-(3,3) changed"},
+		// (c) An update that arrives within the grace is still compared.
+		{name: "change within the grace", firstAt: base, steps: []step{deadline, changed(all)}, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed"},
+		// (d) The bound: a change after the grace is not seen.
+		{name: "change after the grace", firstAt: base, steps: []step{deadline, grace}, after: func(t *testing.T, e env) { _ = e.f.send(all, b) }, observed: IdleWakeQuiet},
+		// (e) The window starts at the first frame, not at the caller's clock.
+		{name: "delayed first frame", firstAt: base.Add(10 * time.Second), steps: []step{deadline, grace}, observed: 60 * time.Second, premise: "static screen for only 60.0 s, need 65 s"},
+		// (f) A read error that the observer did not cause fails.
+		{name: "server breaks the connection", firstAt: base, steps: []step{breakServer}, premise: "screen observer failed"},
+		// (g) Exact boundary: 65 s observed passes.
+		{name: "observed exactly the minimum", firstAt: base.Add(IdleWakeQuiet - IdleWakeObservedMin), steps: []step{deadline, grace}, observed: IdleWakeObservedMin},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			wire := test.fake.serve(t)
-			until := time.Now().Add(test.until)
-			observation := observeIdleScreen(wire, until, 200*time.Millisecond)
-			if test.err != "" {
-				if observation.Err == nil || observation.Err.Error() != test.err {
-					t.Fatalf("observation = %+v, want error %q", observation, test.err)
-				}
-			} else if observation.Err != nil || observation.Changed != test.changed || observation.Updates < test.updates {
-				t.Fatalf("observation = %+v, want changed %d after at least %d updates", observation, test.changed, test.updates)
+			f, wire := newIdleWakeFake(t, a)
+			e := env{f, &idleWakeTimers{asked: make(chan time.Duration, 2), deadline: make(chan time.Time, 1), grace: make(chan time.Time, 1)}}
+			result := make(chan IdleWakeObservation, 1)
+			go func() {
+				result <- observeIdleScreen(wire, until, func() time.Time { return test.firstAt }, e.timers.after)
+			}()
+			for _, step := range test.steps {
+				step(t, e)
 			}
-			if test.static {
-				// Observed runs from the observer's own first frame, past the deadline.
-				if observation.FirstFrame.IsZero() || observation.Observed < until.Sub(observation.FirstFrame) {
-					t.Fatalf("observed static %s from %v, want at least until the deadline %v", observation.Observed, observation.FirstFrame, until)
-				}
-				observation.Observed = IdleWakeObservedMin // scale the passing window to lane length
+			// Only a failure waits this long: every case ends the observer through
+			// its steps, so a missed change does not hang the test.
+			var observation IdleWakeObservation
+			select {
+			case observation = <-result:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("observer did not return after its steps; want %d changed pixels", test.changed)
 			}
-			if test.maxShort > 0 && observation.Observed > test.maxShort {
-				t.Fatalf("observed static %s, want at most %s", observation.Observed, test.maxShort)
+			if test.after != nil {
+				test.after(t, e)
+			}
+			if observation.Updates != test.updates || observation.Changed != test.changed || observation.Observed != test.observed {
+				t.Fatalf("observation = %+v, want %d updates, %d changed, observed %s", observation, test.updates, test.changed, test.observed)
 			}
 			observation.SinceInput = IdleWakeQuiet
 			err := observation.Premise()
