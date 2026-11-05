@@ -276,13 +276,17 @@ set -e
 negative_result=$(final_action "$negative" "$module/fabric/tsnet" TestTSNetPersonWhoAmI)
 # person_identity_smoke_test.go: t.Fatalf("whoami status=%d body=%s", ...);
 # l1/server.go authorize: "machine principals cannot use person protocols".
-identity_line=$(jq -r --arg p "$module/fabric/tsnet" \
-  'select(.Action == "output" and .Package == $p and .Test == "TestTSNetPersonWhoAmI") | .Output' "$negative" |
+# Join the output events before matching: test2json may split one line
+# across events, and only this one test runs here.
+identity_line=$(jq -rj --arg p "$module/fabric/tsnet" \
+  'select(.Action == "output" and .Package == $p) | .Output' "$negative" |
   grep -F 'whoami status=403 body=' |
   grep -F '"code":"principal_forbidden"' |
   grep -F 'machine principals cannot use person protocols' || true)
 if [ "$negative_status" -eq 0 ] || [ "$negative_result" != fail ] || [ -z "$identity_line" ]; then
   jq -rj 'select(.Action == "output" or .Action == "build-output") | .Output' "$negative"
+  echo "--- whoami output events ---"
+  jq -c 'select(.Action == "output" and (.Output | contains("whoami")))' "$negative"
   die "negative control did not fail on the identity check (go test status $negative_status, result ${negative_result:-missing})"
 fi
 printf '%s\n' "$identity_line"
