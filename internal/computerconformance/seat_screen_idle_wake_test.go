@@ -30,11 +30,15 @@ const (
 	// (rfb_banner to frame_baseline), the phase an x11vnc nap delays. #1479
 	// measured 15-130 ms with -nonap -sb 0 and 1025-1868 ms without.
 	IdleWakeBaselineGate = 500 * time.Millisecond
+	// x11vnc answers a held incremental request with a 1x1 heartbeat about
+	// every 5 s on an unchanged screen (scan.c ping_clients).
+	IdleWakePendingLimit = 10 * time.Second
 )
 
 // IdleWakeObservation is what the lane saw before it timed the idle-wake call.
 type IdleWakeObservation struct {
 	SinceInput time.Duration   // from the test's last input to the timed call
+	FirstFrame time.Time       // when the observer's first full frame was complete
 	Observed   time.Duration   // first full frame to the last full check, all static
 	Updates    int             // incremental updates compared in between
 	Changed    int             // differing pixels in the first update that changed
@@ -65,10 +69,16 @@ func (o IdleWakeObservation) Premise() error {
 // arrives, so a change that reverts before a later frame still counts.
 // rfbclient reports only whether an update arrived, and its frame captures
 // fold updates together, so neither can show this. x11vnc's 1x1 heartbeat on
-// an unchanged screen passes because its pixels match. At `until` it asks
-// for the full screen and compares every update until all pixels are covered.
-// The caller closes wire afterwards; that also bounds every read.
-func ObserveIdleScreen(wire io.ReadWriter, until time.Time) (observation IdleWakeObservation) {
+// an unchanged screen passes because its pixels match. At `until` it waits
+// up to IdleWakePendingLimit for the reply to its outstanding request, then,
+// with nothing outstanding, asks for the full screen and compares every
+// update until all pixels are covered. The caller closes wire afterwards;
+// that also bounds every read.
+func ObserveIdleScreen(wire io.ReadWriter, until time.Time) IdleWakeObservation {
+	return observeIdleScreen(wire, until, IdleWakePendingLimit)
+}
+
+func observeIdleScreen(wire io.ReadWriter, until time.Time, pendingLimit time.Duration) (observation IdleWakeObservation) {
 	client, err := rfbclient.Open(wire)
 	if err != nil {
 		observation.Err = err
@@ -80,6 +90,7 @@ func ObserveIdleScreen(wire io.ReadWriter, until time.Time) (observation IdleWak
 		return observation
 	}
 	firstAt := time.Now()
+	observation.FirstFrame = firstAt
 	// rfbclient reads the wire unbuffered and has no request outstanding
 	// after Frame, so the next byte on the wire starts a new server message.
 	updates := make(chan idleWakeUpdate)
@@ -143,8 +154,21 @@ watch:
 			break watch
 		}
 	}
-	// One incremental request may be outstanding. Its reply and the full one
-	// may come separately or merged; every pixel of each is compared.
+	// One incremental request is outstanding. Compare its reply first, so the
+	// final full request is the only one outstanding and no earlier reply can
+	// complete the final check.
+	pending := time.NewTimer(pendingLimit)
+	defer pending.Stop()
+	select {
+	case update := <-updates:
+		if changed(update) {
+			return observation
+		}
+		observation.Updates++
+	case <-pending.C:
+		observation.Err = fmt.Errorf("observer: no reply to the pending request within %s", pendingLimit)
+		return observation
+	}
 	if observation.Err = request(false); observation.Err != nil {
 		return observation
 	}
@@ -275,17 +299,20 @@ func TestIdleWakePremise(t *testing.T) {
 
 // idleWakeFake is a scripted RFB server on a 4x3 screen. Its first full
 // request returns first, later ones last. Each incremental request gets the
-// next scripted update; once the script ends it is held, as x11vnc holds a
-// request without damage, and a later full request answers both at once.
+// next scripted update after its delay. Once the script ends, a request gets
+// a 1x1 heartbeat after heartbeat, as on x11vnc; with no heartbeat it is
+// held, and a later full request answers both at once, as LibVNCServer does.
 type idleWakeFake struct {
 	first, last color.RGBA
 	updates     []idleWakeFakeUpdate
+	heartbeat   time.Duration
 	firstDelay  time.Duration
 }
 
 type idleWakeFakeUpdate struct {
 	rect   image.Rectangle
 	colour color.RGBA
+	delay  time.Duration
 }
 
 func (f idleWakeFake) serve(t *testing.T) net.Conn {
@@ -333,10 +360,17 @@ func (f idleWakeFake) serve(t *testing.T) net.Conn {
 					return
 				}
 				if p[0] == 1 {
-					if next < len(f.updates) && !send(f.updates[next]) {
-						return
+					update := idleWakeFakeUpdate{image.Rect(0, 0, 1, 1), f.first, f.heartbeat}
+					if next < len(f.updates) {
+						update = f.updates[next]
+					} else if f.heartbeat == 0 {
+						continue
 					}
 					next++
+					time.Sleep(update.delay)
+					if !send(update) {
+						return
+					}
 					continue
 				}
 				colour := f.last
@@ -345,7 +379,7 @@ func (f idleWakeFake) serve(t *testing.T) net.Conn {
 					time.Sleep(f.firstDelay)
 				}
 				fulls++
-				if !send(idleWakeFakeUpdate{image.Rect(0, 0, 4, 3), colour}) {
+				if !send(idleWakeFakeUpdate{rect: image.Rect(0, 0, 4, 3), colour: colour}) {
 					return
 				}
 			default:
@@ -362,41 +396,55 @@ func (f idleWakeFake) serve(t *testing.T) net.Conn {
 
 func TestObserveIdleScreen(t *testing.T) {
 	a, b := color.RGBA{R: 24, G: 32, B: 48, A: 255}, color.RGBA{G: 255, A: 255}
-	heartbeat := idleWakeFakeUpdate{image.Rect(0, 0, 1, 1), a}
+	heartbeat := idleWakeFakeUpdate{rect: image.Rect(0, 0, 1, 1), colour: a}
+	beat := 20 * time.Millisecond
 	window := 300 * time.Millisecond
 	for _, test := range []struct {
-		name      string
-		fake      idleWakeFake
-		until     time.Duration // from the start of the observation
-		changed   int
-		updates   int
-		premise   string // the Premise error with lane timings, "" for nil
-		minStatic time.Duration
-		maxStatic time.Duration
+		name     string
+		fake     idleWakeFake
+		until    time.Duration // from the start of the test
+		changed  int
+		updates  int
+		err      string
+		static   bool   // observed static from the first frame to the deadline
+		premise  string // the Premise error with lane timings, "" for nil
+		maxShort time.Duration
 	}{
 		// Unchanged heartbeats are compared and accepted.
-		{name: "heartbeats on a static screen", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, heartbeat, heartbeat}}, until: window, updates: 3, minStatic: window, maxStatic: 5 * time.Second},
+		{name: "heartbeats on a static screen", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, heartbeat, heartbeat}, heartbeat: beat}, until: window, updates: 4, static: true},
 		// B is seen when it arrives, though the screen and the last frame are A again.
-		{name: "A to B to A", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, {image.Rect(1, 1, 3, 3), b}, {image.Rect(1, 1, 3, 3), a}}}, until: window, changed: 4, updates: 1, premise: "4 pixels in (1,1)-(3,3) changed"},
+		{name: "A to B to A", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat, {rect: image.Rect(1, 1, 3, 3), colour: b}, {rect: image.Rect(1, 1, 3, 3), colour: a}}, heartbeat: beat}, until: window, changed: 4, updates: 1, premise: "4 pixels in (1,1)-(3,3) changed"},
 		// A change seen only by the final full check still fails.
-		{name: "changed at the final check", fake: idleWakeFake{first: a, last: b}, until: window, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed"},
+		{name: "changed at the final check", fake: idleWakeFake{first: a, last: b, heartbeat: beat}, until: window, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed"},
+		// The pending request's unchanged full-screen reply must not complete
+		// the final check before the changed full reply is read.
+		{name: "unchanged pending reply then changed final", fake: idleWakeFake{first: a, last: b, updates: []idleWakeFakeUpdate{{rect: image.Rect(0, 0, 4, 3), colour: a, delay: window + 100*time.Millisecond}}, heartbeat: beat}, until: window, changed: 12, updates: 1, premise: "12 pixels in (0,0)-(4,3) changed"},
+		// A held request never passes.
+		{name: "no reply to the pending request", fake: idleWakeFake{first: a, last: a}, until: window, err: "observer: no reply to the pending request within 200ms", premise: "screen observer failed: observer: no reply"},
 		// The window starts at the first frame, not at the caller's clock.
-		{name: "delayed first frame", fake: idleWakeFake{first: a, last: a, firstDelay: 250 * time.Millisecond}, until: window, maxStatic: 200 * time.Millisecond, premise: "static screen for only"},
-		{name: "deadline already expired", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat}}, until: -time.Second, maxStatic: 200 * time.Millisecond, premise: "static screen for only"},
+		{name: "delayed first frame", fake: idleWakeFake{first: a, last: a, firstDelay: 250 * time.Millisecond, heartbeat: beat}, until: window, maxShort: 200 * time.Millisecond, premise: "static screen for only"},
+		{name: "deadline already expired", fake: idleWakeFake{first: a, last: a, updates: []idleWakeFakeUpdate{heartbeat}, heartbeat: beat}, until: -time.Second, maxShort: 200 * time.Millisecond, premise: "static screen for only"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			wire := test.fake.serve(t)
-			start := time.Now()
-			observation := ObserveIdleScreen(wire, start.Add(test.until))
-			if observation.Err != nil || observation.Changed != test.changed || observation.Updates < test.updates {
+			until := time.Now().Add(test.until)
+			observation := observeIdleScreen(wire, until, 200*time.Millisecond)
+			if test.err != "" {
+				if observation.Err == nil || observation.Err.Error() != test.err {
+					t.Fatalf("observation = %+v, want error %q", observation, test.err)
+				}
+			} else if observation.Err != nil || observation.Changed != test.changed || observation.Updates < test.updates {
 				t.Fatalf("observation = %+v, want changed %d after at least %d updates", observation, test.changed, test.updates)
 			}
-			if test.changed == 0 && (observation.Observed < test.minStatic || test.maxStatic > 0 && observation.Observed > test.maxStatic) {
-				t.Fatalf("observed static %s, want %s..%s", observation.Observed, test.minStatic, test.maxStatic)
+			if test.static {
+				// Observed runs from the observer's own first frame, past the deadline.
+				if observation.FirstFrame.IsZero() || observation.Observed < until.Sub(observation.FirstFrame) {
+					t.Fatalf("observed static %s from %v, want at least until the deadline %v", observation.Observed, observation.FirstFrame, until)
+				}
+				observation.Observed = IdleWakeObservedMin // scale the passing window to lane length
 			}
-			// Scale the window to lane length; a premise only passes on a full observation.
-			if test.changed == 0 && observation.Observed >= test.minStatic && test.minStatic > 0 {
-				observation.Observed = IdleWakeObservedMin
+			if test.maxShort > 0 && observation.Observed > test.maxShort {
+				t.Fatalf("observed static %s, want at most %s", observation.Observed, test.maxShort)
 			}
 			observation.SinceInput = IdleWakeQuiet
 			err := observation.Premise()
