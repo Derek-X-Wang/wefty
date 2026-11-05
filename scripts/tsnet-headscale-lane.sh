@@ -277,12 +277,14 @@ negative_result=$(final_action "$negative" "$module/fabric/tsnet" TestTSNetPerso
 # person_identity_smoke_test.go: t.Fatalf("whoami status=%d body=%s", ...);
 # l1/server.go authorize: "machine principals cannot use person protocols".
 # Join the output events before matching: test2json may split one line
-# across events, and only this one test runs here.
+# across events, and only this one test runs here. tsnet debug logs contain
+# NUL bytes, so grep must treat the stream as text (-a); otherwise GNU grep
+# prints only "binary file matches".
 identity_line=$(jq -rj --arg p "$module/fabric/tsnet" \
   'select(.Action == "output" and .Package == $p) | .Output' "$negative" |
-  grep -F 'whoami status=403 body=' |
-  grep -F '"code":"principal_forbidden"' |
-  grep -F 'machine principals cannot use person protocols' || true)
+  grep -aF 'whoami status=403 body=' |
+  grep -aF '"code":"principal_forbidden"' |
+  grep -aF 'machine principals cannot use person protocols' || true)
 if [ "$negative_status" -eq 0 ] || [ "$negative_result" != fail ] || [ -z "$identity_line" ]; then
   jq -rj 'select(.Action == "output" or .Action == "build-output") | .Output' "$negative"
   echo "--- whoami output events ---"
