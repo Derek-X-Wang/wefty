@@ -33,9 +33,10 @@ RUN case "$TARGETARCH" in amd64) ninja_version=1.12.1-1 ;; arm64) ninja_version=
         pkgconf=1.8.1-4 \
         xz-utils=5.8.1-1+deb13u1 \
         zlib1g-dev=1:1.3.dfsg+really1.3.1-1+b1 \
+    # Plain HTTP lets the CI snapshot cache serve this file; the pinned sha256 below guards integrity.
     && curl --fail --location --retry 5 \
       --output /tmp/neatvnc.tar.xz \
-      https://snapshot.debian.org/archive/debian/20260827T000000Z/pool/main/n/neatvnc/neatvnc_0.9.1%2Bdfsg.orig.tar.xz \
+      http://snapshot.debian.org/archive/debian/20260827T000000Z/pool/main/n/neatvnc/neatvnc_0.9.1%2Bdfsg.orig.tar.xz \
     && printf '%s  %s\n' \
       '46d689818d88e0d65387bf9182f1bd1015c4b28e0347696f0bec7c7d9c829194' \
       /tmp/neatvnc.tar.xz | sha256sum --check -
