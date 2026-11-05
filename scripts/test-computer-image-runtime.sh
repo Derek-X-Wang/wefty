@@ -97,7 +97,12 @@ run_mutation() {
   if [[ $mutation == text-frames-accepted && $edge_process_pattern == 'wayvnc -w' ]]; then
     fixture_dockerfile=examples/computer/fixtures/Dockerfile.wayland-text
   fi
-  if ! docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
+  local -a fixture_build_args=(--platform "linux/$arch" --file "$fixture_dockerfile")
+  if [[ -n ${WEFTY_DEBIAN_SNAPSHOT_PROXY:-} ]]; then
+    fixture_build_args+=(--build-arg "http_proxy=$WEFTY_DEBIAN_SNAPSHOT_PROXY"
+      --build-arg "HTTP_PROXY=$WEFTY_DEBIAN_SNAPSHOT_PROXY")
+  fi
+  if ! docker build "${fixture_build_args[@]}" \
     --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .; then
     stage_error "fixture-build/$mutation" "docker build failed for $tag"
     exit 1
