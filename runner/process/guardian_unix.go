@@ -425,80 +425,92 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		}
 		return writeExit(outcome, contract.TerminationCauseSpontaneous)
 	}
-	// ownershipProblem keeps why the latest answering listener was not
-	// confirmed as the payload's own, for the typed failure's message.
-	var ownershipProblem error
-	// lastOwnershipCheck and ownershipConfirmed throttle inspection: a ready
-	// service is checked again each serviceOwnershipRecheckInterval, and an
-	// unconfirmed one is not inspected again sooner either.
-	var lastOwnershipCheck time.Time
-	ownershipConfirmed := true
-	// unconfirmedSince is when probes kept answering but the listener stopped
-	// being confirmed as the payload's after startup. After the startup
-	// readiness deadline in that state the payload is stopped with a typed
-	// reason, so it is never left withdrawn without one.
-	var unconfirmedSince time.Time
+	// Ownership (#1468). Readiness publishes the service, so the Guardian
+	// reports ready only after an inspection confirms that every listener
+	// receiving the backend belongs to the payload's process group, and it
+	// confirms that again each serviceOwnershipRecheckInterval while ready.
+	// Inspection runs beside this loop, so a slow lsof never delays a stop, an
+	// exit or a deadline; while one runs, readiness stays where it is.
+	type inspection struct {
+		verdict serviceListenerVerdict
+		err     error
+	}
+	var (
+		// ownershipProblem is why ownership is not confirmed, for the typed
+		// failure's message.
+		ownershipProblem   error
+		ownershipConfirmed bool
+		lastInspection     time.Time
+		inspecting         <-chan inspection
+		cancelInspection   = func() {}
+		probeAnswering     bool
+		// The ownership deadline runs from the first unconfirmed inspection
+		// after startup and is cleared only by a confirmed one. Probe failures
+		// neither start nor clear it: an ordinary probe loss only withdraws.
+		ownershipTimer    *time.Timer
+		ownershipDeadline <-chan time.Time
+	)
+	defer func() { cancelInspection() }()
+	defer func() {
+		if ownershipTimer != nil {
+			ownershipTimer.Stop()
+		}
+	}()
+	startInspection := func() {
+		inspectionContext, cancel := context.WithTimeout(probeContext, serviceListenerInspectTimeout)
+		cancelInspection = cancel
+		lastInspection = time.Now()
+		result := make(chan inspection, 1)
+		inspecting = result
+		go func() {
+			verdict, err := serviceListenerInspector(inspectionContext, backend, processGroupID)
+			result <- inspection{verdict: verdict, err: err}
+		}()
+	}
 	writePortTaken := func(reason error) error {
+		cancelInspection()
 		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait); err != nil {
 			return err
 		}
 		result := spawnFailure(contract.SpawnFailureServicePortTaken, reason)
 		return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
 	}
-	// confirmOwnership decides whether a successful probe may count as ready
-	// (#1468). It returns done when the Guardian has stopped the payload.
-	confirmOwnership := func(probeReady bool) (bool, bool, error) {
-		if !probeReady {
-			unconfirmedSince = time.Time{}
-			return false, false, nil
-		}
-		now := time.Now()
-		due := lastOwnershipCheck.IsZero() || now.Sub(lastOwnershipCheck) >= serviceOwnershipRecheckInterval ||
-			(!ready && ownershipConfirmed)
-		if !due {
-			// Within the interval: a ready service stays ready, and an
-			// unconfirmed one stays withdrawn.
-			return ready, false, nil
-		}
-		lastOwnershipCheck = now
-		verdict, err := serviceListenerInspector(backend, processGroupID)
-		if err == nil && verdict == serviceListenerOwned {
-			ownershipConfirmed, ownershipProblem, unconfirmedSince = true, nil, time.Time{}
-			return true, false, nil
-		}
-		ownershipConfirmed = false
-		switch {
-		case err != nil:
-			ownershipProblem = err
-		case verdict == serviceListenerForeign:
-			ownershipProblem = fmt.Errorf("a process outside the payload's process group holds a listener that receives %s", start.ServiceAddress)
-			if !startupSatisfied {
-				return false, true, writePortTaken(fmt.Errorf(
-					"service backend %s answered from a process outside the payload's process group; the service was not published",
-					start.ServiceAddress))
+	// setReady reports a readiness change. It returns done when the Guardian
+	// has ended: an exit observable at first readiness wins, and a failed
+	// report stops the payload.
+	setReady := func(value bool) (bool, error) {
+		if value && !startupSatisfied {
+			select {
+			case outcome := <-wait:
+				cancelInspection()
+				return true, writeSpontaneousExit(outcome)
+			default:
 			}
-		default:
-			ownershipProblem = fmt.Errorf("no listener that receives %s and that this user can see belongs to the payload", start.ServiceAddress)
-		}
-		if startupSatisfied {
-			// After startup a probe never kills the payload at once; the
-			// service is withdrawn, and only a lasting state ends it.
-			if unconfirmedSince.IsZero() {
-				unconfirmedSince = now
-			} else if now.Sub(unconfirmedSince) >= start.StartupReadinessDeadline {
-				return false, true, writePortTaken(fmt.Errorf(
-					"service backend %s stayed withdrawn for %s because its listener was not the payload's own: %w",
-					start.ServiceAddress, start.StartupReadinessDeadline, ownershipProblem))
+			// This is the sole starting -> serving event.
+			startupSatisfied = true
+			if deadline != nil {
+				deadline.Stop()
+				deadlineChannel = nil
 			}
 		}
-		return false, false, nil
+		ready = value
+		if err := writeReadiness(value); err != nil {
+			cancelInspection()
+			_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
+			return true, nil
+		}
+		return false, nil
 	}
 
 	for {
 		select {
 		case outcome := <-wait:
+			cancelInspection()
 			return writeSpontaneousExit(outcome)
 		case next := <-control:
+			// A running inspection is cancelled, never awaited, so a stop
+			// starts termination grace at once.
+			cancelInspection()
 			disconnected := next.err != nil || next.message.Type != guardianMessageStop
 			outcome, delivered, reapErr := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
 			if reapErr != nil {
@@ -510,46 +522,71 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				return nil
 			}
 			return writeExit(outcome, cause)
-		case probeReady := <-probes:
-			// Readiness publishes the service, so the listener that answers
-			// must belong to the payload's process group, now and while the
-			// service stays ready (#1468).
-			probeReady, done, err := confirmOwnership(probeReady)
-			if done {
-				return err
-			}
-			if !startupSatisfied {
-				if !probeReady {
-					continue
-				}
-				// If exit is already observable, it wins. Otherwise this first
-				// successful local probe is the sole starting -> serving event.
-				select {
-				case outcome := <-wait:
-					return writeSpontaneousExit(outcome)
-				default:
-				}
-				startupSatisfied = true
-				ready = true
-				if deadline != nil {
-					deadline.Stop()
-					deadlineChannel = nil
-				}
-				if err := writeReadiness(true); err != nil {
-					_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
-					return nil
+		case answering := <-probes:
+			probeAnswering = answering
+			if !answering {
+				// Ordinary probe loss withdraws a ready service and never
+				// ends the payload.
+				if ready {
+					if done, err := setReady(false); done {
+						return err
+					}
 				}
 				continue
 			}
-			if probeReady == ready {
+			if inspecting != nil {
 				continue
 			}
-			ready = probeReady
-			if err := writeReadiness(ready); err != nil {
-				_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
-				return nil
+			// A return to readiness after a confirmed inspection is checked
+			// at once; otherwise inspections keep the recheck interval.
+			if lastInspection.IsZero() || time.Since(lastInspection) >= serviceOwnershipRecheckInterval || (!ready && ownershipConfirmed) {
+				startInspection()
 			}
+		case result := <-inspecting:
+			inspecting = nil
+			cancelInspection()
+			if result.err == nil && result.verdict == serviceListenerOwned {
+				ownershipConfirmed, ownershipProblem = true, nil
+				if ownershipTimer != nil {
+					ownershipTimer.Stop()
+					ownershipTimer, ownershipDeadline = nil, nil
+				}
+				if probeAnswering && !ready {
+					if done, err := setReady(true); done {
+						return err
+					}
+				}
+				continue
+			}
+			ownershipConfirmed = false
+			switch {
+			case result.err != nil:
+				ownershipProblem = result.err
+			case result.verdict == serviceListenerForeign:
+				ownershipProblem = fmt.Errorf("a process outside the payload's process group holds a listener that receives %s", start.ServiceAddress)
+				if !startupSatisfied {
+					return writePortTaken(fmt.Errorf(
+						"service backend %s answered from a process outside the payload's process group; the service was not published",
+						start.ServiceAddress))
+				}
+			default:
+				ownershipProblem = fmt.Errorf("no listener that receives %s and that this user can see belongs to the payload", start.ServiceAddress)
+			}
+			if ready {
+				if done, err := setReady(false); done {
+					return err
+				}
+			}
+			if startupSatisfied && ownershipTimer == nil {
+				ownershipTimer = time.NewTimer(start.StartupReadinessDeadline)
+				ownershipDeadline = ownershipTimer.C
+			}
+		case <-ownershipDeadline:
+			return writePortTaken(fmt.Errorf(
+				"service backend %s stayed withdrawn for %s because its listener was not confirmed as the payload's own: %w",
+				start.ServiceAddress, start.StartupReadinessDeadline, ownershipProblem))
 		case <-deadlineChannel:
+			cancelInspection()
 			// One guardian arbiter owns the process-exit/deadline race. An exit
 			// already queued at the boundary wins; otherwise timeout owns the
 			// termination and is the only reported reason.

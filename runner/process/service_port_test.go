@@ -32,13 +32,13 @@ func TestServiceListenerInspectionAttributesProcessGroups(t *testing.T) {
 	defer listener.Close()
 	backend := mustServiceBackend(t, listener.Addr().String())
 	group := syscall.Getpgrp()
-	if verdict, err := inspectServiceListeners(backend, group); err != nil || verdict != serviceListenerOwned {
+	if verdict, err := inspectServiceListeners(context.Background(), backend, group); err != nil || verdict != serviceListenerOwned {
 		t.Fatalf("own listener verdict = (%d, %v), want owned", verdict, err)
 	}
-	if verdict, err := inspectServiceListeners(backend, group+1_000_000); err != nil || verdict != serviceListenerForeign {
+	if verdict, err := inspectServiceListeners(context.Background(), backend, group+1_000_000); err != nil || verdict != serviceListenerForeign {
 		t.Fatalf("listener of another group verdict = (%d, %v), want foreign", verdict, err)
 	}
-	if verdict, err := inspectServiceListeners(mustServiceBackend(t, releasedServiceAddress(t)), group); err != nil || verdict != serviceListenerUnseen {
+	if verdict, err := inspectServiceListeners(context.Background(), mustServiceBackend(t, releasedServiceAddress(t)), group); err != nil || verdict != serviceListenerUnseen {
 		t.Fatalf("free port verdict = (%d, %v), want unseen", verdict, err)
 	}
 }
@@ -48,28 +48,52 @@ func TestServiceListenerInspectionIgnoresListenersThatCannotReceiveTheBackend(t 
 	backend := mustServiceBackend(t, address)
 	unrelated := listenIPv6Loopback(t, backend.port)
 	defer unrelated.Close()
-	if verdict, err := inspectServiceListeners(backend, syscall.Getpgrp()+1_000_000); err != nil || verdict != serviceListenerUnseen {
+	if verdict, err := inspectServiceListeners(context.Background(), backend, syscall.Getpgrp()+1_000_000); err != nil || verdict != serviceListenerUnseen {
 		t.Fatalf("verdict with only [::1]:%d listening = (%d, %v), want unseen", backend.port, verdict, err)
 	}
 }
 
-func TestServiceBackendReceivesOnlyItsAddressAndWildcards(t *testing.T) {
+func TestServiceBackendReceivingFollowsKernelLookupOrder(t *testing.T) {
 	backend := mustServiceBackend(t, "127.0.0.1:8080")
+	listener := func(ip string, owner listenerOwner) serviceListener {
+		return serviceListener{ip: net.ParseIP(ip), owner: owner}
+	}
 	for _, test := range []struct {
-		ip   string
-		want bool
+		name      string
+		listeners []serviceListener
+		want      serviceListenerVerdict
 	}{
-		{"127.0.0.1", true}, {"::ffff:127.0.0.1", true}, {"0.0.0.0", true}, {"::", true},
-		{"::1", false}, {"127.0.0.2", false}, {"10.0.0.5", false}, {"fe80::1", false},
+		{"exact payload", []serviceListener{listener("127.0.0.1", listenerOfPayload)}, serviceListenerOwned},
+		{"v4-mapped exact foreign", []serviceListener{listener("127.0.0.1", listenerOfPayload), listener("::ffff:127.0.0.1", listenerOfOther)}, serviceListenerForeign},
+		{"wildcards beside exact payload receive nothing", []serviceListener{listener("127.0.0.1", listenerOfPayload), listener("::", listenerOfOther), listener("0.0.0.0", listenerOfOther)}, serviceListenerOwned},
+		{"other addresses never receive", []serviceListener{listener("::1", listenerOfOther), listener("127.0.0.2", listenerOfOther), listener("10.0.0.5", listenerOfOther)}, serviceListenerUnseen},
+		{"IPv6 wildcard may be dual-stack beside a wildcard payload", []serviceListener{listener("0.0.0.0", listenerOfPayload), listener("::", listenerOfOther)}, serviceListenerForeign},
+		{"wildcard payload alone", []serviceListener{listener("::", listenerOfPayload)}, serviceListenerOwned},
 	} {
-		if got := backend.receives(net.ParseIP(test.ip)); got != test.want {
-			t.Errorf("listener on %s receives 127.0.0.1 = %t, want %t", test.ip, got, test.want)
+		if verdict, err := backend.verdict(test.listeners, nil); err != nil || verdict != test.want {
+			t.Errorf("%s: verdict = (%d, %v), want %d", test.name, verdict, err, test.want)
 		}
 	}
-	ipv6 := mustServiceBackend(t, "[::1]:8080")
-	if ipv6.receives(net.ParseIP("0.0.0.0")) || !ipv6.receives(net.ParseIP("::")) {
-		t.Error("an IPv6 backend must count the IPv6 wildcard and not the IPv4 one")
+	if _, err := backend.verdict([]serviceListener{listener("127.0.0.1", listenerOfUnknown)}, nil); err == nil {
+		t.Error("an unattributed receiving listener was given a verdict")
 	}
+	ipv6 := mustServiceBackend(t, "[::1]:8080")
+	if got := ipv6.receiving([]serviceListener{listener("0.0.0.0", listenerOfOther)}); len(got) != 0 {
+		t.Error("an IPv6 backend counted the IPv4 wildcard")
+	}
+}
+
+func TestGuardianPublishesBesideAnIPv6OnlyWildcardListener(t *testing.T) {
+	address := releasedServiceAddress(t)
+	// Go's tcp6 listener sets IPV6_V6ONLY, so this cannot receive
+	// 127.0.0.1 traffic; both Linux and macOS let it share the port.
+	wildcard, err := net.Listen("tcp6", net.JoinHostPort("::", strconv.Itoa(mustServiceBackend(t, address).port)))
+	if err != nil {
+		t.Skipf("IPv6 is unavailable here: %v", err)
+	}
+	defer wildcard.Close()
+	go serveAndCloseForTest(wildcard)
+	assertGuardianPublishes(t, helperExecution("listen", address), address)
 }
 
 func TestGuardianPublishesBesideAnUnrelatedListenerOnAnotherAddress(t *testing.T) {
@@ -84,104 +108,152 @@ func TestGuardianPublishesAListenerOwnedByAChildInThePayloadGroup(t *testing.T) 
 	assertGuardianPublishes(t, helperExecution("listen-child", address), address)
 }
 
+// The takeover tests serve the Guardian in this process with the real
+// inspector and a short recheck interval; the production interval is 10 s.
+
 func TestGuardianWithdrawsAListenerTakeoverWithoutAFailedProbe(t *testing.T) {
+	injectInspector(t)
 	address := releasedServiceAddress(t)
-	readiness := make(chan bool, 8)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	finished := runServiceAsync(ctx, serviceTestRunner(30*time.Second), Request{
-		AttemptID: "reuseport-takeover", Guarded: true,
-		Execution: helperExecution("listen-reuseport", address), IdlePolicy: IgnoreIdle, ServiceAddress: address,
-		ReadinessChanged: func(_, ready bool) { readiness <- ready },
-	})
-	if !waitGuardianReadiness(t, readiness) {
-		t.Fatal("the payload's own listener was not published")
-	}
+	guardian := runInProcessServiceGuardian(t, "listen-reuseport", address, 30*time.Second)
+	guardian.expectReadiness(t, true)
 	// The payload keeps listening, so every probe keeps succeeding: only the
 	// periodic ownership check can see the second, foreign listener.
 	foreign := listenReusePort(t, address)
-	if waitGuardianReadiness(t, readiness) {
-		t.Fatal("guardian kept a foreign SO_REUSEPORT listener published")
-	}
-	assertStillRunning(t, finished)
+	guardian.expectReadiness(t, false)
 	_ = foreign.Close()
-	if !waitGuardianReadiness(t, readiness) {
-		t.Fatal("guardian did not republish once only the payload listened again")
-	}
-	cancel()
-	outcome := awaitRun(t, finished)
-	if !errors.Is(outcome.err, context.Canceled) {
-		t.Fatalf("guardian outcome after cancellation = (%#v, %v)", outcome.result, outcome.err)
-	}
+	guardian.expectReadiness(t, true)
+	guardian.stopWithin(t, 5*time.Second)
 }
 
 func TestGuardianStopsAServiceWhoseListenerStaysForeign(t *testing.T) {
+	injectInspector(t)
 	address := releasedServiceAddress(t)
-	readiness := make(chan bool, 8)
-	finished := runServiceAsync(context.Background(), serviceTestRunner(3*time.Second), Request{
-		AttemptID: "lasting-takeover", Guarded: true,
-		Execution: helperExecution("listen-reuseport", address), IdlePolicy: IgnoreIdle, ServiceAddress: address,
-		ReadinessChanged: func(_, ready bool) { readiness <- ready },
-	})
-	if !waitGuardianReadiness(t, readiness) {
-		t.Fatal("the payload's own listener was not published")
-	}
+	guardian := runInProcessServiceGuardian(t, "listen-reuseport", address, time.Second)
+	guardian.expectReadiness(t, true)
 	foreign := listenReusePort(t, address)
 	defer foreign.Close()
-	if waitGuardianReadiness(t, readiness) {
-		t.Fatal("guardian kept a foreign SO_REUSEPORT listener published")
-	}
-	outcome := awaitRun(t, finished)
-	if outcome.err != nil || outcome.result.SpawnError == nil || outcome.result.SpawnError.Code != contract.SpawnFailureServicePortTaken {
-		t.Fatalf("lasting takeover outcome = (%#v, %v), want typed service_port_taken", outcome.result, outcome.err)
-	}
+	guardian.expectReadiness(t, false)
+	guardian.expectPortTaken(t, "outside the payload's process group")
 }
 
-func TestGuardianInspectionFailureIsNeverPublishedAndEndsTyped(t *testing.T) {
-	injected := errors.New("injected listener inspection failure")
-	var failing atomic.Bool
+// inspectionMode drives the injected inspector of the in-process tests.
+type inspectionMode int32
+
+const (
+	inspectReal inspectionMode = iota
+	inspectFail
+	inspectStall
+)
+
+var errInjectedInspection = errors.New("injected listener inspection failure")
+
+// injectInspector replaces the Guardian's inspector for one test with one
+// that follows mode, and shortens the recheck interval. A stalled
+// inspection blocks until its context ends and reports that on cancelled.
+func injectInspector(t *testing.T) (mode *atomic.Int32, cancelled <-chan struct{}) {
+	t.Helper()
+	mode = &atomic.Int32{}
+	observed := make(chan struct{}, 16)
 	priorInspector, priorInterval := serviceListenerInspector, serviceOwnershipRecheckInterval
-	serviceListenerInspector = func(backend serviceBackend, group int) (serviceListenerVerdict, error) {
-		if failing.Load() {
-			return 0, injected
+	serviceListenerInspector = func(ctx context.Context, backend serviceBackend, group int) (serviceListenerVerdict, error) {
+		switch inspectionMode(mode.Load()) {
+		case inspectFail:
+			return 0, errInjectedInspection
+		case inspectStall:
+			<-ctx.Done()
+			observed <- struct{}{}
+			return 0, ctx.Err()
 		}
-		return inspectServiceListeners(backend, group)
+		return inspectServiceListeners(ctx, backend, group)
 	}
 	serviceOwnershipRecheckInterval = 50 * time.Millisecond
 	t.Cleanup(func() { serviceListenerInspector, serviceOwnershipRecheckInterval = priorInspector, priorInterval })
+	return mode, observed
+}
 
+func TestGuardianInspectionFailureIsNeverPublishedAndEndsTyped(t *testing.T) {
+	mode, _ := injectInspector(t)
 	t.Run("before startup", func(t *testing.T) {
-		failing.Store(true)
-		statuses := runInProcessServiceGuardian(t, releasedServiceAddress(t), time.Second)
-		exited := nextGuardianStatus(t, statuses)
+		mode.Store(int32(inspectFail))
+		guardian := runInProcessServiceGuardian(t, "listen", releasedServiceAddress(t), time.Second)
+		exited := guardian.next(t)
 		if exited.Type != guardianMessageExited || exited.Result.SpawnError == nil ||
 			exited.Result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout ||
-			!strings.Contains(exited.Result.SpawnError.Message, injected.Error()) {
+			!strings.Contains(exited.Result.SpawnError.Message, errInjectedInspection.Error()) {
 			t.Fatalf("status = %#v, want startup_readiness_timeout naming the inspection failure", exited)
 		}
 	})
 	t.Run("after startup", func(t *testing.T) {
-		failing.Store(false)
-		statuses := runInProcessServiceGuardian(t, releasedServiceAddress(t), time.Second)
-		if ready := nextGuardianStatus(t, statuses); ready.Type != guardianMessageReadiness || !*ready.Ready {
-			t.Fatalf("status = %#v, want readiness true", ready)
+		mode.Store(int32(inspectReal))
+		guardian := runInProcessServiceGuardian(t, "listen", releasedServiceAddress(t), time.Second)
+		guardian.expectReadiness(t, true)
+		mode.Store(int32(inspectFail))
+		guardian.expectReadiness(t, false)
+		guardian.expectPortTaken(t, errInjectedInspection.Error())
+	})
+}
+
+func TestGuardianOwnershipDeadlineIgnoresProbeFailures(t *testing.T) {
+	mode, _ := injectInspector(t)
+	guardian := runInProcessServiceGuardian(t, "listen-toggle", releasedServiceAddress(t), 1500*time.Millisecond)
+	guardian.expectReadiness(t, true)
+	mode.Store(int32(inspectFail))
+	guardian.expectReadiness(t, false)
+	// The payload closes its listener: from now on probes fail. An ordinary
+	// probe loss never ends the payload, but it must not clear the
+	// ownership deadline that the failed inspection started.
+	if err := syscall.Kill(guardian.pid, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	guardian.expectPortTaken(t, errInjectedInspection.Error())
+}
+
+func TestGuardianStalledInspectionNeitherChangesReadinessNorDelaysStop(t *testing.T) {
+	t.Run("before startup", func(t *testing.T) {
+		mode, cancelled := injectInspector(t)
+		mode.Store(int32(inspectStall))
+		guardian := runInProcessServiceGuardian(t, "listen", releasedServiceAddress(t), 30*time.Second)
+		select {
+		case status := <-guardian.statuses:
+			t.Fatalf("guardian reported %#v while its only inspection stalled", status)
+		case <-time.After(500 * time.Millisecond):
 		}
-		failing.Store(true)
-		if withdrawn := nextGuardianStatus(t, statuses); withdrawn.Type != guardianMessageReadiness || *withdrawn.Ready {
-			t.Fatalf("status = %#v, want readiness withdrawn", withdrawn)
+		guardian.stopWithin(t, 2*time.Second)
+		select {
+		case <-cancelled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the stop did not cancel the stalled inspection")
 		}
-		exited := nextGuardianStatus(t, statuses)
-		if exited.Type != guardianMessageExited || exited.Result.SpawnError == nil ||
-			exited.Result.SpawnError.Code != contract.SpawnFailureServicePortTaken ||
-			!strings.Contains(exited.Result.SpawnError.Message, injected.Error()) {
-			t.Fatalf("status = %#v, want service_port_taken naming the inspection failure", exited)
+	})
+	t.Run("while ready", func(t *testing.T) {
+		mode, cancelled := injectInspector(t)
+		guardian := runInProcessServiceGuardian(t, "listen", releasedServiceAddress(t), 30*time.Second)
+		guardian.expectReadiness(t, true)
+		mode.Store(int32(inspectStall))
+		// Forwarding stays as it is until an inspection answers.
+		select {
+		case status := <-guardian.statuses:
+			t.Fatalf("guardian reported %#v while a recheck stalled", status)
+		case <-time.After(500 * time.Millisecond):
+		}
+		guardian.stopWithin(t, 2*time.Second)
+		select {
+		case <-cancelled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the stop did not cancel the stalled inspection")
 		}
 	})
 }
 
+type inProcessGuardian struct {
+	statuses <-chan guardianStatusMessage
+	pid      int
+	encoder  *json.Encoder
+}
+
 // runInProcessServiceGuardian serves a Guardian in this process for a
-// payload that owns address, and returns its statuses after Started.
-func runInProcessServiceGuardian(t *testing.T, address string, startupDeadline time.Duration) <-chan guardianStatusMessage {
+// helper payload in mode that owns address, and returns it after Started.
+func runInProcessServiceGuardian(t *testing.T, mode, address string, startupDeadline time.Duration) inProcessGuardian {
 	t.Helper()
 	agentEndpoint, guardianEndpoint, err := newGuardianSocketPair()
 	if err != nil {
@@ -189,17 +261,19 @@ func runInProcessServiceGuardian(t *testing.T, address string, startupDeadline t
 	}
 	done := make(chan error, 1)
 	go func() { done <- serveGuardian(guardianEndpoint, os.Stdout, os.Stderr) }()
-	start := guardianTestStart("listen")
+	start := guardianTestStart(mode)
 	start.Start.Args = append(start.Start.Args, address)
 	start.Start.ServiceAddress = address
 	start.Start.StartupReadinessDeadline = startupDeadline
 	start.Start.ReadinessProbeInterval = 20 * time.Millisecond
 	start.Start.ReadinessConnectTimeout = 100 * time.Millisecond
-	if err := json.NewEncoder(agentEndpoint).Encode(start); err != nil {
+	encoder := json.NewEncoder(agentEndpoint)
+	if err := encoder.Encode(start); err != nil {
 		t.Fatal(err)
 	}
 	decoder := json.NewDecoder(agentEndpoint)
-	if started, err := decodeGuardianStatus(decoder); err != nil || started.Type != guardianMessageStarted {
+	started, err := decodeGuardianStatus(decoder)
+	if err != nil || started.Type != guardianMessageStarted {
 		t.Fatalf("first status = (%#v, %v), want started", started, err)
 	}
 	statuses := make(chan guardianStatusMessage, 8)
@@ -220,13 +294,13 @@ func runInProcessServiceGuardian(t *testing.T, address string, startupDeadline t
 		}
 		_ = guardianEndpoint.Close()
 	})
-	return statuses
+	return inProcessGuardian{statuses: statuses, pid: started.PID, encoder: encoder}
 }
 
-func nextGuardianStatus(t *testing.T, statuses <-chan guardianStatusMessage) guardianStatusMessage {
+func (guardian inProcessGuardian) next(t *testing.T) guardianStatusMessage {
 	t.Helper()
 	select {
-	case status, open := <-statuses:
+	case status, open := <-guardian.statuses:
 		if !open {
 			t.Fatal("guardian status stream ended")
 		}
@@ -234,6 +308,41 @@ func nextGuardianStatus(t *testing.T, statuses <-chan guardianStatusMessage) gua
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for a guardian status")
 		return guardianStatusMessage{}
+	}
+}
+
+func (guardian inProcessGuardian) expectReadiness(t *testing.T, want bool) {
+	t.Helper()
+	if status := guardian.next(t); status.Type != guardianMessageReadiness || status.Ready == nil || *status.Ready != want {
+		t.Fatalf("status = %#v, want readiness %t", status, want)
+	}
+}
+
+func (guardian inProcessGuardian) expectPortTaken(t *testing.T, reason string) {
+	t.Helper()
+	exited := guardian.next(t)
+	if exited.Type != guardianMessageExited || exited.Result.SpawnError == nil ||
+		exited.Result.SpawnError.Code != contract.SpawnFailureServicePortTaken ||
+		!strings.Contains(exited.Result.SpawnError.Message, reason) {
+		t.Fatalf("status = %#v, want service_port_taken naming %q", exited, reason)
+	}
+}
+
+// stopWithin asks the Guardian to stop and requires its exit report within
+// bound. The listen payload honours TERM at once, so bound measures only
+// how long the Guardian took to begin termination.
+func (guardian inProcessGuardian) stopWithin(t *testing.T, bound time.Duration) {
+	t.Helper()
+	began := time.Now()
+	if err := guardian.encoder.Encode(guardianControlMessage{Type: guardianMessageStop}); err != nil {
+		t.Fatal(err)
+	}
+	exited := guardian.next(t)
+	if exited.Type != guardianMessageExited {
+		t.Fatalf("status after stop = %#v, want exited", exited)
+	}
+	if elapsed := time.Since(began); elapsed > bound {
+		t.Fatalf("stop took %s, want under %s", elapsed, bound)
 	}
 }
 
@@ -395,31 +504,14 @@ func TestGuardianTypesALostPayloadBindAsServicePortTaken(t *testing.T) {
 }
 
 func TestGuardianPublishesOnlyThePayloadsOwnListenerAfterStartup(t *testing.T) {
+	injectInspector(t)
 	address := releasedServiceAddress(t)
-	payload := make(chan int, 1)
-	readiness := make(chan bool, 8)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	finished := make(chan runOutcome, 1)
-	go func() {
-		result, err := serviceTestRunner(10*time.Second).Run(ctx, Request{
-			AttemptID: "owned-service-listener", Guarded: true,
-			Execution: helperExecution("listen-toggle", address), IdlePolicy: IgnoreIdle, ServiceAddress: address,
-			ProcessStarted:   func(processGroupID int) error { payload <- processGroupID; return nil },
-			ReadinessChanged: func(_, ready bool) { readiness <- ready },
-		}, nil)
-		finished <- runOutcome{result: result, err: err}
-	}()
-	if !waitGuardianReadiness(t, readiness) {
-		t.Fatal("the payload's own listener was not published")
-	}
-	pid := <-payload
-	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+	guardian := runInProcessServiceGuardian(t, "listen-toggle", address, 30*time.Second)
+	guardian.expectReadiness(t, true)
+	if err := syscall.Kill(guardian.pid, syscall.SIGUSR1); err != nil {
 		t.Fatal(err)
 	}
-	if waitGuardianReadiness(t, readiness) {
-		t.Fatal("guardian did not withdraw readiness after the payload closed its listener")
-	}
+	guardian.expectReadiness(t, false)
 
 	// Another process takes the port while the payload is not listening.
 	// Probes now succeed, yet nothing is published and the payload lives.
@@ -427,34 +519,19 @@ func TestGuardianPublishesOnlyThePayloadsOwnListenerAfterStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		for {
-			connection, err := foreign.Accept()
-			if err != nil {
-				return
-			}
-			_ = connection.Close()
-		}
-	}()
+	go serveAndCloseForTest(foreign)
 	select {
-	case ready := <-readiness:
-		t.Fatalf("guardian reported readiness %t for a listener outside the payload group", ready)
+	case status := <-guardian.statuses:
+		t.Fatalf("guardian reported %#v for a listener outside the payload group", status)
 	case <-time.After(time.Second):
 	}
-	assertStillRunning(t, finished)
 	_ = foreign.Close()
 
-	if err := syscall.Kill(pid, syscall.SIGUSR2); err != nil {
+	if err := syscall.Kill(guardian.pid, syscall.SIGUSR2); err != nil {
 		t.Fatal(err)
 	}
-	if !waitGuardianReadiness(t, readiness) {
-		t.Fatal("guardian did not republish the payload's own listener")
-	}
-	cancel()
-	outcome := awaitRun(t, finished)
-	if !errors.Is(outcome.err, context.Canceled) || outcome.result.Signal == "" {
-		t.Fatalf("guardian outcome after cancellation = (%#v, %v)", outcome.result, outcome.err)
-	}
+	guardian.expectReadiness(t, true)
+	guardian.stopWithin(t, 5*time.Second)
 }
 
 func serviceTestRunner(startupDeadline time.Duration) *Runner {

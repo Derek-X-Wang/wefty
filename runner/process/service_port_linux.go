@@ -4,6 +4,7 @@ package process
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -15,13 +16,13 @@ import (
 	"strings"
 )
 
-// inspectServiceListeners matches the kernel's listening sockets that can
-// receive the backend's connections against the socket descriptors of the
-// payload's process group. It reads only the network namespace the Guardian
-// shares with its payload, and only the descriptors of processes in that
-// group, which run as this user.
-func inspectServiceListeners(backend serviceBackend, processGroupID int) (serviceListenerVerdict, error) {
-	listening := make(map[string]bool)
+// inspectServiceListeners matches the kernel's listening sockets on the
+// backend port against the socket descriptors of the payload's process group.
+// It reads only the network namespace the Guardian shares with its payload,
+// and only the descriptors of processes in that group, which run as this
+// user.
+func inspectServiceListeners(ctx context.Context, backend serviceBackend, processGroupID int) (serviceListenerVerdict, error) {
+	var found []procListener
 	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		contents, err := os.ReadFile(table)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -31,40 +32,51 @@ func inspectServiceListeners(backend serviceBackend, processGroupID int) (servic
 		if err != nil {
 			return 0, err
 		}
-		inodes, err := receivingListenerInodes(contents, backend)
+		listeners, err := portListeners(contents, backend.port)
 		if err != nil {
 			return 0, fmt.Errorf("%s: %w", table, err)
 		}
-		for _, inode := range inodes {
-			listening[inode] = true
-		}
+		found = append(found, listeners...)
 	}
-	if len(listening) == 0 {
+	if len(backend.receiving(procServiceListeners(found, nil, nil))) == 0 {
 		return serviceListenerUnseen, nil
 	}
-	owned, unreadable, err := processGroupSockets(processGroupID)
+	owned, unreadable, err := processGroupSockets(ctx, processGroupID)
 	if err != nil {
 		return 0, err
 	}
-	for inode := range listening {
-		if owned[inode] {
-			continue
-		}
-		if unreadable != nil {
-			// The listener may belong to the member whose descriptors this
-			// user cannot read (for example a setuid child): it is neither
-			// confirmed as the payload's nor proven foreign.
-			return 0, unreadable
-		}
-		return serviceListenerForeign, nil
-	}
-	return serviceListenerOwned, nil
+	return backend.verdict(procServiceListeners(found, owned, unreadable), unreadable)
 }
 
-// receivingListenerInodes returns the inodes of the LISTEN sockets in one
-// /proc/net/tcp or tcp6 table that can receive the backend's connections.
-func receivingListenerInodes(table []byte, backend serviceBackend) ([]string, error) {
-	var inodes []string
+// procListener is one LISTEN row of /proc/net/tcp or tcp6.
+type procListener struct {
+	ip    net.IP
+	inode string
+}
+
+// procServiceListeners attributes each listener: the payload's when the
+// group holds its inode; unknown when it does not but some member's
+// descriptors could not be read, since the listener may be that member's;
+// otherwise another process's.
+func procServiceListeners(found []procListener, owned map[string]bool, unreadable error) []serviceListener {
+	listeners := make([]serviceListener, 0, len(found))
+	for _, listener := range found {
+		owner := listenerOfOther
+		switch {
+		case owned[listener.inode]:
+			owner = listenerOfPayload
+		case unreadable != nil:
+			owner = listenerOfUnknown
+		}
+		listeners = append(listeners, serviceListener{ip: listener.ip, owner: owner})
+	}
+	return listeners
+}
+
+// portListeners returns the LISTEN sockets on port in one /proc/net/tcp or
+// tcp6 table.
+func portListeners(table []byte, port int) ([]procListener, error) {
+	var listeners []procListener
 	lines := strings.Split(string(table), "\n")
 	for _, line := range lines[1:] {
 		// sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
@@ -76,22 +88,20 @@ func receivingListenerInodes(table []byte, backend serviceBackend) ([]string, er
 		if !found {
 			return nil, fmt.Errorf("malformed local address %q", fields[1])
 		}
-		port, err := strconv.ParseUint(hexPort, 16, 16)
+		value, err := strconv.ParseUint(hexPort, 16, 16)
 		if err != nil {
 			return nil, fmt.Errorf("malformed local port %q: %w", hexPort, err)
 		}
-		if int(port) != backend.port {
+		if int(value) != port {
 			continue
 		}
 		ip, err := procNetAddress(hexAddress)
 		if err != nil {
 			return nil, err
 		}
-		if backend.receives(ip) {
-			inodes = append(inodes, fields[9])
-		}
+		listeners = append(listeners, procListener{ip: ip, inode: fields[9]})
 	}
-	return inodes, nil
+	return listeners, nil
 }
 
 // procNetAddress decodes a /proc/net/tcp address: the network-order bytes
@@ -108,9 +118,12 @@ func procNetAddress(text string) (net.IP, error) {
 	return ip, nil
 }
 
+// readProcLink is os.Readlink outside tests, which inject a denial.
+var readProcLink = os.Readlink
+
 // processGroupSockets returns the socket inodes held open by members of
 // processGroupID, and why some member's descriptors could not be read.
-func processGroupSockets(processGroupID int) (sockets map[string]bool, unreadable error, err error) {
+func processGroupSockets(ctx context.Context, processGroupID int) (sockets map[string]bool, unreadable error, err error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, nil, err
@@ -118,6 +131,9 @@ func processGroupSockets(processGroupID int) (sockets map[string]bool, unreadabl
 	group := strconv.Itoa(processGroupID)
 	sockets = make(map[string]bool)
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if _, err := strconv.Atoi(entry.Name()); err != nil {
 			continue
 		}
@@ -146,8 +162,15 @@ func processGroupSockets(processGroupID int) (sockets map[string]bool, unreadabl
 			continue
 		}
 		for _, descriptor := range descriptors {
-			target, err := os.Readlink(directory + "/fd/" + descriptor.Name())
+			target, err := readProcLink(directory + "/fd/" + descriptor.Name())
+			if errors.Is(err, fs.ErrNotExist) {
+				// The descriptor was closed meanwhile.
+				continue
+			}
 			if err != nil {
+				// Linux checks ptrace access per link, so a readable
+				// directory does not prove readable links.
+				unreadable = fmt.Errorf("read descriptor %s of payload group member %s: %w", descriptor.Name(), entry.Name(), err)
 				continue
 			}
 			if inode, found := strings.CutPrefix(target, "socket:["); found {
