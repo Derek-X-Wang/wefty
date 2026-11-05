@@ -97,7 +97,7 @@ run_mutation() {
   local -a fixture_build_args=(--platform "linux/$arch" --file "$fixture_dockerfile")
   if [[ -n ${WEFTY_DEBIAN_SNAPSHOT_PROXY:-} ]]; then
     fixture_build_args+=(--build-arg "http_proxy=$WEFTY_DEBIAN_SNAPSHOT_PROXY"
-      --build-arg "HTTP_PROXY=$WEFTY_DEBIAN_SNAPSHOT_PROXY" --add-host snapshot.debian.org:192.0.2.1)
+      --build-arg "HTTP_PROXY=$WEFTY_DEBIAN_SNAPSHOT_PROXY")
   fi
   if ! docker build "${fixture_build_args[@]}" \
     --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .; then

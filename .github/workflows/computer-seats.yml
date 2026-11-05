@@ -96,7 +96,6 @@ jobs:
           restore-keys: debian-snapshot-v1-default-computer-seats-${{ matrix.arch }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile') }}-
       - name: Start the Debian snapshot cache proxy
         env:
-          DEBIAN_CACHE_OFFLINE: "1"
           ARCH: ${{ matrix.arch }}
           PROBE_PACKAGE: pool/main/x/xorg-server/xvfb_21.1.7-3%2bdeb12u12
         run: bash scripts/debian-snapshot-cache.sh start "${PROBE_PACKAGE}_${ARCH}.deb"
@@ -109,11 +108,11 @@ jobs:
           mkdir -p "$evidence"
           reference="localhost:5000/wefty-computer-default:${CANDIDATE_SHA}-${ARCH}"
           docker buildx build --no-cache --platform "linux/$ARCH" --provenance=false --sbom=false \
-            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" --add-host snapshot.debian.org:192.0.2.1 \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
             --output "type=oci,dest=$evidence/$ARCH.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "linux/$ARCH" --provenance=false --sbom=false \
-            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" --add-host snapshot.debian.org:192.0.2.1 \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
             --output "type=registry,registry.insecure=true,name=$reference,rewrite-timestamp=true" .
           scripts/verify-acceptance-image.sh --archive "$evidence/$ARCH.oci.tar" \
