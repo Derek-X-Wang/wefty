@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -275,7 +277,7 @@ func listenReusePort() {
 	config := net.ListenConfig{Control: func(_, _ string, connection syscall.RawConn) error {
 		var optionErr error
 		if err := connection.Control(func(descriptor uintptr) {
-			optionErr = syscall.SetsockoptInt(int(descriptor), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+			optionErr = unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 		}); err != nil {
 			return err
 		}

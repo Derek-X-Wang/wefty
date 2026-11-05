@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"golang.org/x/sys/unix"
 )
 
 // #1468: the agent releases a process service's backend port before the
@@ -296,7 +297,7 @@ func listenReusePort(t *testing.T, address string) net.Listener {
 	config := net.ListenConfig{Control: func(_, _ string, connection syscall.RawConn) error {
 		var optionErr error
 		if err := connection.Control(func(descriptor uintptr) {
-			optionErr = syscall.SetsockoptInt(int(descriptor), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+			optionErr = unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 		}); err != nil {
 			return err
 		}
