@@ -9,6 +9,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -128,13 +129,15 @@ func run(args []string, d deps) int {
 			fmt.Fprintln(d.stderr, "action-pins: base "+*base+":", err)
 			return exitUsage
 		}
-		known := map[string]bool{}
+		// An occurrence is unchanged only when the same file at the base
+		// has the same reference; a copy into another file is checked.
+		known := map[[2]string]bool{}
 		for _, ref := range baseRefs {
-			known[ref.uses] = true
+			known[[2]string{ref.file, ref.uses}] = true
 		}
 		var changed []actionRef
 		for _, ref := range refs {
-			if !known[ref.uses] {
+			if !known[[2]string{ref.file, ref.uses}] {
 				changed = append(changed, ref)
 			}
 		}
@@ -337,21 +340,22 @@ func (c *client) commit(repo, version string) outcome {
 	status, body, failure := c.get("/repos/"+escapePath(repo)+"/commits/"+escapePath(version), "application/vnd.github.sha")
 	switch {
 	case failure != "":
-		return outcome{state: unavailable, reason: failure}
+		return c.unavailable(failure)
 	case status == http.StatusNotFound || status == http.StatusUnprocessableEntity:
 		return outcome{state: invalid, reason: "no such repository or commit"}
 	case status != http.StatusOK:
-		return outcome{state: unavailable, reason: fmt.Sprintf("commit lookup returned HTTP %d", status)}
+		return c.unavailable(fmt.Sprintf("commit lookup returned HTTP %d", status))
 	}
 	sha := strings.TrimSpace(string(body))
 	if !commitSHA.MatchString(sha) {
-		return outcome{state: unavailable, reason: "commit lookup returned no commit SHA"}
+		return c.unavailable("commit lookup returned no commit SHA")
 	}
 	return outcome{state: resolved, sha: sha, reason: "resolves"}
 }
 
-// target checks that the action folder holds action.yml or action.yaml, or
-// that the reusable workflow file exists, at the commit.
+// target checks that the action folder holds the file action.yml or
+// action.yaml, or that the reusable workflow file exists, at the commit. A
+// directory or any other non-file entry with that name does not count.
 func (c *client) target(repo, sha, path string) outcome {
 	candidates := []string{"action.yml", "action.yaml"}
 	what := "no action.yml or action.yaml"
@@ -364,17 +368,37 @@ func (c *client) target(repo, sha, path string) outcome {
 		}
 	}
 	for _, candidate := range candidates {
-		status, _, failure := c.get("/repos/"+escapePath(repo)+"/contents/"+escapePath(candidate)+"?ref="+sha, "application/vnd.github+json")
+		status, body, failure := c.get("/repos/"+escapePath(repo)+"/contents/"+escapePath(candidate)+"?ref="+sha, "application/vnd.github+json")
 		switch {
 		case failure != "":
-			return outcome{state: unavailable, reason: failure}
-		case status == http.StatusOK:
-			return outcome{state: resolved, sha: sha, reason: "resolves"}
-		case status != http.StatusNotFound:
-			return outcome{state: unavailable, reason: fmt.Sprintf("contents lookup returned HTTP %d", status)}
+			return c.unavailable(failure)
+		case status == http.StatusNotFound:
+			continue
+		case status != http.StatusOK:
+			return c.unavailable(fmt.Sprintf("contents lookup returned HTTP %d", status))
+		}
+		// A file is a JSON object; a directory is a JSON array.
+		var entry any
+		if err := json.Unmarshal(body, &entry); err != nil {
+			return c.unavailable("contents lookup returned a body that does not decode")
+		}
+		switch entry := entry.(type) {
+		case []any:
+		case map[string]any:
+			if entry["type"] == "file" {
+				return outcome{state: resolved, sha: sha, reason: "resolves"}
+			}
+		default:
+			return c.unavailable("contents lookup returned neither an object nor an array")
 		}
 	}
 	return outcome{state: invalid, reason: what + " at commit " + sha}
+}
+
+// unavailable marks the API down, so later lookups make no calls.
+func (c *client) unavailable(reason string) outcome {
+	c.down = true
+	return outcome{state: unavailable, reason: reason}
 }
 
 // get returns the status and body of a GET, or a failure when the API is
@@ -397,13 +421,9 @@ func (c *client) get(path, accept string) (int, []byte, string) {
 		case status == http.StatusForbidden && (header.Get("X-RateLimit-Remaining") == "0" || header.Get("Retry-After") != ""):
 			failure = "HTTP 403 rate limited"
 		default:
-			if status != http.StatusOK && status != http.StatusNotFound && status != http.StatusUnprocessableEntity {
-				c.down = true
-			}
 			return status, body, ""
 		}
 	}
-	c.down = true
 	return 0, nil, fmt.Sprintf("%s after %d attempts", failure, c.attempts)
 }
 

@@ -19,10 +19,15 @@ const (
 	shaD = "dddddddddddddddddddddddddddddddddddddddd"
 )
 
+const (
+	fileBody = `{"type":"file","name":"action.yml"}`
+	dirBody  = `[{"type":"file","name":"inner.yml"}]`
+)
+
 // fakeAPI serves the two GitHub REST lookups from fixed tables.
 type fakeAPI struct {
-	commits map[string]string                      // owner/repo@ref -> sha
-	files   map[string]bool                        // owner/repo@sha:path
+	commits map[string]string                      // owner/repo@ref -> response body (the sha)
+	files   map[string]string                      // owner/repo@sha:path -> response body
 	fail    func(*http.Request) (int, http.Header) // status 0 serves the tables
 	calls   []string
 	auth    []string
@@ -48,11 +53,12 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 		if f.record(w, r) {
 			return
 		}
-		if !f.files[r.PathValue("owner")+"/"+r.PathValue("repo")+"@"+r.URL.Query().Get("ref")+":"+r.PathValue("path")] {
+		body, ok := f.files[r.PathValue("owner")+"/"+r.PathValue("repo")+"@"+r.URL.Query().Get("ref")+":"+r.PathValue("path")]
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(`{"type":"file"}`))
+		w.Write([]byte(body))
 	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -132,19 +138,29 @@ func steps(uses ...string) string {
 func defaultAPI() *fakeAPI {
 	return &fakeAPI{
 		commits: map[string]string{
-			"actions/checkout@" + shaA:  shaA,
-			"actions/setup-go@v7":       shaB,
-			"actions/cache@" + shaC:     shaC,
-			"owner/yaml-action@" + shaD: shaD,
-			"owner/workflows@" + shaD:   shaD,
-			"owner/no-action@" + shaD:   shaD,
+			"actions/checkout@" + shaA:    shaA,
+			"actions/setup-go@v7":         shaB,
+			"actions/cache@" + shaC:       shaC,
+			"owner/yaml-action@" + shaD:   shaD,
+			"owner/workflows@" + shaD:     shaD,
+			"owner/no-action@" + shaD:     shaD,
+			"owner/dir-action@" + shaD:    shaD,
+			"owner/dir-then-file@" + shaD: shaD,
+			"owner/submodule@" + shaD:     shaD,
+			"owner/branchy@release/v1#rc": shaA,
 		},
-		files: map[string]bool{
-			"actions/checkout@" + shaA + ":action.yml":                 true,
-			"actions/setup-go@" + shaB + ":action.yml":                 true,
-			"actions/cache@" + shaC + ":save/action.yml":               true,
-			"owner/yaml-action@" + shaD + ":action.yaml":               true,
-			"owner/workflows@" + shaD + ":.github/workflows/build.yml": true,
+		files: map[string]string{
+			"actions/checkout@" + shaA + ":action.yml":                 fileBody,
+			"actions/setup-go@" + shaB + ":action.yml":                 fileBody,
+			"actions/cache@" + shaC + ":save/action.yml":               fileBody,
+			"owner/yaml-action@" + shaD + ":action.yaml":               fileBody,
+			"owner/workflows@" + shaD + ":.github/workflows/build.yml": fileBody,
+			"owner/workflows@" + shaD + ":.github/workflows/dir.yml":   dirBody,
+			"owner/dir-action@" + shaD + ":action.yml":                 dirBody,
+			"owner/dir-then-file@" + shaD + ":action.yml":              dirBody,
+			"owner/dir-then-file@" + shaD + ":action.yaml":             fileBody,
+			"owner/submodule@" + shaD + ":action.yml":                  `{"type":"submodule"}`,
+			"owner/branchy@" + shaA + ":action.yml":                    fileBody,
 		},
 	}
 }
@@ -167,6 +183,10 @@ func TestReferencesResolve(t *testing.T) {
 		{name: "reusable workflow", uses: "owner/workflows/.github/workflows/build.yml@" + shaD, job: true, want: exitValid},
 		{name: "missing reusable workflow", uses: "owner/workflows/.github/workflows/gone.yml@" + shaD, job: true, want: exitInvalid, reason: "no such reusable workflow"},
 		{name: "malformed", uses: "checkout@v7", want: exitInvalid, reason: "not an owner/repo[/path]@ref reference"},
+		{name: "directory named action.yml", uses: "owner/dir-action@" + shaD, want: exitInvalid, reason: "no action.yml or action.yaml"},
+		{name: "action.yaml file after an action.yml directory", uses: "owner/dir-then-file@" + shaD, want: exitValid},
+		{name: "submodule named action.yml", uses: "owner/submodule@" + shaD, want: exitInvalid, reason: "no action.yml or action.yaml"},
+		{name: "directory named like the reusable workflow", uses: "owner/workflows/.github/workflows/dir.yml@" + shaD, job: true, want: exitInvalid, reason: "no such reusable workflow"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := defaultAPI()
@@ -347,17 +367,85 @@ func TestBaseChecksOnlyIntroducedOrChangedRefs(t *testing.T) {
 			t.Fatalf("exit %d\n%s", got.code, got.stdout)
 		}
 	})
+	t.Run("broken base ref copied into another file", func(t *testing.T) {
+		api := defaultAPI()
+		head := map[string]string{
+			".github/workflows/a.yml": base[".github/workflows/a.yml"],
+			".github/workflows/b.yml": steps("unknown/kept@" + shaA),
+		}
+		got := runWith(t, api.server(t).URL, head, base, "--base", "base-rev")
+		if got.code != exitInvalid || !strings.Contains(got.stdout, "invalid pin: .github/workflows/b.yml jobs.build.steps[0]: unknown/kept@"+shaA) ||
+			strings.Contains(got.stdout, "invalid pin: .github/workflows/a.yml") || !strings.Contains(got.stdout, "checked 1 action refs") {
+			t.Fatalf("exit %d\n%s", got.code, got.stdout)
+		}
+	})
 	t.Run("no new refs", func(t *testing.T) {
 		api := defaultAPI()
 		head := map[string]string{
-			".github/workflows/a.yml":     steps("unknown/kept@"+shaA, "./local-action"),
-			".github/workflows/moved.yml": steps("actions/setup-go@v6", "actions/checkout@"+shaA),
+			".github/workflows/a.yml": steps("actions/setup-go@v6", "./local-action", "unknown/kept@"+shaA, "actions/checkout@"+shaA),
 		}
 		got := runWith(t, api.server(t).URL, head, base, "--base", "base-rev")
 		if got.code != exitValid || !strings.Contains(got.stdout, "no new or changed action refs") || len(api.calls) != 0 {
 			t.Fatalf("exit %d, calls %v\n%s", got.code, api.calls, got.stdout)
 		}
 	})
+}
+
+// An unavailable answer from one endpoint stops every later lookup, so a
+// second distinct ref makes no call.
+func TestEndpointUnavailableStopsLaterLookups(t *testing.T) {
+	for _, tc := range []struct {
+		name, uses, reason string
+		fail               func(*http.Request) (int, http.Header)
+	}{
+		{name: "commit 200 without a SHA", uses: "owner/nosha@" + shaD, reason: "commit lookup returned no commit SHA"},
+		{name: "contents 422", uses: "actions/checkout@" + shaA, reason: "contents lookup returned HTTP 422",
+			fail: func(r *http.Request) (int, http.Header) {
+				if strings.Contains(r.URL.Path, "/contents/") {
+					return http.StatusUnprocessableEntity, nil
+				}
+				return 0, nil
+			}},
+		{name: "contents body that does not decode", uses: "owner/garbled@" + shaD, reason: "contents lookup returned a body that does not decode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := defaultAPI()
+			api.commits["owner/nosha@"+shaD] = "<html>not a sha</html>"
+			api.commits["owner/garbled@"+shaD] = shaD
+			api.files["owner/garbled@"+shaD+":action.yml"] = "{not json"
+			api.fail = tc.fail
+			head := map[string]string{".github/workflows/a.yml": steps(tc.uses, "actions/setup-go@v7")}
+			got := runWith(t, api.server(t).URL, head, nil, "--all")
+			if got.code != exitUnavailable ||
+				!strings.Contains(got.stdout, "API unavailable: .github/workflows/a.yml jobs.build.steps[0]: "+tc.uses+": "+tc.reason) ||
+				!strings.Contains(got.stdout, "API unavailable: .github/workflows/a.yml jobs.build.steps[1]: actions/setup-go@v7: not checked after an earlier API failure") {
+				t.Fatalf("exit %d\n%s", got.code, got.stdout)
+			}
+			for _, call := range api.calls {
+				if strings.Contains(call, "setup-go") {
+					t.Fatalf("looked up the second ref after the outage: %v", api.calls)
+				}
+			}
+		})
+	}
+}
+
+// A version with '/' is escaped per segment: slashes stay, other reserved
+// characters are escaped, and the ref resolves.
+func TestVersionWithSlashResolves(t *testing.T) {
+	api := defaultAPI()
+	head := map[string]string{".github/workflows/a.yml": steps("owner/branchy@release/v1#rc")}
+	got := runWith(t, api.server(t).URL, head, nil, "--all")
+	if got.code != exitValid {
+		t.Fatalf("exit %d\n%s", got.code, got.stdout)
+	}
+	want := []string{
+		"/repos/owner/branchy/commits/release/v1%23rc",
+		"/repos/owner/branchy/contents/action.yml?ref=" + shaA,
+	}
+	if strings.Join(api.calls, " ") != strings.Join(want, " ") {
+		t.Fatalf("calls = %v, want %v", api.calls, want)
+	}
 }
 
 func TestCollectReadsOnlyDecodedRemoteUses(t *testing.T) {
