@@ -1743,6 +1743,12 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 		if replayed != nil {
 			*replayed = true
 		}
+		if computer.ReconfigurationPhase != ComputerReconfigurationReimaging ||
+			request.IntentRevision != computer.IntentRevision-1 {
+			return computer, nil
+		}
+		// Keep driving this reimage's pending projection through the exact
+		// replay validator while the old Job is quiescing.
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return Computer{}, snapshotReadError(lookupErr, "read Computer reimage replay")
 	}

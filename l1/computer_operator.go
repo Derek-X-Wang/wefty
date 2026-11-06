@@ -269,6 +269,13 @@ func projectComputerResponse(ctx context.Context, reads readModel, selected Comp
 		}
 		computer.RestoreOperation = &op
 	}
+	if selected.LastGrowOperation != nil {
+		outcome, err := reads.computerStorageGrowOutcome(ctx, computer.ComputerID, selected.LastGrowOperation.OperationRevision)
+		if err != nil {
+			return Computer{}, err
+		}
+		computer.LastGrowOperation = outcome
+	}
 	return projectComputerForCallerTx(ctx, reads, computer, actor)
 }
 
