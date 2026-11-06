@@ -2,9 +2,20 @@ package agent
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
+
+func readSnapshotExpired(err error) bool {
+	var protocol *ProtocolError
+	if !errors.As(err, &protocol) || protocol.StatusCode != http.StatusServiceUnavailable ||
+		protocol.APIError.Code != contract.ErrorUnavailable || !protocol.APIError.Retryable {
+		return false
+	}
+	reason := protocol.APIError.Details["reason"]
+	return reason == "read_snapshot_expired" || reason == "read_snapshot_admission_expired"
+}
 
 type agentProtocolErrorClassification struct {
 	destination         errorDestination

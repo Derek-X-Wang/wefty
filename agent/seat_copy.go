@@ -189,8 +189,14 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 }
 
 func (c *Client) AuthorizeSeatCopy(ctx context.Context, id string, r l1.SeatCopyAuthorityInput) (l1.SeatCopyAuthority, error) {
+	return c.authorizeSeatCopyWithClock(ctx, id, r, systemClock{})
+}
+
+func (c *Client) authorizeSeatCopyWithClock(ctx context.Context, id string, r l1.SeatCopyAuthorityInput, clock Clock) (l1.SeatCopyAuthority, error) {
 	var value l1.SeatCopyAuthority
-	err := c.post(ctx, "/v1/agent/seats/"+id+"/copy-authority", r, &value)
+	err := retryReadSnapshotWithClock(ctx, clock, func(ctx context.Context) error {
+		return c.post(ctx, "/v1/agent/seats/"+id+"/copy-authority", r, &value)
+	})
 	return value, err
 }
 func (c *Client) RecordSeatCopy(ctx context.Context, id string, r l1.SeatCopyReceipt) error {

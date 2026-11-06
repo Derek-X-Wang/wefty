@@ -168,10 +168,16 @@ func (c *Client) ClaimPoll(ctx context.Context, nodeID, bootSessionID, class str
 }
 
 func (c *Client) ProveServiceBinding(ctx context.Context, nodeID, bootSessionID, jobID string) (bool, error) {
+	return c.proveServiceBindingWithClock(ctx, nodeID, bootSessionID, jobID, systemClock{})
+}
+
+func (c *Client) proveServiceBindingWithClock(ctx context.Context, nodeID, bootSessionID, jobID string, clock Clock) (bool, error) {
 	var response l1.ServiceBindingProofResponse
-	err := c.post(ctx, "/v1/agent/jobs/"+url.PathEscape(jobID)+"/service-binding-proof", l1.ServiceBindingProofRequest{
-		NodeID: nodeID, BootSessionID: bootSessionID,
-	}, &response)
+	err := retryReadSnapshotWithClock(ctx, clock, func(ctx context.Context) error {
+		return c.post(ctx, "/v1/agent/jobs/"+url.PathEscape(jobID)+"/service-binding-proof", l1.ServiceBindingProofRequest{
+			NodeID: nodeID, BootSessionID: bootSessionID,
+		}, &response)
+	})
 	return response.Bound, err
 }
 
