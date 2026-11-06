@@ -46,7 +46,7 @@ func TestSeatRunBindingRefusesEndedSeatAndAttemptReuse(t *testing.T) {
 func startSeatRunFixture(t *testing.T) (*seatLifecycleFixture, string, string, Claim, SeatRunControlRequest) {
 	t.Helper()
 	f, id, secret, _ := liveSeatForRun(t)
-	binding, err := f.store.ResolveSeatRun(t.Context(), id, secret)
+	binding, err := testReads(f.store).ResolveSeatRun(t.Context(), id, secret)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,14 +144,14 @@ func liveSeatForRun(t *testing.T) (*seatLifecycleFixture, string, string, SeatCo
 		t.Fatalf("claim=%v %v", claim, err)
 	}
 	auth := ComputerSeatAttemptRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, FencingToken: claim.Lease.FencingToken}
-	list, err := f.store.GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
+	list, err := testReads(f.store).GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.store.ReportComputerSeatObservations(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, ComputerSeatObservationReport{NodeID: auth.NodeID, BootSessionID: auth.BootSessionID, FencingToken: auth.FencingToken, ListRevision: list.Revision, Generation: 1, Sequence: 1, Seats: []ComputerSeatObservation{{SeatID: id, Place: 1, State: ComputerSeatReady}}}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+	result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || result.Credential == "" {
 		t.Fatalf("credential: %+v %v", result, err)
 	}
@@ -593,7 +593,7 @@ func reopenSeatRunOnNewL1Boot(t *testing.T, f *seatLifecycleFixture) *seatBootTe
 }
 func assertSeatRunContinues(t *testing.T, f *seatLifecycleFixture, claim Claim, input SeatRunControlRequest) {
 	t.Helper()
-	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	job, err := testReads(f.store).GetJob(t.Context(), claim.Job.JobID)
 	if err != nil || (job.State != contract.JobClaimed && job.State != contract.JobRunning) {
 		t.Fatalf("L1 reboot or missing stamp ended command: %+v %v", job, err)
 	}
@@ -637,26 +637,29 @@ func TestSeatRunL1HostRebootRestampsWithoutEndingCommand(t *testing.T) {
 func TestSeatRunL1HostRebootBackstopWaitsForFreshWindow(t *testing.T) {
 	f, id, secret, claim, input := startSeatRunFixture(t)
 	clock := reopenSeatRunOnNewL1Boot(t, f)
-	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+	// CheckSeatLife logs and skips a pass whose inventory read expires, so
+	// give each pass room to run on a slow host.
+	life := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, 10*time.Second)
+	if err := f.store.CheckSeatLife(life); err != nil {
 		t.Fatal(err)
 	}
 	// Repeated maintenance must retain the re-stamp, rather than continually
 	// renewing the window. The old boot's elapsed value is unrelated.
 	clock.elapsed += 65*time.Minute - time.Nanosecond
-	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+	if err := f.store.CheckSeatLife(life); err != nil {
 		t.Fatal(err)
 	}
 	assertSeatRunContinues(t, f, claim, input)
 	assertSeatRunStartStamp(t, f, claim, clock.boot, int64(10*time.Minute))
 	clock.elapsed++
-	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+	if err := f.store.CheckSeatLife(life); err != nil {
 		t.Fatal(err)
 	}
-	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	job, err := testReads(f.store).GetJob(t.Context(), claim.Job.JobID)
 	if err != nil || job.State != contract.JobFailed {
 		t.Fatalf("fresh backstop did not finish: %+v %v", job, err)
 	}
-	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,10 +676,10 @@ func TestSeatRunL1HostRebootBackstopWaitsForFreshWindow(t *testing.T) {
 		t.Fatal("fresh backstop omitted finished event")
 	}
 	clock.elapsed += 30 * time.Minute
-	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+	if err = f.store.CheckSeatLife(life); err != nil {
 		t.Fatal(err)
 	}
-	value, err := f.store.GetSeatRequest(t.Context(), id)
+	value, err := testReads(f.store).GetSeatRequest(t.Context(), id)
 	if err != nil || value.State != SeatEnding {
 		t.Fatalf("fresh backstop did not release hold: %+v %v", value, err)
 	}

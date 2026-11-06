@@ -49,7 +49,8 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		return err
 	}
 	var job l1.Job
-	if err := clients.l1.do(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(args[0])+"/cancel", nil, nil, &job, http.StatusOK); err != nil {
+	readBack := readBackWith("/v1/jobs/"+url.PathEscape(args[0]), "wefty inspect "+args[0])
+	if _, err := clients.l1.mutate(ctx, readBack, http.MethodPost, "/v1/jobs/"+url.PathEscape(args[0])+"/cancel", nil, &job, http.StatusOK); err != nil {
 		return clients.cancelIdentityHint(err)
 	}
 	if jsonOutput {

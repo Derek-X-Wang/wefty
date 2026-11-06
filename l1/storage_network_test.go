@@ -24,7 +24,7 @@ func TestComputerCloneKeepsSourceNetwork(t *testing.T) {
 				if err != nil || replayed != wantReplay || clone.Network != network {
 					t.Fatalf("clone network=%q replay=%t error=%v; want %q replay=%t", clone.Network, replayed, err, network, wantReplay)
 				}
-				observed, err := h.store.GetComputer(t.Context(), clone.ComputerID)
+				observed, err := testReads(h.store).GetComputer(t.Context(), clone.ComputerID)
 				if err != nil || observed.Network != network {
 					t.Fatalf("observed network=%q error=%v; want %q", observed.Network, err, network)
 				}

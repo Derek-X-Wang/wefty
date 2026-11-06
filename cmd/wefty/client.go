@@ -331,7 +331,7 @@ func (c *apiClients) interruptRestartableAttempt(ctx context.Context, nodeID, at
 
 func (c *apiClients) createService(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	var job l1.Job
-	err := c.l1.do(ctx, http.MethodPost, "/v1/jobs", spec, nil, &job, http.StatusCreated, http.StatusOK)
+	_, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, "/v1/jobs", spec, &job, http.StatusCreated, http.StatusOK)
 	return job, err
 }
 
@@ -342,7 +342,7 @@ type mutationReceipt struct {
 
 func (c *apiClients) createComputer(ctx context.Context, request l1.CreateComputerRequest) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, "/v1/computers", request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, "/v1/computers", request, &computer,
 		http.StatusCreated, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -369,8 +369,8 @@ func (c *apiClients) setComputerDesiredState(ctx context.Context, computerID str
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/desired-state"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &computer, http.StatusAccepted)
-	return computer, mutationReceiptFromHeaders(headers), err
+	headers, err := c.l1.mutate(ctx, readBackComputer(computerID), http.MethodPut, path, request, &computer, http.StatusAccepted)
+	return computer, readBackReceipt(headers, computer, request.ComputerMutationPrecondition), err
 }
 
 func (c *apiClients) restartComputer(ctx context.Context, computerID string,
@@ -378,7 +378,7 @@ func (c *apiClients) restartComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/restart"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -388,8 +388,8 @@ func (c *apiClients) removeComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/remove"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted)
-	return computer, mutationReceiptFromHeaders(headers), err
+	headers, err := c.l1.mutate(ctx, readBackComputer(computerID), http.MethodPost, path, request, &computer, http.StatusAccepted)
+	return computer, readBackReceipt(headers, computer, request.ComputerMutationPrecondition), err
 }
 
 func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
@@ -397,7 +397,7 @@ func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reimage"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -407,7 +407,7 @@ func (c *apiClients) resetComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-reset"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -417,7 +417,7 @@ func (c *apiClients) growComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/grow"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -427,9 +427,25 @@ func (c *apiClients) abortComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reconfiguration-abort"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer,
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
+}
+
+// readBackComputer is the plan for an unkeyed Computer mutation.
+func readBackComputer(computerID string) postChangeRecovery {
+	return readBackWith("/v1/computers/"+url.PathEscape(computerID), "wefty services status "+computerID)
+}
+
+// readBackReceipt keeps L1's receipt. A read-back after a committed change
+// can lack the receipt headers, so it applies L1's own rule: the change
+// applied when it advanced the observed intent revision.
+func readBackReceipt(headers http.Header, computer l1.Computer, request l1.ComputerMutationPrecondition) mutationReceipt {
+	receipt := mutationReceiptFromHeaders(headers)
+	if headers != nil && headers.Get("Mutation-Applied") == "" {
+		receipt.Applied = computer.IntentRevision > request.IntentRevision
+	}
+	return receipt
 }
 
 func mutationReceiptFromHeaders(headers http.Header) mutationReceipt {
@@ -466,7 +482,7 @@ func (c *apiClients) setServiceDesiredState(
 ) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/desired-state?class=" + contract.JobClassService
-	err := c.l1.do(ctx, http.MethodPut, path, l1.ServiceDesiredStateRequest{DesiredState: desired}, nil, &job, http.StatusAccepted)
+	_, err := c.l1.mutate(ctx, readBackService(jobID), http.MethodPut, path, l1.ServiceDesiredStateRequest{DesiredState: desired}, &job, http.StatusAccepted)
 	return job, err
 }
 
@@ -477,7 +493,7 @@ func (c *apiClients) restartService(ctx context.Context, jobID, idempotencyKey s
 func (c *apiClients) restartServiceRequest(ctx context.Context, jobID string, request l1.ServiceRestartRequest) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/restart?class=" + contract.JobClassService
-	err := c.l1.do(ctx, http.MethodPost, path, request, nil,
+	_, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request,
 		&job, http.StatusAccepted, http.StatusOK)
 	return job, err
 }
@@ -485,15 +501,20 @@ func (c *apiClients) restartServiceRequest(ctx context.Context, jobID string, re
 func (c *apiClients) removeService(ctx context.Context, jobID string) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/remove?class=" + contract.JobClassService
-	err := c.l1.do(ctx, http.MethodPost, path, nil, nil, &job, http.StatusAccepted)
+	_, err := c.l1.mutate(ctx, readBackService(jobID), http.MethodPost, path, nil, &job, http.StatusAccepted)
 	return job, err
 }
 
 func (c *apiClients) forceForgetService(ctx context.Context, jobID string) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/forget?class=" + contract.JobClassService
-	err := c.l1.do(ctx, http.MethodPost, path, l1.ForceForgetRequest{Force: true}, nil, &job, http.StatusOK)
+	_, err := c.l1.mutate(ctx, readBackService(jobID), http.MethodPost, path, l1.ForceForgetRequest{Force: true}, &job, http.StatusOK)
 	return job, err
+}
+
+// readBackService is the plan for an unkeyed service mutation.
+func readBackService(jobID string) postChangeRecovery {
+	return readBackWith("/v1/jobs/"+url.PathEscape(jobID)+"?class="+contract.JobClassService, "wefty services status "+jobID)
 }
 
 func (c *apiClients) getServiceLogs(ctx context.Context, jobID, cursor string, limit int) (l1.LogPage, error) {
@@ -610,7 +631,7 @@ func (c *apiClients) getComputerStorageAuthority(ctx context.Context, computerID
 func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string, request l1.ComputerBackupCapRequest) (l1.Computer, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backup-cap"
-	err := c.l1.do(ctx, http.MethodPut, path, request, nil, &computer, http.StatusOK)
+	_, err := c.l1.mutate(ctx, readBackComputer(computerID), http.MethodPut, path, request, &computer, http.StatusOK)
 	return computer, err
 }
 
@@ -619,7 +640,7 @@ func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string
 func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, string, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	return computer, headers.Get("Backup-Id"), responseWasIdempotentReplay(headers), err
 }
 
@@ -686,7 +707,7 @@ func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backup
 func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, int64, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/restore"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operationRevision int64
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Restore-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		operationRevision = parsed
@@ -715,7 +736,7 @@ type cloneComputerOperation struct {
 func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, cloneComputerOperation, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(sourceComputerID) + "/backups/" + url.PathEscape(backupID) + "/clone"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operation cloneComputerOperation
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Clone-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		if computerID := strings.TrimSpace(headers.Get("Clone-Computer-Id")); computerID != "" {
@@ -774,7 +795,7 @@ func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID 
 func (c *apiClients) attestComputerCustodyDeleted(ctx context.Context, exportID string, request l1.ComputerCustodyAttestationRequest) (l1.ComputerCustodyExport, bool, error) {
 	var export l1.ComputerCustodyExport
 	path := "/v1/custody-exports/" + url.PathEscape(exportID) + "/attest-deleted"
-	headers, err := c.l1.doWithResponse(ctx, http.MethodPost, path, request, nil, &export, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &export, http.StatusOK)
 	return export, responseWasIdempotentReplay(headers), err
 }
 
@@ -903,6 +924,81 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 		}
 	}
 	return err
+}
+
+// postChangeRecovery is one L1 mutation's explicit plan for an answer that
+// says the change committed but its post-change read expired (#1511): 503
+// `unavailable`, retryable, details.reason=read_snapshot_post_change_failed
+// and mutation_applied=true. Each mutation in this file names its plan.
+type postChangeRecovery struct {
+	// resend repeats the identical request once. Only a request whose body
+	// carries its idempotency or dispatch key may: L1 resolves that replay
+	// before any precondition and answers with the committed object.
+	resend bool
+	// readBack is the GET path that observes the committed resource. A
+	// request without a key is never repeated; it is read back instead.
+	readBack string
+	// hint tells the person how to read the result again when neither works.
+	hint string
+}
+
+// resendWithKey is the plan for a keyed mutation.
+var resendWithKey = postChangeRecovery{resend: true,
+	hint: "run the same command again with the same idempotency key to read it"}
+
+// readBackWith is the plan for an unkeyed mutation with a matching GET.
+func readBackWith(path, command string) postChangeRecovery {
+	return postChangeRecovery{readBack: path, hint: "run `" + command + "` to read it again"}
+}
+
+// committedReadUnavailable returns L1's answer when it reports a committed
+// change whose post-change read was unavailable, and nil otherwise.
+func committedReadUnavailable(err error) *apiResponseError {
+	var response *apiResponseError
+	if !errors.As(err, &response) || !isRetryableL1Answer(err) {
+		return nil
+	}
+	if applied, _ := response.APIError.Details["mutation_applied"].(bool); !applied ||
+		response.APIError.Details["reason"] != "read_snapshot_post_change_failed" {
+		return nil
+	}
+	return response
+}
+
+// mutate sends one L1 mutation exactly once. If L1 committed it but could not
+// read it back, mutate takes the mutation's one bounded recovery step, which
+// fills target as a plain success would. When that step fails too, the
+// answer stays exit 13 and says plainly that the change was applied. A
+// caller's cancellation ends everything, and a transport failure is never
+// retried.
+func (c *apiClient) mutate(ctx context.Context, recovery postChangeRecovery, method, path string, body any, target any, success ...int) (http.Header, error) {
+	headers, err := c.doWithResponse(ctx, method, path, body, nil, target, success...)
+	committed := committedReadUnavailable(err)
+	if committed == nil {
+		return headers, err
+	}
+	var recoveryErr error
+	switch {
+	case recovery.resend:
+		if recoveryErr = readRetryWait(ctx, readRetryBackoff(0)); recoveryErr == nil {
+			var resent http.Header
+			if resent, recoveryErr = c.doWithResponse(ctx, method, path, body, nil, target, success...); recoveryErr == nil {
+				return resent, nil
+			}
+		}
+	case recovery.readBack != "":
+		// The mutation's own headers keep its receipt; the GET has the quiet
+		// one-shot read retry (#773).
+		if recoveryErr = c.do(ctx, http.MethodGet, recovery.readBack, nil, nil, target, http.StatusOK); recoveryErr == nil {
+			return headers, nil
+		}
+	}
+	if errors.Is(recoveryErr, context.Canceled) {
+		return headers, recoveryErr
+	}
+	applied := *committed
+	applied.APIError.Message += "; the change was applied, but reading it back was unavailable; " + recovery.hint
+	return headers, &applied
 }
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {

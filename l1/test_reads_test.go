@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
@@ -32,6 +33,12 @@ func (r testReadStore) GetComputerPolicyRevocation(ctx context.Context, identity
 	})
 }
 
+func (r testReadStore) GetComputerSeatListForAttempt(ctx context.Context, identity, computerID, jobID, attemptID string, request ComputerSeatAttemptRequest) (ComputerSeatList, error) {
+	return retryTestStatusRead(ctx, func() (ComputerSeatList, error) {
+		return r.store.GetComputerSeatListForAttempt(ctx, identity, computerID, jobID, attemptID, request)
+	})
+}
+
 func (r testReadStore) GetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error) {
 	return retryTestStatusRead(ctx, func() (ComputerSubmissionState, error) {
 		return r.store.GetComputerSubmissionState(ctx, identity, computerID)
@@ -48,6 +55,18 @@ func (r testReadStore) GetJobLogs(ctx context.Context, jobID, cursor string, lim
 
 func (r testReadStore) GetJobResult(ctx context.Context, jobID string) (JobResult, error) {
 	return retryTestStatusRead(ctx, func() (JobResult, error) { return r.store.GetJobResult(ctx, jobID) })
+}
+
+func (r testReadStore) GetSeatCall(ctx context.Context, caller, id string) (SeatCallResult, error) {
+	return retryTestStatusRead(ctx, func() (SeatCallResult, error) { return r.store.GetSeatCall(ctx, caller, id) })
+}
+
+func (r testReadStore) GetSeatLogs(ctx context.Context, caller, id, secret, cursor string, limit int) (SeatLogPage, error) {
+	return retryTestStatusRead(ctx, func() (SeatLogPage, error) { return r.store.GetSeatLogs(ctx, caller, id, secret, cursor, limit) })
+}
+
+func (r testReadStore) GetSeatRequest(ctx context.Context, id string) (SeatRequest, error) {
+	return retryTestStatusRead(ctx, func() (SeatRequest, error) { return r.store.GetSeatRequest(ctx, id) })
 }
 
 func (r testReadStore) ListChildJobs(ctx context.Context, parentJobID, cursorValue string, limit int) (JobList, error) {
@@ -161,6 +180,10 @@ func (r testReadStore) ResolveAttemptCredential(ctx context.Context, token, iden
 	return retryTestStatusRead(ctx, func() (AttemptCredentialScope, error) {
 		return r.store.ResolveAttemptCredential(ctx, token, identityNodeID)
 	})
+}
+
+func (r testReadStore) ResolveSeatRun(ctx context.Context, id, credential string) (contract.SeatRunBinding, error) {
+	return retryTestStatusRead(ctx, func() (contract.SeatRunBinding, error) { return r.store.ResolveSeatRun(ctx, id, credential) })
 }
 
 func (r testReadStore) listNodesPage(ctx context.Context, filters nodeListFilters, cursorValue string, limit int) (NodeList, error) {
