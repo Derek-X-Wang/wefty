@@ -819,6 +819,13 @@ greeting probe. An idle x11vnc checks its Unix listener on an approximately
 200 ms cycle; that wake-up plus the WebSocket and relay checks cannot fit
 reliably into a 200 ms probe. This endpoint budget does not extend the
 Seat's 60-second readiness deadline or allow a late probe to publish ready.
+The image's supervisor probes starting Seats one after another in one loop. A
+silent but listening endpoint of one starting Seat can therefore delay the
+supervision of other Seats (deadline answers, cleanup retries, new directives
+and the stop flag) by up to the 2-second budget for each endpoint it probes in
+each tick. No contract sets a numeric limit for that delay. Each Seat's
+60-second readiness deadline still holds, because the supervisor refuses a late
+probe.
 
 The default image logs each Seat start and each published Seat answer as JSON
 lines in the Computer log, with directive generation and place. While waiting,
