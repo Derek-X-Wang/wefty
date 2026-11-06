@@ -1257,7 +1257,12 @@ readiness stays where it is until an inspection answers, and a stop, an exit
 or a deadline cancels a running inspection without waiting for it, so it adds
 no phase to the shutdown bound. A failed probe discards the answer of a
 running inspection, because the listener it saw may be gone, and the next
-answering probe starts a fresh inspection. The Guardian inspects on every
+answering probe starts a fresh inspection. This has a liveness limit: after
+startup, if probes keep failing and recovering faster than an inspection
+answers, no inspection completes, so a foreign owner is not detected and the
+ownership deadline below does not start. Routing stays safe: the first failed
+probe withdraws the service, and only a completed inspection that confirms
+the payload's own listener publishes it again. The Guardian inspects on every
 return to readiness and every 10 seconds while the service is ready. A
 takeover with no failed probe in between (the payload closes its listener and
 another process binds the port, or another process adds an `SO_REUSEPORT`

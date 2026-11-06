@@ -528,7 +528,13 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				// A running inspection may have seen a listener that is now
 				// gone, and another process may bind the port before the
 				// next probe. Its answer is discarded, and the next answering
-				// probe starts a fresh inspection.
+				// probe starts a fresh inspection. Liveness limit: if probes
+				// keep flapping faster than an inspection answers, no
+				// inspection completes, so a foreign owner after startup is
+				// not detected and the ownership deadline never starts.
+				// Routing stays safe: this failed probe withdraws the
+				// service, and only a completed "owned" inspection
+				// republishes it.
 				if inspecting != nil {
 					cancelInspection()
 					inspecting, lastInspection = nil, time.Time{}

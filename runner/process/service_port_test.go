@@ -252,23 +252,35 @@ func TestGuardianStalledInspectionNeitherChangesReadinessNorDelaysStop(t *testin
 // listener, a probe fails, and another process takes the port.
 func TestGuardianDiscardsAnInspectionThatAProbeFailureOutdated(t *testing.T) {
 	captured, release, invalidated := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	staleReturned := make(chan struct{})
 	var calls atomic.Int32
 	priorInspector := serviceListenerInspector
 	serviceListenerInspector = func(ctx context.Context, backend serviceBackend, group int) (serviceListenerVerdict, error) {
-		verdict, err := inspectServiceListeners(ctx, backend, group)
 		if calls.Add(1) != 1 {
-			return verdict, err
+			// The fresh inspection after recovery answers only after the
+			// stale one has delivered its "owned" answer, so that late
+			// answer reaches a Guardian that is still supervising.
+			<-staleReturned
+			time.Sleep(100 * time.Millisecond)
+			return inspectServiceListeners(ctx, backend, group)
 		}
+		verdict, err := inspectServiceListeners(ctx, backend, group)
 		if err != nil || verdict != serviceListenerOwned {
 			t.Errorf("gated inspection verdict = (%d, %v), want owned", verdict, err)
 		}
 		close(captured)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			close(invalidated)
-		}
-		return verdict, err
+		// Cancellation is reported at once, but the stale answer is held
+		// until the port answers again.
+		go func() {
+			select {
+			case <-ctx.Done():
+				close(invalidated)
+			case <-release:
+			}
+		}()
+		<-release
+		defer close(staleReturned)
+		return verdict, nil
 	}
 	t.Cleanup(func() { serviceListenerInspector = priorInspector })
 
@@ -404,6 +416,51 @@ func TestGuardianWithdrawsATakeoverWithinTheBoundWhenInspectionsAreSlow(t *testi
 		t.Fatalf("takeover withdrawn after %s; the slow inspections were not exercised", elapsed)
 	}
 	guardian.stopWithin(t, 5*time.Second)
+}
+
+// The liveness limit of discarding outdated inspections: while probes flap
+// faster than an inspection answers, every inspection is cancelled, so no
+// ownership verdict arrives. Routing stays safe: the service is withdrawn on
+// the first failed probe and never republished without a completed "owned"
+// inspection. When the flapping stops, an inspection completes again (here
+// it fails at its timeout) and the ownership deadline ends the payload.
+func TestGuardianNeverRepublishesWhileProbesFlapFasterThanInspection(t *testing.T) {
+	mode, cancelled := injectInspector(t)
+	priorTimeout := serviceListenerInspectTimeout
+	serviceListenerInspectTimeout = 2 * time.Second
+	t.Cleanup(func() { serviceListenerInspectTimeout = priorTimeout })
+	guardian := runInProcessServiceGuardian(t, "listen-toggle", releasedServiceAddress(t), time.Second)
+	guardian.expectReadiness(t, true)
+	mode.Store(int32(inspectStall))
+	cancellations, withdrawn := 0, false
+	for range 8 {
+		for _, toggle := range []syscall.Signal{syscall.SIGUSR1, syscall.SIGUSR2} {
+			if err := syscall.Kill(guardian.pid, toggle); err != nil {
+				t.Fatal(err)
+			}
+			wait := time.After(150 * time.Millisecond)
+		waiting:
+			for {
+				select {
+				case <-cancelled:
+					cancellations++
+				case status := <-guardian.statuses:
+					if withdrawn || status.Type != guardianMessageReadiness || status.Ready == nil || *status.Ready {
+						t.Fatalf("status while probes flap = %#v, want only the first withdrawal", status)
+					}
+					withdrawn = true
+				case <-wait:
+					break waiting
+				}
+			}
+		}
+	}
+	if !withdrawn || cancellations < 3 {
+		t.Fatalf("withdrawn = %t, cancelled inspections = %d; the flapping did not cancel inspections", withdrawn, cancellations)
+	}
+	// The listener stays open now, so the stalled inspection reaches its
+	// timeout and starts the ownership deadline.
+	guardian.expectPortTaken(t, context.DeadlineExceeded.Error())
 }
 
 type inProcessGuardian struct {
