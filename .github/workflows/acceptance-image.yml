@@ -206,13 +206,13 @@ jobs:
             mkdir -p "$layout"
             tar -xf "$RUNNER_TEMP/platforms/$arch.oci.tar" -C "$layout"
             "$crane" push "$layout" "$IMAGE_NAME:${GITHUB_SHA}-${arch}"
-            test "$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/platforms/$arch.digest")"
+            bash scripts/published-tag-digest.sh read-tag "$crane" "$IMAGE_NAME:${GITHUB_SHA}-${arch}" "$(cat "$RUNNER_TEMP/platforms/$arch.digest")" >/dev/null
           done
-          "$crane" index append \
+          index_digest="$("$crane" index append \
             -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/amd64.digest")" \
             -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/arm64.digest")" \
-            -t "$IMAGE_NAME:$GITHUB_SHA"
-          index_digest="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
+            -t "$IMAGE_NAME:$GITHUB_SHA" | bash scripts/published-tag-digest.sh index-digest "$IMAGE_NAME")"
+          bash scripts/published-tag-digest.sh read-tag "$crane" "$IMAGE_NAME:$GITHUB_SHA" "$index_digest" >/dev/null
           printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
       - name: Resolve the published digest once and verify its platform set
         env:
@@ -220,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           crane="$(go env GOPATH)/bin/crane"
-          index_digest="$("$crane" digest "$IMAGE_NAME:$GITHUB_SHA")"
+          index_digest="$(bash scripts/published-tag-digest.sh read-tag "$crane" "$IMAGE_NAME:$GITHUB_SHA" "$ACTION_DIGEST")"
           test "$index_digest" = "$ACTION_DIGEST"
           printf '%s\n' "$index_digest" > "$RUNNER_TEMP/acceptance-image-index-digest.txt"
           "$crane" manifest "$IMAGE_NAME@$index_digest" > "$RUNNER_TEMP/acceptance-image-index.json"
@@ -281,16 +281,16 @@ jobs:
               mkdir -p "$layout"
               tar -xf "$RUNNER_TEMP/platforms/${arch}-user-${variant}.oci.tar" -C "$layout"
               "$crane" push "$layout" "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}-${arch}"
-              test "$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}-${arch}")" = "$(cat "$RUNNER_TEMP/platforms/${arch}-user-${variant}.digest")"
+              bash scripts/published-tag-digest.sh read-tag "$crane" "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}-${arch}" "$(cat "$RUNNER_TEMP/platforms/${arch}-user-${variant}.digest")" >/dev/null
               jq -e --arg digest "$(cat "$RUNNER_TEMP/platforms/${arch}-user-${variant}.digest")" --arg image_user "$owner" \
                 '.digest == $digest and .image_user == $image_user and .executed and .health' \
                 "$RUNNER_TEMP/platforms/${arch}-user-${variant}-runtime.json"
             done
-            "$crane" index append \
+            index_digest="$("$crane" index append \
               -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/amd64-user-${variant}.digest")" \
               -m "$IMAGE_NAME@$(cat "$RUNNER_TEMP/platforms/arm64-user-${variant}.digest")" \
-              -t "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}"
-            index_digest="$("$crane" digest "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}")"
+              -t "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}" | bash scripts/published-tag-digest.sh index-digest "$IMAGE_NAME")"
+            bash scripts/published-tag-digest.sh read-tag "$crane" "$IMAGE_NAME:${GITHUB_SHA}-user-${variant}" "$index_digest" >/dev/null
             printf '%s\n' "$index_digest" > "$release/acceptance-image-user-${variant}-index-digest.txt"
             "$crane" manifest "$IMAGE_NAME@$index_digest" > "$release/acceptance-image-user-${variant}-index.json"
             test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$release/acceptance-image-user-${variant}-index.json")" = 2
@@ -559,13 +559,13 @@ jobs:
             mkdir -p "$layout"
             tar -xf "$RUNNER_TEMP/computer-platforms/$arch.oci.tar" -C "$layout"
             "$crane" push "$layout" "$COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}"
-            test "$("$crane" digest "$COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/computer-platforms/$arch.digest")"
+            bash scripts/published-tag-digest.sh read-tag "$crane" "$COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}" "$(cat "$RUNNER_TEMP/computer-platforms/$arch.digest")" >/dev/null
           done
-          "$crane" index append \
+          index_digest="$("$crane" index append \
             -m "$COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/computer-platforms/amd64.digest")" \
             -m "$COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/computer-platforms/arm64.digest")" \
-            -t "$COMPUTER_IMAGE_NAME:$GITHUB_SHA"
-          index_digest="$("$crane" digest "$COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+            -t "$COMPUTER_IMAGE_NAME:$GITHUB_SHA" | bash scripts/published-tag-digest.sh index-digest "$COMPUTER_IMAGE_NAME")"
+          bash scripts/published-tag-digest.sh read-tag "$crane" "$COMPUTER_IMAGE_NAME:$GITHUB_SHA" "$index_digest" >/dev/null
           printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
       - name: Bind the public index to the executed platform bytes
         env:
@@ -573,7 +573,7 @@ jobs:
         run: |
           set -euo pipefail
           crane="$(go env GOPATH)/bin/crane"
-          index_digest="$("$crane" digest "$COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+          index_digest="$(bash scripts/published-tag-digest.sh read-tag "$crane" "$COMPUTER_IMAGE_NAME:$GITHUB_SHA" "$ACTION_DIGEST")"
           test "$index_digest" = "$ACTION_DIGEST"
           printf '%s\n' "$index_digest" > "$RUNNER_TEMP/computer-image-index-digest.txt"
           "$crane" manifest "$COMPUTER_IMAGE_NAME@$index_digest" > "$RUNNER_TEMP/computer-image-index.json"
@@ -674,13 +674,13 @@ jobs:
             mkdir -p "$layout"
             tar -xf "$RUNNER_TEMP/wayland-computer-platforms/$arch.oci.tar" -C "$layout"
             "$crane" push "$layout" "$WAYLAND_COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}"
-            test "$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}")" = "$(cat "$RUNNER_TEMP/wayland-computer-platforms/$arch.digest")"
+            bash scripts/published-tag-digest.sh read-tag "$crane" "$WAYLAND_COMPUTER_IMAGE_NAME:${GITHUB_SHA}-${arch}" "$(cat "$RUNNER_TEMP/wayland-computer-platforms/$arch.digest")" >/dev/null
           done
-          "$crane" index append \
+          index_digest="$("$crane" index append \
             -m "$WAYLAND_COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/wayland-computer-platforms/amd64.digest")" \
             -m "$WAYLAND_COMPUTER_IMAGE_NAME@$(cat "$RUNNER_TEMP/wayland-computer-platforms/arm64.digest")" \
-            -t "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA"
-          index_digest="$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+            -t "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA" | bash scripts/published-tag-digest.sh index-digest "$WAYLAND_COMPUTER_IMAGE_NAME")"
+          bash scripts/published-tag-digest.sh read-tag "$crane" "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA" "$index_digest" >/dev/null
           printf '%s\n' "digest=$index_digest" >> "$GITHUB_OUTPUT"
       - name: Bind the Wayland index to conformance, furniture, and ELF evidence
         env:
@@ -688,7 +688,7 @@ jobs:
         run: |
           set -euo pipefail
           crane="$(go env GOPATH)/bin/crane"
-          index_digest="$("$crane" digest "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA")"
+          index_digest="$(bash scripts/published-tag-digest.sh read-tag "$crane" "$WAYLAND_COMPUTER_IMAGE_NAME:$GITHUB_SHA" "$ACTION_DIGEST")"
           test "$index_digest" = "$ACTION_DIGEST"
           printf '%s\n' "$index_digest" > "$RUNNER_TEMP/wayland-computer-image-index-digest.txt"
           "$crane" manifest "$WAYLAND_COMPUTER_IMAGE_NAME@$index_digest" > "$RUNNER_TEMP/wayland-computer-image-index.json"

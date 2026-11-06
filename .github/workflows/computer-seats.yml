@@ -353,31 +353,31 @@ jobs:
             mkdir -p "$layout"
             tar -xf "$RUNNER_TEMP/default-platforms/$arch.oci.tar" -C "$layout"
             "$crane" push "$layout" "$DEFAULT_COMPUTER_IMAGE:${GITHUB_SHA}-$arch"
-            test "$("$crane" digest "$DEFAULT_COMPUTER_IMAGE:${GITHUB_SHA}-$arch")" = "$(cat "$RUNNER_TEMP/default-platforms/$arch.digest")"
+            bash scripts/published-tag-digest.sh read-tag "$crane" "$DEFAULT_COMPUTER_IMAGE:${GITHUB_SHA}-${arch}" "$(cat "$RUNNER_TEMP/default-platforms/$arch.digest")" >/dev/null
           done
-          "$crane" index append \
+          index_digest="$("$crane" index append \
             -m "$DEFAULT_COMPUTER_IMAGE@$(cat "$RUNNER_TEMP/default-platforms/amd64.digest")" \
             -m "$DEFAULT_COMPUTER_IMAGE@$(cat "$RUNNER_TEMP/default-platforms/arm64.digest")" \
-            -t "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA"
-          digest="$("$crane" digest "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA")"
+            -t "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA" | bash scripts/published-tag-digest.sh index-digest "$DEFAULT_COMPUTER_IMAGE")"
+          bash scripts/published-tag-digest.sh read-tag "$crane" "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA" "$index_digest" >/dev/null
           release="$RUNNER_TEMP/default-computer-release"
           mkdir -p "$release"
-          printf '%s@%s\n' "$DEFAULT_COMPUTER_IMAGE" "$digest" > "$release/default-computer-reference.txt"
-          "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$digest" > "$release/index.json"
+          printf '%s@%s\n' "$DEFAULT_COMPUTER_IMAGE" "$index_digest" > "$release/default-computer-reference.txt"
+          "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$index_digest" > "$release/index.json"
           for arch in amd64 arm64; do
             jq -e --arg arch "$arch" --arg digest "$(cat "$RUNNER_TEMP/default-platforms/$arch.digest")" \
               '([.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch and .digest == $digest)] | length) == 1' "$release/index.json"
             cp "$RUNNER_TEMP/default-platforms/$arch-seats.json" "$release/"
           done
-          "$crane" pull "$DEFAULT_COMPUTER_IMAGE@$digest" "$RUNNER_TEMP/default.oci" --format=oci --annotate-ref
+          "$crane" pull "$DEFAULT_COMPUTER_IMAGE@$index_digest" "$RUNNER_TEMP/default.oci" --format=oci --annotate-ref
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP/default.oci" -cf "$release/default-computer.oci.tar" .
-          scripts/verify-acceptance-image.sh --archive "$release/default-computer.oci.tar" --expected-top-digest "$digest" \
+          scripts/verify-acceptance-image.sh --archive "$release/default-computer.oci.tar" --expected-top-digest "$index_digest" \
             --expected-platform linux/amd64 --expected-platform linux/arm64 \
             --expected-platform-digest "linux/amd64=$(cat "$RUNNER_TEMP/default-platforms/amd64.digest")" \
             --expected-platform-digest "linux/arm64=$(cat "$RUNNER_TEMP/default-platforms/arm64.digest")" \
             --receipt-output "$release/archive.json"
           mkdir -p "$RUNNER_TEMP/anonymous-default-docker"
-          DOCKER_CONFIG="$RUNNER_TEMP/anonymous-default-docker" "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$digest" >/dev/null
+          DOCKER_CONFIG="$RUNNER_TEMP/anonymous-default-docker" "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$index_digest" >/dev/null
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wefty-computer-default-${{ github.sha }}
