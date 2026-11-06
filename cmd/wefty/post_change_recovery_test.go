@@ -103,6 +103,94 @@ func TestKeyedResendKeepsTheFirstReceipt(t *testing.T) {
 	}
 }
 
+// TestKeyedResendKeepsAReplayReceiptAndOperationHeaders: a first answer that
+// was itself a replay stays one, and the resend's other headers survive.
+func TestKeyedResendKeepsAReplayReceiptAndOperationHeaders(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		firstReplay  string
+		wantReplay   bool
+		wantApplied  bool
+		firstApplied string
+	}{
+		{"first answer was a replay", "true", true, false, "false"},
+		{"first answer omits the replay header", "", false, true, "true"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clients, requests := readRetryStub(t, func(requests int32, r *http.Request, w http.ResponseWriter) {
+				if requests == 1 {
+					w.Header().Set("Mutation-Applied", test.firstApplied)
+					if test.firstReplay != "" {
+						w.Header().Set("Idempotent-Replay", test.firstReplay)
+					}
+					writeCommittedReadUnavailable(w, true)
+					return
+				}
+				w.Header().Set("Mutation-Applied", "false")
+				w.Header().Set("Idempotent-Replay", "true")
+				w.Header().Set("X-Operation", "kept")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer_1"})
+			})
+			withRetryWait(t, func(context.Context, time.Duration) error { return nil })
+			headers, err := clients.l1.mutate(t.Context(), resendKeepingReceipt, http.MethodPost, "/v1/computers/computer_1/restart", nil, &l1.Computer{}, http.StatusOK)
+			receipt := mutationReceiptFromHeaders(headers)
+			if err != nil || requests.Load() != 2 || receipt.Replay != test.wantReplay || receipt.Applied != test.wantApplied ||
+				headers.Get("X-Operation") != "kept" {
+				t.Fatalf("receipt=%+v headers=%v err=%v requests=%d", receipt, headers, err, requests.Load())
+			}
+		})
+	}
+}
+
+// TestNoResendCallSitesSendOneMutation pins the client methods whose plan is
+// not to resend: each sends one mutation, keeps exit 13 and names the same
+// idempotency key.
+func TestNoResendCallSitesSendOneMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(context.Context, *apiClients) error
+	}{
+		{"grow", func(ctx context.Context, c *apiClients) error {
+			_, _, err := c.growComputer(ctx, "computer_1", l1.ComputerGrowRequest{IdempotencyKey: "k"})
+			return err
+		}},
+		{"reimage", func(ctx context.Context, c *apiClients) error {
+			_, _, err := c.reimageComputer(ctx, "computer_1", l1.ComputerReimageRequest{IdempotencyKey: "k"})
+			return err
+		}},
+		{"backup create", func(ctx context.Context, c *apiClients) error {
+			_, _, _, err := c.createComputerBackup(ctx, "computer_1", l1.ComputerBackupCreateRequest{IdempotencyKey: "k"})
+			return err
+		}},
+		{"restore", func(ctx context.Context, c *apiClients) error {
+			_, _, _, err := c.restoreComputerBackup(ctx, "computer_1", "backup_1", l1.ComputerRestoreRequest{IdempotencyKey: "k"})
+			return err
+		}},
+		{"clone", func(ctx context.Context, c *apiClients) error {
+			_, _, _, err := c.cloneComputerBackup(ctx, "computer_1", "backup_1", l1.ComputerCloneRequest{IdempotencyKey: "k"})
+			return err
+		}},
+		{"custody attest", func(ctx context.Context, c *apiClients) error {
+			_, _, err := c.attestComputerCustodyDeleted(ctx, "export_1", l1.ComputerCustodyAttestationRequest{IdempotencyKey: "k"})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clients, seen := postChangeStub(t, func(w http.ResponseWriter) {
+				t.Error("a no-resend mutation sent a second request")
+			})
+			err := test.call(t.Context(), clients)
+			var refusal *apiResponseError
+			if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || len(seen()) != 1 ||
+				!strings.Contains(refusal.APIError.Message, "the change was applied") ||
+				!strings.Contains(refusal.APIError.Message, "same idempotency key") {
+				t.Fatalf("exit=%d requests=%d err=%v", commandExitCode(err), len(seen()), err)
+			}
+		})
+	}
+}
+
 // TestUnkeyedMutationReadsBackAfterCommittedReadUnavailable: an unkeyed
 // mutation is never sent again; its matching GET supplies the success, and
 // the command prints its normal output (exit 0).

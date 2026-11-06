@@ -397,7 +397,7 @@ func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reimage"
-	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -958,8 +958,9 @@ var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, h
 
 // sameKeyReadAgain is the plan for a keyed mutation that is not resent: its
 // first answer has no receipt to say what this command did (backup, restore,
-// clone, custody attestation), or its replay can show another operation
-// (grow, #1516). The answer stays the plain "applied" one.
+// clone, custody attestation), its replay can show another operation (grow,
+// #1516), or its replay revokes the Computer's tokens again (reimage). The
+// answer stays the plain "applied" one.
 var sameKeyReadAgain = postChangeRecovery{hint: sameKeyHint}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
