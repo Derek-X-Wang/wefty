@@ -10,7 +10,8 @@ import (
 )
 
 // Mutation waits share one failure decision. Run wait and the three log
-// followers retain their separate policies; one-shot GET retries stay local.
+// followers retain their separate policies; one-shot GET retries and the
+// post-change recovery of a committed mutation stay local to the client.
 func TestCLIWaitDecisionCallSites(t *testing.T) {
 	allowed := map[string]bool{
 		"seat_logs_command.go:executeSeatLogs:isRetryableObservation":           true,
@@ -18,6 +19,7 @@ func TestCLIWaitDecisionCallSites(t *testing.T) {
 		"exec_command.go:submitExecRun:isRetryableL1Answer":                     true,
 		"wait_decision.go:decideWaitFailure:isRetryableL1Answer":                true,
 		"client.go:do:isRetryableL1Answer":                                      true,
+		"client.go:committedReadUnavailable:isRetryableL1Answer":                true,
 		"wait_decision.go:isRetryableObservation:isRetryableL1Answer":           true,
 		"command.go:executeLogs:isRetryableObservation":                         true,
 		"command.go:executeLogs:isRetryableL1Answer":                            true,
