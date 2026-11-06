@@ -436,23 +436,27 @@ func TestObserveIdleScreen(t *testing.T) {
 		firstAt time.Time
 	}
 	type step func(*testing.T, env)
-	unchanged := func(r image.Rectangle) step {
-		return func(t *testing.T, e env) { e.f.answer(t, r, a); e.f.awaitRequest(t) }
+	unchangedAs := func(r image.Rectangle, colour color.RGBA) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, colour); e.f.awaitRequest(t) }
 	}
+	unchanged := func(r image.Rectangle) step { return unchangedAs(r, a) }
 	changed := func(r image.Rectangle, colour color.RGBA) step {
 		return func(t *testing.T, e env) { e.f.answer(t, r, colour) }
 	}
-	// repaint sends an early change that the observer folds and asks again.
-	repaint := func(colour color.RGBA) step {
-		return func(t *testing.T, e env) { e.f.answer(t, all, colour); e.f.awaitRequest(t) }
+	// repaintIn sends an early change that the observer folds and asks again.
+	repaintIn := func(r image.Rectangle, colour color.RGBA) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, colour); e.f.awaitRequest(t) }
 	}
+	repaint := func(colour color.RGBA) step { return repaintIn(all, colour) }
 	// started waits until the observer has read its first-frame time.
 	started := func(t *testing.T, e env) { e.f.awaitRequest(t) }
 	at := func(d time.Duration) step {
 		return func(t *testing.T, e env) { e.clock.set(e.firstAt.Add(d)) }
 	}
 	deadline := func(t *testing.T, e env) {
-		<-e.timers.asked
+		if got, want := <-e.timers.asked, until.Sub(e.firstAt); got != want {
+			t.Errorf("deadline %s, want %s: a repaint must not move it", got, want)
+		}
 		e.timers.deadline <- until
 		if got := <-e.timers.asked; got != IdleWakeGrace {
 			t.Errorf("grace %s, want %s", got, IdleWakeGrace)
@@ -490,6 +494,9 @@ func TestObserveIdleScreen(t *testing.T) {
 		// (j) After the settle the premise stays strict, against the folded
 		// reference: going back to the first frame's pixels is a change.
 		{name: "change after an early repaint", firstAt: base, steps: []step{started, at(800 * time.Millisecond), repaint(b), at(IdleWakeSettle + time.Nanosecond), changed(all, a)}, updates: 1, repaints: 1, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed 3.0 s after"},
+		// (j2) A partial repaint folds only its own pixels: later updates that
+		// repeat it, or show the untouched pixels, are unchanged.
+		{name: "partial repaint then unchanged updates", firstAt: base, steps: []step{started, at(800 * time.Millisecond), repaintIn(image.Rect(0, 0, 2, 3), b), at(10 * time.Second), unchangedAs(image.Rect(0, 0, 2, 3), b), unchangedAs(image.Rect(2, 0, 4, 3), a), deadline, grace}, updates: 3, repaints: 1, observed: IdleWakeQuiet - 800*time.Millisecond, settled: 800 * time.Millisecond},
 		// (k) The settle bound: a change just after it fails.
 		{name: "change just after the settle", firstAt: base, steps: []step{started, at(IdleWakeSettle + time.Nanosecond), changed(all, b)}, changed: 12, premise: "changed 3.0 s after the first frame"},
 		// (l) An early repaint never extends the deadline: a late first frame
