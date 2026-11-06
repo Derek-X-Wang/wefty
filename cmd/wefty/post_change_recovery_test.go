@@ -177,17 +177,40 @@ func TestNoResendCallSitesSendOneMutation(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			clients, seen := postChangeStub(t, func(w http.ResponseWriter) {
-				t.Error("a no-resend mutation sent a second request")
+			// L1 sends grow's and reimage's receipt before the read, so the
+			// first answer carries one: only the plan keeps them from resending.
+			clients, requests := readRetryStub(t, func(requests int32, r *http.Request, w http.ResponseWriter) {
+				if requests > 1 {
+					t.Error("a no-resend mutation sent a second request")
+				}
+				w.Header().Set("Mutation-Applied", "true")
+				w.Header().Set("Idempotent-Replay", "false")
+				writeCommittedReadUnavailable(w, true)
 			})
+			withRetryWait(t, func(context.Context, time.Duration) error { return nil })
 			err := test.call(t.Context(), clients)
 			var refusal *apiResponseError
-			if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || len(seen()) != 1 ||
+			if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || requests.Load() != 1 ||
 				!strings.Contains(refusal.APIError.Message, "the change was applied") ||
 				!strings.Contains(refusal.APIError.Message, "same idempotency key") {
-				t.Fatalf("exit=%d requests=%d err=%v", commandExitCode(err), len(seen()), err)
+				t.Fatalf("exit=%d requests=%d err=%v", commandExitCode(err), requests.Load(), err)
 			}
 		})
+	}
+}
+
+// TestUpgradeRestartReadsBackInsteadOfResending: an upgrade restart can be a
+// no-op that records no key, so it is read back, never sent again.
+func TestUpgradeRestartReadsBackInsteadOfResending(t *testing.T) {
+	clients, seen := postChangeStub(t, func(w http.ResponseWriter) {
+		writeJob(w, http.StatusOK, l1.Job{JobID: "job_1", State: contract.JobRunning})
+	})
+	job, err := clients.restartServiceRequest(t.Context(), "job_1", l1.ServiceRestartRequest{
+		IdempotencyKey: "upgrade-key", Upgrade: &l1.ServiceUpgradeRecovery{}})
+	requests := seen()
+	if err != nil || job.JobID != "job_1" || len(requests) != 2 || requests[0].method != http.MethodPost ||
+		requests[1].method != http.MethodGet || requests[1].path != "/v1/jobs/job_1?class="+contract.JobClassService {
+		t.Fatalf("upgrade restart: job=%+v err=%v requests=%+v", job, err, requests)
 	}
 }
 

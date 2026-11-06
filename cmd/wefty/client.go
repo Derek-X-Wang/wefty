@@ -493,7 +493,13 @@ func (c *apiClients) restartService(ctx context.Context, jobID, idempotencyKey s
 func (c *apiClients) restartServiceRequest(ctx context.Context, jobID string, request l1.ServiceRestartRequest) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/restart?class=" + contract.JobClassService
-	_, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request,
+	recovery := resendWithKey
+	if request.Upgrade != nil {
+		// An upgrade restart can answer a no-op without recording its key
+		// while the predecessor still runs, so a resend could restart for real.
+		recovery = readBackService(jobID)
+	}
+	_, err := c.l1.mutate(ctx, recovery, http.MethodPost, path, request,
 		&job, http.StatusAccepted, http.StatusOK)
 	return job, err
 }
