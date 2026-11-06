@@ -983,7 +983,7 @@ func (c *apiClient) mutate(ctx context.Context, recovery postChangeRecovery, met
 		if recoveryErr = readRetryWait(ctx, readRetryBackoff(0)); recoveryErr == nil {
 			var resent http.Header
 			if resent, recoveryErr = c.doWithResponse(ctx, method, path, body, nil, target, success...); recoveryErr == nil {
-				return resent, nil
+				return keepFirstReceipt(headers, resent), nil
 			}
 		}
 	case recovery.readBack != "":
@@ -999,6 +999,25 @@ func (c *apiClient) mutate(ctx context.Context, recovery postChangeRecovery, met
 	applied := *committed
 	applied.APIError.Message += "; the change was applied, but reading it back was unavailable; " + recovery.hint
 	return headers, &applied
+}
+
+// keepFirstReceipt returns the resend's headers, which name the replayed
+// operation, but keeps the first answer's receipt when it sent one: that
+// receipt is what this command did. The resend is only a replay of it.
+func keepFirstReceipt(first, resent http.Header) http.Header {
+	if first.Get("Mutation-Applied") == "" {
+		return resent
+	}
+	merged := resent.Clone()
+	if merged == nil {
+		merged = http.Header{}
+	}
+	merged.Set("Mutation-Applied", first.Get("Mutation-Applied"))
+	merged.Del("Idempotent-Replay")
+	if replay := first.Get("Idempotent-Replay"); replay != "" {
+		merged.Set("Idempotent-Replay", replay)
+	}
+	return merged
 }
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {

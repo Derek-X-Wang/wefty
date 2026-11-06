@@ -80,6 +80,29 @@ func TestKeyedMutationResendsOnceAfterCommittedReadUnavailable(t *testing.T) {
 	}
 }
 
+// TestKeyedResendKeepsTheFirstReceipt: L1 wrote this command's receipt
+// (applied, not a replay) before its post-change read expired. The resend is
+// a replay, but the command reports what it did, with the replay's operation.
+func TestKeyedResendKeepsTheFirstReceipt(t *testing.T) {
+	clients, requests := readRetryStub(t, func(requests int32, r *http.Request, w http.ResponseWriter) {
+		if requests == 1 {
+			w.Header().Set("Mutation-Applied", "true")
+			w.Header().Set("Idempotent-Replay", "false")
+			writeCommittedReadUnavailable(w, true)
+			return
+		}
+		w.Header().Set("Mutation-Applied", "false")
+		w.Header().Set("Idempotent-Replay", "true")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer_1", IntentRevision: 4})
+	})
+	withRetryWait(t, func(context.Context, time.Duration) error { return nil })
+	computer, receipt, err := clients.growComputer(t.Context(), "computer_1", l1.ComputerGrowRequest{IdempotencyKey: "grow-key"})
+	if err != nil || computer.IntentRevision != 4 || requests.Load() != 2 || !receipt.Applied || receipt.Replay {
+		t.Fatalf("keyed resend receipt: computer=%+v receipt=%+v err=%v requests=%d", computer, receipt, err, requests.Load())
+	}
+}
+
 // TestUnkeyedMutationReadsBackAfterCommittedReadUnavailable: an unkeyed
 // mutation is never sent again; its matching GET supplies the success, and
 // the command prints its normal output (exit 0).
