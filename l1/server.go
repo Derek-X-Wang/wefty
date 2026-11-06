@@ -1818,7 +1818,8 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if !replayed {
+	// Only a new revision carries an owed revocation; no-ops and replays do not.
+	if computer.owedRevocationID != 0 {
 		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
 			writeError(w, err)
 			return
@@ -1829,7 +1830,7 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	writeComputerMutationHeaders(w, !replayed && computer.IntentRevision > request.IntentRevision, replayed)
+	writeComputerMutationHeaders(w, computer.owedRevocationID != 0, replayed)
 	s.writeComputerForCaller(w, r, status, computer)
 }
 

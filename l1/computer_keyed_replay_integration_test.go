@@ -36,11 +36,11 @@ func TestComputerReimageKeyedReplayAfterPreflightFailure(t *testing.T) {
 	request := ComputerReimageRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
 		Image: reimageTarget('7'), TerminateSessions: true, IdempotencyKey: "failed-reimage"}
 	accepted, replayed, err := h.store.ReimageComputerWithReplay(t.Context(), computer.ComputerID, request)
-	if err != nil || replayed || accepted.CurrentJob.State != contract.JobStopping {
+	if err != nil || replayed || accepted.CurrentJob.State != contract.JobStopping || accepted.owedRevocationID == 0 {
 		t.Fatalf("accept reimage: replayed=%t err=%v computer=%#v", replayed, err, accepted)
 	}
 	quiescing, replayed, err := h.store.ReimageComputerWithReplay(t.Context(), computer.ComputerID, request)
-	if err != nil || !replayed || quiescing.IntentRevision != accepted.IntentRevision ||
+	if err != nil || !replayed || quiescing.owedRevocationID != 0 || quiescing.IntentRevision != accepted.IntentRevision ||
 		quiescing.CurrentJobID != computer.CurrentJobID || quiescing.CurrentJob.State != contract.JobStopping ||
 		quiescing.ReconfigurationPhase != ComputerReconfigurationReimaging {
 		t.Fatalf("quiescing retry: replayed=%t err=%v computer=%#v", replayed, err, quiescing)
@@ -124,6 +124,52 @@ func TestComputerGrowKeyedReplayProjectsSelectedOutcome(t *testing.T) {
 	}
 }
 
+func TestComputerReimageSameDigestDoesNotRevoke(t *testing.T) {
+	for _, reference := range []string{"current-reference", "new-tag"} {
+		for _, revision := range []string{"current-revision", "stale-revision"} {
+			t.Run(reference+"/"+revision, func(t *testing.T) {
+				h, node, computer := computerKeyedReplayHarness(t)
+				startComputerAttempt(t, h, node, nil)
+				computer = mustGetComputer(t, h, computer.ComputerID)
+				var revocations []ComputerTokenRevocation
+				h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+					revocations = append(revocations, request)
+					return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+						ComputerAttemptID: request.ComputerAttemptID, CommittedAt: h.clock.Now()}, nil
+				}}
+				request := ComputerReimageRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+					Image: computer.CurrentJob.Spec.Execution.OCI.Image, IdempotencyKey: "noop-reimage"}
+				if reference == "new-tag" {
+					request.Image.Reference = "example.invalid/computer:new-tag"
+				}
+				if revision == "stale-revision" {
+					request.IntentRevision--
+				}
+				before := owedRevocationAuditRows(t, h, computer.ComputerID)
+				client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+				status, headers, body := h.do(client, http.MethodPost, "/v1/computers/"+computer.ComputerID+"/reimage", request)
+				var result Computer
+				if status != http.StatusAccepted || json.Unmarshal(body, &result) != nil {
+					t.Fatalf("same-digest reimage: status=%d body=%s", status, body)
+				}
+				if headers.Get("Mutation-Applied") != "false" || headers.Get("Idempotent-Replay") != "" {
+					t.Errorf("same-digest no-op receipt: %v", headers)
+				}
+				if len(revocations) != 0 {
+					t.Errorf("same-digest no-op requested revocation: %#v", revocations)
+				}
+				if after := owedRevocationAuditRows(t, h, computer.ComputerID); !reflect.DeepEqual(after, before) {
+					t.Errorf("same-digest no-op changed revocation records: before=%#v after=%#v", before, after)
+				}
+				if result.IntentRevision != computer.IntentRevision || result.CurrentJobID != computer.CurrentJobID ||
+					result.CurrentJob.Spec.Execution.OCI.Image.Reference != computer.CurrentJob.Spec.Execution.OCI.Image.Reference {
+					t.Errorf("same-digest no-op changed Computer: %#v", result)
+				}
+			})
+		}
+	}
+}
+
 func TestComputerReimageKeyedReplayDoesNotRevokeAgain(t *testing.T) {
 	for _, unavailable := range []bool{false, true} {
 		name := "original-settled"
@@ -147,13 +193,13 @@ func TestComputerReimageKeyedReplayDoesNotRevokeAgain(t *testing.T) {
 			request := ComputerReimageRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
 				Image: reimageTarget('8'), TerminateSessions: true, IdempotencyKey: "reimage-once"}
 			path := "/v1/computers/" + computer.ComputerID + "/reimage"
-			status, _, body := h.do(client, http.MethodPost, path, request)
+			status, headers, body := h.do(client, http.MethodPost, path, request)
 			if unavailable {
 				assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied", "is owed")
-			} else if status != http.StatusAccepted {
-				t.Fatalf("original reimage: status=%d body=%s", status, body)
+			} else if status != http.StatusAccepted || headers.Get("Mutation-Applied") != "true" {
+				t.Fatalf("original reimage: status=%d headers=%v body=%s", status, headers, body)
 			}
-			if len(revocations) == 0 || !revocations[0].RevokeAll || revocations[0].Reason != "computer_reimaged" {
+			if len(revocations) != 1 || !revocations[0].RevokeAll || revocations[0].Reason != "computer_reimaged" {
 				t.Fatalf("original reimage did not revoke: %#v", revocations)
 			}
 			if _, err := h.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
@@ -164,8 +210,8 @@ func TestComputerReimageKeyedReplayDoesNotRevokeAgain(t *testing.T) {
 			acknowledgeReimagePreflight(t, h, node, computer.ComputerID, claim.Lease.AttemptID, claim.Lease.FencingToken)
 			before := owedRevocationAuditRows(t, h, computer.ComputerID)
 			calls := len(revocations)
-			status, headers, body := h.do(client, http.MethodPost, path, request)
-			if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" {
+			status, headers, body = h.do(client, http.MethodPost, path, request)
+			if status != http.StatusOK || headers.Get("Idempotent-Replay") != "true" || headers.Get("Mutation-Applied") != "false" {
 				t.Fatalf("completed reimage replay: status=%d headers=%v body=%s", status, headers, body)
 			}
 			if len(revocations) != calls {
