@@ -1,7 +1,6 @@
 package l1
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +15,7 @@ import (
 // Expire only the response snapshot, after the real keyed store mutation.
 // The injected hold limit needs no sleep and leaves write authority intact.
 func TestComputerMutationReceiptBeforePostChangeRead(t *testing.T) {
-	for _, verb := range []string{"backup", "restore", "clone", "custody attest", "grow"} {
+	for _, verb := range []string{"backup", "restore", "clone", "custody attest", "grow", "reimage", "reimage no-op"} {
 		t.Run(verb, func(t *testing.T) {
 			h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 3)
 			h.stopServer()
@@ -44,33 +43,54 @@ func TestComputerMutationReceiptBeforePostChangeRead(t *testing.T) {
 			case "grow":
 				body = ComputerGrowRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), DiskBytes: computer.DesiredDiskBytes + 1<<30, IdempotencyKey: "receipt-grow"}
 				handler = h.server.growComputer
+			case "reimage", "reimage no-op":
+				image := reimageTarget('b')
+				if verb == "reimage no-op" {
+					image = computer.CurrentJob.Spec.Execution.OCI.Image
+				}
+				body = ComputerReimageRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Image: image, IdempotencyKey: "receipt-reimage"}
+				handler = h.server.reimageComputer
 			}
 			payload, err := json.Marshal(body)
 			if err != nil {
 				t.Fatal(err)
 			}
 			for _, replay := range []bool{false, true} {
+				h.store.SetReadSnapshotHardLimitForTest(10 * time.Second)
 				base := computerSnapshotRequest(t.Context(), computer.ComputerID)
-				ctx := context.WithValue(base.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
-				r := httptest.NewRequest(http.MethodPost, "/mutation", strings.NewReader(string(payload))).WithContext(ctx)
+				r := httptest.NewRequest(http.MethodPost, "/mutation", strings.NewReader(string(payload))).WithContext(base.Context())
 				r.SetPathValue("computer_id", computer.ComputerID)
 				r.SetPathValue("backup_id", backup.BackupID)
 				r.SetPathValue("export_id", exportID)
 				w := httptest.NewRecorder()
-				handler(w, r)
+				handler(receiptExpiryResponseWriter{w, h.store}, r)
 				var answer contract.ErrorResponse
+				// The body says mutation_applied=true even for the reimage no-op: today's
+				// behaviour, which #1538 may change together with the CLI resend.
 				if w.Code != http.StatusServiceUnavailable || json.Unmarshal(w.Body.Bytes(), &answer) != nil || answer.Error.Code != contract.ErrorUnavailable || !answer.Error.Retryable || answer.Error.Details["reason"] != "read_snapshot_post_change_failed" || answer.Error.Details["mutation_applied"] != true {
 					t.Fatalf("replay=%t response=%d %s", replay, w.Code, w.Body.String())
 				}
 				headers := w.Result().Header
 				wantReplay := ""
-				if replay {
+				if replay && verb != "reimage no-op" {
 					wantReplay = "true"
 				}
-				if headers.Get("Mutation-Applied") != strconv.FormatBool(!replay) || headers.Get("Idempotent-Replay") != wantReplay {
+				if headers.Get("Mutation-Applied") != strconv.FormatBool(!replay && verb != "reimage no-op") || headers.Get("Idempotent-Replay") != wantReplay {
 					t.Fatalf("replay=%t receipt=%v", replay, headers)
 				}
 			}
 		})
 	}
+}
+
+// Reimage reads before changing authority too. Arm expiry only when the handler
+// starts its response headers, leaving those earlier reads available.
+type receiptExpiryResponseWriter struct {
+	*httptest.ResponseRecorder
+	store *Store
+}
+
+func (w receiptExpiryResponseWriter) Header() http.Header {
+	w.store.SetReadSnapshotHardLimitForTest(time.Nanosecond)
+	return w.ResponseRecorder.Header()
 }

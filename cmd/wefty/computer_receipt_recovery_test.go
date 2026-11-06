@@ -28,6 +28,7 @@ func TestComputerCommandsResendKeepingReceipt(t *testing.T) {
 		{"clone", append([]string{"services", "clone", "computer-1", "backup-1", "--name=clone", "--disk-bytes=1000"}, cas...), "/v1/computers/computer-1/backups/backup-1/clone"},
 		{"custody attest", []string{"services", "custody", "attest", "export-1", "--idempotency-key=receipt-key"}, "/v1/custody-exports/export-1/attest-deleted"},
 		{"grow", append([]string{"services", "resize", "computer-1", "--disk-bytes=1000"}, cas...), "/v1/computers/computer-1/grow"},
+		{"reimage", append([]string{"services", "reimage", "computer-1", "--image=ghcr.io/example/reimaged@" + computerCLITestDigestB}, cas...), "/v1/computers/computer-1/reimage"},
 	} {
 		for _, secondFailure := range []bool{false, true} {
 			t.Run(test.name+map[bool]string{false: "/success", true: "/second failure"}[secondFailure], func(t *testing.T) {

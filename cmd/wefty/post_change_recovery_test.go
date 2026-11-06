@@ -143,42 +143,6 @@ func TestKeyedResendKeepsAReplayReceiptAndOperationHeaders(t *testing.T) {
 	}
 }
 
-// TestNoResendCallSitesSendOneMutation pins the client methods whose plan is
-// not to resend: each sends one mutation, keeps exit 13 and names the same
-// idempotency key.
-func TestNoResendCallSitesSendOneMutation(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		call func(context.Context, *apiClients) error
-	}{
-		{"reimage", func(ctx context.Context, c *apiClients) error {
-			_, _, err := c.reimageComputer(ctx, "computer_1", l1.ComputerReimageRequest{IdempotencyKey: "k"})
-			return err
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			// L1 sends reimage's receipt before the read, so only the
-			// plan keeps it from resending.
-			clients, requests := readRetryStub(t, func(requests int32, r *http.Request, w http.ResponseWriter) {
-				if requests > 1 {
-					t.Error("a no-resend mutation sent a second request")
-				}
-				w.Header().Set("Mutation-Applied", "true")
-				w.Header().Set("Idempotent-Replay", "false")
-				writeCommittedReadUnavailable(w, true)
-			})
-			withRetryWait(t, func(context.Context, time.Duration) error { return nil })
-			err := test.call(t.Context(), clients)
-			var refusal *apiResponseError
-			if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || requests.Load() != 1 ||
-				!strings.Contains(refusal.APIError.Message, "the change was applied") ||
-				!strings.Contains(refusal.APIError.Message, "same idempotency key") {
-				t.Fatalf("exit=%d requests=%d err=%v", commandExitCode(err), requests.Load(), err)
-			}
-		})
-	}
-}
-
 // TestUpgradeRestartReadsBackInsteadOfResending: an upgrade restart can be a
 // no-op that records no key, so it is read back, never sent again.
 func TestUpgradeRestartReadsBackInsteadOfResending(t *testing.T) {
@@ -238,7 +202,6 @@ func TestCommittedReadUnavailableWithoutRecoveryKeepsExit13(t *testing.T) {
 		hint     string
 	}{
 		{"no key and no GET", postChangeRecovery{hint: "run `wefty inspect job_1` to read it again"}, nil, 1, "wefty inspect job_1"},
-		{"keyed but not resent", sameKeyReadAgain, nil, 1, "same idempotency key"},
 		{"receipt plan without a first receipt", resendKeepingReceipt, nil, 1, "same idempotency key"},
 		{"resend unavailable again", resendWithKey, func(w http.ResponseWriter) { writeCommittedReadUnavailable(w, true) }, 2, "same idempotency key"},
 		{"read-back refused", readBackWith("/v1/jobs/job_1", "wefty inspect job_1"), writeForbiddenResponse, 2, "wefty inspect job_1"},
