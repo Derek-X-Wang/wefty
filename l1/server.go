@@ -1799,9 +1799,12 @@ func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Reques
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
-		writeError(w, err)
-		return
+	// Only a new projection carries an owed revocation; same-phase retries do not.
+	if computer.owedRevocationID != 0 {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	s.writeComputerForCaller(w, r, http.StatusAccepted, computer)
 }
