@@ -24,6 +24,23 @@ permissions:
 
 env:
   CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+  # Keep candidate-run scripts and the runtime checker aligned with the workflow.
+  # The crane helper is staged from workflow_sha and is deliberately excluded.
+  # Dockerfiles are deliberately excluded: Debian pin bumps would block behind PRs too often.
+  # The checker's contract constants are excluded too: that package churns for unrelated work.
+  IMAGE_TEST_INTERFACE_PATHS: >-
+    scripts/verify-acceptance-image.sh
+    scripts/build-oci-install-manifest.sh
+    scripts/debian-snapshot-cache.sh
+    scripts/debian-snapshot-cache-proxy.py
+    scripts/test-computer-image-runtime.sh
+    scripts/check-computer-image-runtime-evidence.sh
+    scripts/test-computer-wayland-furniture.sh
+    scripts/measure-computer-image.sh
+    scripts/assemble-oci-index.sh
+    cmd/wefty-computer-conformance
+    internal/computerconformance
+    internal/rfbclient
   IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
   COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference
   WAYLAND_COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-wayland-reference
@@ -61,6 +78,27 @@ jobs:
           repository: ${{ inputs.source_repository || github.repository }}
           ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
+      - name: Check candidate image test interface is current
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::could not fetch or compare image test interface history" >&2; exit 1' ERR
+          if [[ "$CANDIDATE_SHA" == "$WORKFLOW_SHA" ]]; then exit 0; fi
+          # Unshallow from the candidate origin, which may be a fork. Fetch only
+          # commits and trees; the comparison never needs file contents.
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            git fetch --no-tags --filter=blob:none --unshallow origin "$CANDIDATE_SHA"
+          fi
+          # Fetching by URL without credentials relies on a public repo; a private repo fails closed with the fetch error above.
+          git fetch --no-tags --filter=blob:none "$WORKFLOW_REPOSITORY_URL" "$WORKFLOW_SHA"
+          read -r -a interface_paths <<< "$IMAGE_TEST_INTERFACE_PATHS"
+          behind="$(git rev-list --no-merges --max-count=1 "$CANDIDATE_SHA..$WORKFLOW_SHA" -- "${interface_paths[@]}" ':(exclude)*_test.go' ':(exclude)*/testdata/*')"
+          if [[ -n "$behind" ]]; then
+            echo "::error::this PR is behind $behind; merge main into the branch, then rerun"
+            exit 1
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -249,6 +287,27 @@ jobs:
           repository: ${{ inputs.source_repository || github.repository }}
           ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
+      - name: Check candidate image test interface is current
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::could not fetch or compare image test interface history" >&2; exit 1' ERR
+          if [[ "$CANDIDATE_SHA" == "$WORKFLOW_SHA" ]]; then exit 0; fi
+          # Unshallow from the candidate origin, which may be a fork. Fetch only
+          # commits and trees; the comparison never needs file contents.
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            git fetch --no-tags --filter=blob:none --unshallow origin "$CANDIDATE_SHA"
+          fi
+          # Fetching by URL without credentials relies on a public repo; a private repo fails closed with the fetch error above.
+          git fetch --no-tags --filter=blob:none "$WORKFLOW_REPOSITORY_URL" "$WORKFLOW_SHA"
+          read -r -a interface_paths <<< "$IMAGE_TEST_INTERFACE_PATHS"
+          behind="$(git rev-list --no-merges --max-count=1 "$CANDIDATE_SHA..$WORKFLOW_SHA" -- "${interface_paths[@]}" ':(exclude)*_test.go' ':(exclude)*/testdata/*')"
+          if [[ -n "$behind" ]]; then
+            echo "::error::this PR is behind $behind; merge main into the branch, then rerun"
+            exit 1
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -395,6 +454,27 @@ jobs:
           repository: ${{ inputs.source_repository || github.repository }}
           ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
+      - name: Check candidate image test interface is current
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::could not fetch or compare image test interface history" >&2; exit 1' ERR
+          if [[ "$CANDIDATE_SHA" == "$WORKFLOW_SHA" ]]; then exit 0; fi
+          # Unshallow from the candidate origin, which may be a fork. Fetch only
+          # commits and trees; the comparison never needs file contents.
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            git fetch --no-tags --filter=blob:none --unshallow origin "$CANDIDATE_SHA"
+          fi
+          # Fetching by URL without credentials relies on a public repo; a private repo fails closed with the fetch error above.
+          git fetch --no-tags --filter=blob:none "$WORKFLOW_REPOSITORY_URL" "$WORKFLOW_SHA"
+          read -r -a interface_paths <<< "$IMAGE_TEST_INTERFACE_PATHS"
+          behind="$(git rev-list --no-merges --max-count=1 "$CANDIDATE_SHA..$WORKFLOW_SHA" -- "${interface_paths[@]}" ':(exclude)*_test.go' ':(exclude)*/testdata/*')"
+          if [[ -n "$behind" ]]; then
+            echo "::error::this PR is behind $behind; merge main into the branch, then rerun"
+            exit 1
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod

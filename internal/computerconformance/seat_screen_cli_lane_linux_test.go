@@ -50,7 +50,8 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	traceLog := &screenLaneTimingLog{t: t, fallback: previousLog}
 	log.SetOutput(traceLog)
 	t.Cleanup(func() { log.SetOutput(previousLog) })
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	// The idle-wake case below waits about 70 s without input.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	t.Cleanup(cancel)
 	imageRef := requiredSeatEnv(t, "WEFTY_SEAT_IMAGE")
 	binaryPath := requiredSeatEnv(t, "WEFTY_SEAT_CLI_BINARY")
@@ -178,7 +179,8 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	seatMust(t, os.Chmod(state, 0700))
 	credential, _ := json.Marshal(map[string]string{"seat_id": id, "credential": ready.Credential})
 	seatMust(t, os.WriteFile(filepath.Join(state, id+".json"), credential, 0600))
-	var processStart time.Time
+	var processStart, lastInput time.Time
+	// Every call sends input; lastInput is when the latest CLI process ended.
 	call := func(args ...string) (int, []byte, time.Duration) {
 		t.Helper()
 		command := exec.CommandContext(ctx, binaryPath, append([]string{"--l1", listener.Addr().String(), "--plain-identity", "screen-cli", "--plain-fabric-id", "plain-seat-screen-lane", "--json", "seat"}, args...)...)
@@ -187,6 +189,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		processStart = start
 		out, e := command.CombinedOutput()
 		elapsed := time.Since(start)
+		lastInput = time.Now()
 		code := 0
 		if e != nil {
 			exit, ok := e.(*exec.ExitError)
@@ -259,6 +262,65 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		return ownerFabric.Dial(ctx, network, host)
 	}}
 	defer transport.CloseIdleConnections()
+	openWire := func(ctx context.Context, mode string) (net.Conn, func(), error) {
+		ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
+		if err != nil {
+			return nil, nil, err
+		}
+		stop := context.AfterFunc(ctx, func() { _ = ws.CloseNow() })
+		ws.SetReadLimit(128 << 20)
+		return websocket.NetConn(ctx, ws, websocket.MessageBinary), func() { stop(); _ = ws.CloseNow() }, nil
+	}
+	openScreen := func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+		wire, close, err := openWire(ctx, mode)
+		if err != nil {
+			return nil, nil, err
+		}
+		client, err := rfbclient.Open(wire)
+		if err != nil {
+			close()
+			return nil, nil, err
+		}
+		return client, close, nil
+	}
+	// SC-1 idle-wake (#1495): a Seat nobody has used for a while still answers
+	// a click + PNG quickly. The warm calls above keep x11vnc awake; here the
+	// control role gets no input and sends no framebuffer data for
+	// IdleWakeQuiet, so an x11vnc that naps would be asleep. The node's 1 s
+	// Seat observation still greets both roles, as on a real idle Seat; a
+	// greeting is neither input nor framebuffer data.
+	//
+	// The observer starts right after the last warm call and holds a
+	// view-role connection: a separate x11vnc process, so its requests and
+	// frames cannot wake the control role or reset its idle clocks. It
+	// compares every update with its first frame, so a changed screen fails
+	// the premise instead of passing warm.
+	idleCtx, stopIdle := context.WithTimeout(ctx, computerconformance.IdleWakeQuiet+30*time.Second)
+	var idle computerconformance.IdleWakeObservation
+	if wire, closeWire, err := openWire(idleCtx, "view"); err != nil {
+		idle.Err = err
+	} else {
+		idle = computerconformance.ObserveIdleScreen(wire, lastInput.Add(computerconformance.IdleWakeQuiet))
+		closeWire()
+	}
+	stopIdle()
+	idle.SinceInput = time.Since(lastInput)
+	idlePremise := idle.Premise()
+	var idleWake, idleBaseline time.Duration
+	idlePhases, idleResult := map[string]float64{}, "ok"
+	if idlePremise != nil {
+		idleResult = idlePremise.Error()
+		t.Errorf("SC-1 idle-wake: not measured: %v", idlePremise)
+	} else {
+		idleWake = click()
+		idlePhases = breakdowns[len(breakdowns)-1]
+		baseline, ok := idlePhases["frame_baseline"]
+		if !ok {
+			t.Error("SC-1 idle-wake call omitted phase frame_baseline")
+		}
+		idleBaseline = time.Duration((baseline - idlePhases["rfb_banner"]) * float64(time.Millisecond))
+		t.Logf("SC-1 idle-wake: baseline %.3f ms (gate %d ms); click + PNG %.3f ms (SC-1 1000 ms, data); idle %.1f s since input, observed static %.1f s over %d updates", float64(idleBaseline.Microseconds())/1000, computerconformance.IdleWakeBaselineGate.Milliseconds(), float64(idleWake.Microseconds())/1000, idle.SinceInput.Seconds(), idle.Observed.Seconds(), idle.Updates)
+	}
 	// Prove the CLI's timeout capture on this Seat's x11vnc, through the node
 	// front door (#1484). Run after SC-1 so the colour page cannot affect its
 	// timings. The page changes colour only through real control connections.
@@ -267,21 +329,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		return exec.CommandContext(ctx, "ctr", append([]string{"--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", execID, "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place) + script}, args...)...)
 	}
 	inputCapture, probeErr := computerconformance.ProbeInputCapture(probeCtx, computerconformance.InputCaptureProbeOptions{
-		Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
-			ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
-			if err != nil {
-				return nil, nil, err
-			}
-			stop := context.AfterFunc(ctx, func() { _ = ws.CloseNow() })
-			close := func() { stop(); _ = ws.CloseNow() }
-			ws.SetReadLimit(128 << 20)
-			client, err := rfbclient.Open(websocket.NetConn(ctx, ws, websocket.MessageBinary))
-			if err != nil {
-				close()
-				return nil, nil, err
-			}
-			return client, close, nil
-		},
+		Open: openScreen,
 		Prepare: func(ctx context.Context, attempt int) (string, error) {
 			output, err := ctrExec(ctx, fmt.Sprintf("input-capture-colour-%d", attempt), computerconformance.InputCaptureProbeLaunchScript, "sh", computerconformance.InputCaptureProbeURL()).CombinedOutput()
 			return fmt.Sprintf("launch attempt=%d status=%v output=%s", attempt, err, output), err
@@ -350,13 +398,19 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	// Both observations are logged even when one exceeds its limit.
 	evidence, _ := json.MarshalIndent(map[string]any{
 		"input_capture":        inputCapture,
-		"sc1_phase_ms":         map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
+		"sc1_phase_ms":         map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:5], "idle_wake": idlePhases},
 		"x11vnc_rss_kib":       rss,
 		"sc1_ms":               float64(sc1.Microseconds()) / 1000,
 		"sc1_cold_ms":          float64(cold.Microseconds()) / 1000,
 		"sc1_warm_ms":          []float64{float64(warm[0].Microseconds()) / 1000, float64(warm[1].Microseconds()) / 1000, float64(warm[2].Microseconds()) / 1000},
 		"sc1_warm_median_ms":   float64(sc1.Microseconds()) / 1000,
 		"sc1_warm_max_ms":      float64(ordered[2].Microseconds()) / 1000,
+		"sc1_idle_baseline_ms": float64(idleBaseline.Microseconds()) / 1000,
+		"sc1_idle_wake_ms":     float64(idleWake.Microseconds()) / 1000,
+		"sc1_idle_quiet_s":     idle.SinceInput.Seconds(),
+		"sc1_idle_static_s":    idle.Observed.Seconds(),
+		"sc1_idle_updates":     idle.Updates,
+		"sc1_idle_premise":     idleResult,
 		"backend_timing_jsonl": string(timingBytes),
 		"node_helper_timing":   traceLog.snapshot(),
 		"sc4_ms":               float64(sc4.Microseconds()) / 1000,
@@ -369,6 +423,9 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	}
 	if sc4 > time.Second {
 		t.Errorf("SC-4 %s exceeds 1s", sc4)
+	}
+	if idlePremise == nil && idleBaseline > computerconformance.IdleWakeBaselineGate {
+		t.Errorf("SC-1 idle-wake baseline frame %s exceeds %s after %.1f s idle (click + PNG %s)", idleBaseline, computerconformance.IdleWakeBaselineGate, idle.SinceInput.Seconds(), idleWake)
 	}
 }
 
