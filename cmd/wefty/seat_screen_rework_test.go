@@ -26,7 +26,7 @@ import (
 )
 
 type seatScreenReworkStats struct {
-	input, events, baseline, syncs, incremental, capture atomic.Int32
+	input, events, baseline, syncs, incremental, capture, discovery atomic.Int32
 }
 
 func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string, *atomic.Int32) {
@@ -52,6 +52,10 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/screen-target") {
+			if stats.discovery.Add(1) == 1 && failure == "discovery-expiry" {
+				writeRetryableUnavailable(w, "read_snapshot_expired")
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address, "unread_events": 0})
 			return
 		}

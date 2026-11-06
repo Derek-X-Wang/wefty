@@ -162,11 +162,37 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 		wait = waitForContext
 	}
 	var cleanupDeadline time.Time
+	readCtx := withoutClientRetry(ctx)
+	var lastRetryable error
+	stopped := func(err error, unread int) error {
+		return withSeatReply(stdout, jsonOutput, id, unread, func(io.Writer) error {
+			return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, err)
+		})
+	}
 	coldStartObserved := false
 	const coldStartMessage = "starting the host VM, about 1 minute"
+	// ended reports a Refused, Ending or Ended Seat as its typed outcome.
+	ended := func(result l1.SeatCallResult) error {
+		outcome := seatCallRefusal(id, result.Reason)
+		if result.State != l1.SeatRefused {
+			outcome = &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
+		}
+		if coldStartObserved {
+			outcome.APIError.Details["host_vm_starting"] = true
+			outcome.APIError.Details["message"] = coldStartMessage
+		}
+		if result.CleanupPending {
+			outcome.APIError.Message += "; cleanup still pending; L1 continues cleanup; check again with wefty seat wait " + id
+			outcome.APIError.Details["cleanup_pending"] = true
+		}
+		return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(output io.Writer) error { return outcome })
+	}
+	// lastEnded is the ended Seat whose cleanup the wait is watching; a busy
+	// L1 answer must not carry the wait past its cleanup limit.
+	var lastEnded l1.SeatCallResult
 	for {
 		var result l1.SeatCallResult
-		err := clients.l1.do(ctx, http.MethodGet, "/v1/seat-requests/"+id, nil, nil, &result, http.StatusOK)
+		err := clients.l1.do(readCtx, http.MethodGet, "/v1/seat-requests/"+id, nil, nil, &result, http.StatusOK)
 		var apiErr *apiResponseError
 		if err != nil && errors.As(err, &apiErr) && apiErr.APIError.Code == contract.ErrorNotFound {
 			input, e := loadSeatCallInput(id)
@@ -174,9 +200,26 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 				return err
 			}
 			err = clients.l1.do(ctx, http.MethodPost, "/v1/seat-requests", input, nil, &result, http.StatusOK)
+			if err != nil {
+				return err
+			}
 		}
+		verdict := decideWaitFailure(ctx, readCtx, err, &lastRetryable)
 		if err != nil {
-			return err
+			switch verdict {
+			case waitRetry:
+				if !cleanupDeadline.IsZero() && !now().Before(cleanupDeadline) {
+					return ended(lastEnded)
+				}
+				if err := wait(readCtx, 250*time.Millisecond); err != nil {
+					return stopped(err, result.UnreadEvents)
+				}
+				continue
+			case waitCallerStopped:
+				return stopped(err, result.UnreadEvents)
+			default:
+				return err
+			}
 		}
 		if result.SeatID != id {
 			return fmt.Errorf("Seat request response changed its ID")
@@ -221,27 +264,14 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 					cleanupDeadline = now().Add(seatCleanupWaitLimit)
 				}
 				if now().Before(cleanupDeadline) {
+					lastEnded = result
 					break
 				}
 			}
-			outcome := seatCallRefusal(id, result.Reason)
-			if result.State != l1.SeatRefused {
-				outcome = &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
-			}
-			if coldStartObserved {
-				outcome.APIError.Details["host_vm_starting"] = true
-				outcome.APIError.Details["message"] = coldStartMessage
-			}
-			if result.CleanupPending {
-				outcome.APIError.Message += "; cleanup still pending; L1 continues cleanup; check again with wefty seat wait " + id
-				outcome.APIError.Details["cleanup_pending"] = true
-			}
-			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(output io.Writer) error { return outcome })
+			return ended(result)
 		}
 		if err := wait(ctx, 250*time.Millisecond); err != nil {
-			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(io.Writer) error {
-				return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, err)
-			})
+			return stopped(err, result.UnreadEvents)
 		}
 	}
 }
