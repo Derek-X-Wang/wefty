@@ -1230,6 +1230,66 @@ Inline executable decoding, digest validation, interpreter resolution,
 materialization, and cleanup are owned by the process adapter; the agent
 lifecycle never materializes a kind-specific executable.
 
+A portful process service's backend port is picked by binding port 0 on
+`127.0.0.1` and releasing it. The payload binds it later through
+`WEFTY_SERVICE_PORT`, so another local process can take it in between (#1468).
+Immediately before the runtime starts the payload, the agent binds the port
+once more to confirm that it is free. If it is taken, the agent picks one fresh
+port the same way, at once, and starts the payload there. If that port is taken
+too, the attempt ends with restartable `service_port_taken` before any payload
+exists. After spawn, the Guardian reports readiness, which publishes the
+service, only when every TCP listener that can receive connections for the
+backend address belongs to the payload's process group. It follows the
+kernel's own lookup order on Linux and macOS: a listener bound to `127.0.0.1`
+(also as `::ffff:127.0.0.1`) takes every such connection, so wildcards count
+only when no such listener exists. A listener on `::1` or on another
+interface never counts. Among wildcards an IPv6 one counts as possibly
+dual-stack: neither `/proc/net/tcp6` nor lsof shows `IPV6_V6ONLY`, and
+another process's socket option cannot be read without ptrace rights. So an
+IPv6-only wildcard of another process beside a payload that itself listens on
+a wildcard still withdraws the service; beside a payload bound to
+`127.0.0.1` it does not count. On Linux the Guardian matches `/proc/net/tcp`
+and `/proc/net/tcp6` listening-socket inodes against the group's
+descriptors; a member whose descriptors or descriptor links cannot be read
+makes an unattributed listener inconclusive, never foreign. On macOS it reads
+`/usr/sbin/lsof`. Inspection runs beside the Guardian's supervision loop:
+readiness stays where it is until an inspection answers, and a stop, an exit
+or a deadline cancels a running inspection without waiting for it, so it adds
+no phase to the shutdown bound. A failed probe discards the answer of a
+running inspection, because the listener it saw may be gone, and the next
+answering probe starts a fresh inspection. This has a liveness limit: after
+startup, if probes keep failing and recovering faster than an inspection
+answers, no inspection completes, so a foreign owner is not detected and the
+ownership deadline below does not start. Routing stays safe: the first failed
+probe withdraws the service, and only a completed inspection that confirms
+the payload's own listener publishes it again. The Guardian inspects on every
+return to readiness and every 10 seconds while the service is ready. A
+takeover with no failed probe in between (the payload closes its listener and
+another process binds the port, or another process adds an `SO_REUSEPORT`
+listener) is therefore withdrawn within the interval, one probe cycle and one
+inspection. That is nominally about 10.3 seconds, because an inspection
+usually answers in tens of milliseconds. Forwarding stays as it is while an
+inspection runs, and an inspection may take up to its 5-second timeout, so
+the bound is about 15 seconds plus one probe cycle (250 ms interval and up to
+200 ms connect timeout): about 15.5 seconds. The interval follows a CPU budget of 1% of one
+core per ready service; one ready service measured 0.76% on macOS. A listener
+of another process before startup makes the Guardian stop the payload and
+report `service_port_taken`. After startup a foreign owner or a failed
+inspection withdraws the service and starts an ownership deadline as long as
+the startup readiness deadline. Only a confirmed inspection clears it; probe
+failures neither start nor clear it. When it expires, the Guardian stops the
+payload and reports `service_port_taken` with the reason. An ordinary probe
+loss alone still only withdraws and never ends the payload. A payload that
+exits before startup while another process still holds its port also reports
+`service_port_taken`. Before startup, a listener the check cannot attribute,
+such as another user's on macOS, or a failed inspection is never published;
+the startup deadline then reports `startup_readiness_timeout` with that
+reason. Every new attempt receives a fresh port.
+
+Roll out L1 before agents that report `service_port_taken`. An older L1
+accepts the code but classifies every unknown spawn code as terminal, so a
+service on a newer agent would stop instead of restarting on a fresh port.
+
 `ServiceAddress` remains only for the process readiness guardian. A portful OCI
 request instead asks its adapter for the named `service` `AttemptEndpoint`: the
 helper allocates a bounded named endpoint map and the adapter returns an

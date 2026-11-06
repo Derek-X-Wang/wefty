@@ -22,7 +22,9 @@ type ShutdownTimeouts struct {
 // finalization timeout and can overrun it by the one request in flight, one
 // L1 operation timeout; then the completion (or its evidence recovery) and
 // the result upload, one operation timeout each. Attempts end concurrently,
-// so the slowest one bounds the agent. A service manager that kills the agent
+// so the slowest one bounds the agent. A Guardian cancels its listener
+// ownership inspection on a stop and never waits for it, so that inspection
+// adds no phase here. A service manager that kills the agent
 // a fixed time after SIGTERM must allow at least its shutdown budget plus
 // this.
 func ForcedShutdownBound(timeouts ShutdownTimeouts) time.Duration {

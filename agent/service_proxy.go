@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -25,6 +26,9 @@ type serviceRuntimeEndpoint struct {
 	environment map[string]string
 	address     string
 	dial        func(context.Context) (net.Conn, error)
+	// reallocate is set only on a process endpoint whose port the agent
+	// picked and released. It picks a fresh port the same way (#1468).
+	reallocate func(context.Context) (serviceRuntimeEndpoint, error)
 }
 
 type runtimeEndpointLatch struct {
@@ -91,19 +95,63 @@ func prepareProcessServiceEndpoint(ctx context.Context) (serviceRuntimeEndpoint,
 	if err != nil {
 		return serviceRuntimeEndpoint{}, fmt.Errorf("reserve process service endpoint: %w", err)
 	}
-	address := reservation.Addr().String()
-	port := reservation.Addr().(*net.TCPAddr).Port
+	address := reservation.Addr().(*net.TCPAddr)
 	if err := reservation.Close(); err != nil {
 		return serviceRuntimeEndpoint{}, fmt.Errorf("release process service endpoint reservation: %w", err)
 	}
+	return releasedServiceEndpoint(address, prepareProcessServiceEndpoint), nil
+}
+
+// releasedServiceEndpoint describes a backend port that the payload binds
+// after the agent released it. Until then another local process can take it.
+func releasedServiceEndpoint(address *net.TCPAddr, reallocate func(context.Context) (serviceRuntimeEndpoint, error)) serviceRuntimeEndpoint {
 	dialer := &net.Dialer{}
+	text := address.String()
 	return serviceRuntimeEndpoint{
-		environment: map[string]string{contract.EnvServicePort: strconv.Itoa(port)},
-		address:     address,
+		environment: map[string]string{contract.EnvServicePort: strconv.Itoa(address.Port)},
+		address:     text,
 		dial: func(ctx context.Context) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp4", address)
+			return dialer.DialContext(ctx, "tcp4", text)
 		},
-	}, nil
+		reallocate: reallocate,
+	}
+}
+
+var errServicePortTaken = errors.New("process service backend port taken")
+
+// confirmReleasedServicePort runs just before the payload starts. If another
+// process took the released port, it retries once, at once, on a fresh port;
+// if that is taken too, it fails with errServicePortTaken (#1468).
+func confirmReleasedServicePort(ctx context.Context, endpoint serviceRuntimeEndpoint) (serviceRuntimeEndpoint, error) {
+	taken, err := servicePortTaken(endpoint.address)
+	if err != nil || !taken {
+		return endpoint, err
+	}
+	fresh, err := endpoint.reallocate(ctx)
+	if err != nil {
+		return serviceRuntimeEndpoint{}, err
+	}
+	taken, err = servicePortTaken(fresh.address)
+	if err != nil {
+		return serviceRuntimeEndpoint{}, err
+	}
+	if taken {
+		return serviceRuntimeEndpoint{}, fmt.Errorf("%w: other processes took %s and then %s before the payload started",
+			errServicePortTaken, endpoint.address, fresh.address)
+	}
+	return fresh, nil
+}
+
+// servicePortTaken binds address briefly: the bind the payload needs.
+func servicePortTaken(address string) (bool, error) {
+	probe, err := net.Listen("tcp4", address)
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("confirm process service endpoint %s is free: %w", address, err)
+	}
+	return false, probe.Close()
 }
 
 type serviceRunOutcome struct {
@@ -140,6 +188,23 @@ func runPortfulService(
 	endpoint serviceRuntimeEndpoint,
 	config serviceSupervisorConfig,
 ) (contract.ProcessResult, error) {
+	if endpoint.reallocate != nil {
+		confirmed, err := confirmReleasedServicePort(ctx, endpoint)
+		if errors.Is(err, errServicePortTaken) {
+			// No payload exists yet, so nothing was published or started.
+			return spawnFailure(contract.SpawnFailureServicePortTaken, err), nil
+		}
+		if err != nil {
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		if confirmed.address != endpoint.address {
+			request.Execution.Env = cloneEnvironment(request.Execution.Env)
+			for name, value := range confirmed.environment {
+				request.Execution.Env[name] = value
+			}
+			endpoint = confirmed
+		}
+	}
 	// Keep the guardian execution context independent from the caller's
 	// cancellation long enough to withdraw local publication and close the
 	// Fabric listener first. The explicit ctx.Done arm below owns that order.

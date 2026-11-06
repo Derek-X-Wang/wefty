@@ -23,6 +23,9 @@ func TestSpawnFailureClassificationDefaultsTerminal(t *testing.T) {
 	if !IsRestartableSpawnFailure(contract.SpawnFailureStartupReadinessTimeout) {
 		t.Fatal("startup readiness timeout must be restartable")
 	}
+	if !IsRestartableSpawnFailure(contract.SpawnFailureServicePortTaken) {
+		t.Fatal("a taken service backend port must be restartable: the next attempt gets a fresh port")
+	}
 	if got := classifySpawnFailure(contract.SpawnFailurePublishedListener); got != failureInfrastructure {
 		t.Fatalf("published listener classification = %d, want infrastructure", got)
 	}

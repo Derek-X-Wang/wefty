@@ -993,6 +993,10 @@ const (
 	SpawnFailureReconfigurationAborted     SpawnFailureCode = "reconfiguration_aborted"
 	SpawnFailureReimagePreflight           SpawnFailureCode = "computer_reimage_preflight_failed"
 	SpawnFailurePassUnavailable            SpawnFailureCode = "pass_unavailable"
+	// Another local process took a process service's released backend port
+	// before the payload bound it, or answered on it, so the agent did not
+	// publish the service (#1468). The next attempt gets a fresh port.
+	SpawnFailureServicePortTaken SpawnFailureCode = "service_port_taken"
 	// The two Storage copy preparation outcomes that are terminal for a
 	// Computer clone reach the Job's latched failure surface under their own
 	// names. They are the same typed words the helper and the Custody import

@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,6 +15,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -44,6 +48,14 @@ func main() {
 		write(os.Stderr)
 	case "hang":
 		hang()
+	case "listen":
+		listen()
+	case "listen-reuseport":
+		listenReusePort()
+	case "listen-child":
+		listenChild()
+	case "listen-toggle":
+		listenToggle()
 	case "hang-both-streams":
 		ignoreTermination(nil)
 		fmt.Fprintln(os.Stdout, os.Getpid())
@@ -238,6 +250,98 @@ func hang() {
 	ignoreTermination(nil)
 	fmt.Fprintln(os.Stdout, os.Getpid())
 	select {}
+}
+
+// listen is a payload that owns its service backend: it binds the address it
+// is given, like a real service binding WEFTY_SERVICE_PORT, and exits 1 when
+// that bind fails.
+func listen() {
+	if len(os.Args) != 3 {
+		fatalf("listen mode requires one address")
+	}
+	listener, err := net.Listen("tcp4", os.Args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	serveAndClose(listener)
+	fatalf("listener stopped accepting")
+}
+
+// listenReusePort owns its backend with SO_REUSEPORT set, so a test can add
+// a second listener on the same address while this one keeps answering.
+func listenReusePort() {
+	if len(os.Args) != 3 {
+		fatalf("listen-reuseport mode requires one address")
+	}
+	config := net.ListenConfig{Control: func(_, _ string, connection syscall.RawConn) error {
+		var optionErr error
+		if err := connection.Control(func(descriptor uintptr) {
+			optionErr = unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return optionErr
+	}}
+	listener, err := config.Listen(context.Background(), "tcp4", os.Args[2])
+	if err != nil {
+		fatalf("listen: %v", err)
+	}
+	serveAndClose(listener)
+	fatalf("listener stopped accepting")
+}
+
+// listenChild leaves the backend to a child in its process group, like a
+// shell or launcher that starts the real server.
+func listenChild() {
+	if len(os.Args) != 3 {
+		fatalf("listen-child mode requires one address")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		fatalf("locate helper executable: %v", err)
+	}
+	child := exec.Command(executable, "listen", os.Args[2])
+	child.Stdout, child.Stderr = os.Stdout, os.Stderr
+	if err := child.Run(); err != nil {
+		fatalf("listen child: %v", err)
+	}
+}
+
+// listenToggle owns its backend like listen, closes it on SIGUSR1 and binds
+// it again on SIGUSR2, so a test can take readiness away from a live payload.
+func listenToggle() {
+	if len(os.Args) != 3 {
+		fatalf("listen-toggle mode requires one address")
+	}
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGUSR1, syscall.SIGUSR2)
+	open := func() net.Listener {
+		listener, err := net.Listen("tcp4", os.Args[2])
+		if err != nil {
+			fatalf("listen: %v", err)
+		}
+		go serveAndClose(listener)
+		return listener
+	}
+	listener := open()
+	for received := range signals {
+		if received == syscall.SIGUSR1 {
+			_ = listener.Close()
+		} else {
+			listener = open()
+		}
+	}
+}
+
+func serveAndClose(listener net.Listener) {
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = connection.Close()
+	}
 }
 
 func spawnChild() {
