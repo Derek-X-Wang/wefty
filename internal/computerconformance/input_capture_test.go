@@ -388,30 +388,8 @@ func inputCaptureFakeClient(t *testing.T, ctx context.Context, page *inputCaptur
 		defer close(done)
 		defer server.Close()
 		defer close(out)
-		write := func(p []byte) bool { _, err := server.Write(p); return err == nil }
 		read := func(n int) ([]byte, error) { p := make([]byte, n); _, err := io.ReadFull(server, p); return p, err }
-		if !write([]byte("RFB 003.008\n")) {
-			return
-		}
-		if _, err := read(12); err != nil {
-			return
-		}
-		if !write([]byte{1, 1}) {
-			return
-		}
-		if _, err := read(1); err != nil {
-			return
-		}
-		if !write([]byte{0, 0, 0, 0}) {
-			return
-		}
-		if _, err := read(1); err != nil {
-			return
-		}
-		init := make([]byte, 24)
-		binary.BigEndian.PutUint16(init, 3)
-		binary.BigEndian.PutUint16(init[2:], 3)
-		if !write(init) {
+		if !fakeRFBHandshake(server, 3, 3) {
 			return
 		}
 		held := false
@@ -496,4 +474,19 @@ func inputCaptureFakeClient(t *testing.T, ctx context.Context, page *inputCaptur
 		return nil, nil, err
 	}
 	return rfb, close, nil
+}
+
+// fakeRFBHandshake plays the server side of an RFB 3.8 handshake with None
+// security for a width x height screen. The input-capture and idle-wake fakes
+// share it.
+func fakeRFBHandshake(server io.ReadWriter, width, height int) bool {
+	write := func(p []byte) bool { _, err := server.Write(p); return err == nil }
+	read := func(n int) bool { _, err := io.ReadFull(server, make([]byte, n)); return err == nil }
+	if !write([]byte("RFB 003.008\n")) || !read(12) || !write([]byte{1, 1}) || !read(1) || !write([]byte{0, 0, 0, 0}) || !read(1) {
+		return false
+	}
+	init := make([]byte, 24)
+	binary.BigEndian.PutUint16(init, uint16(width))
+	binary.BigEndian.PutUint16(init[2:], uint16(height))
+	return write(init)
 }
