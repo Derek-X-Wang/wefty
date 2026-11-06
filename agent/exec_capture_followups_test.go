@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -246,6 +248,14 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 }
 
 func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
+	testExecCaptureCleanupIgnoresReplacedMailboxPath(t, false)
+}
+
+func TestExecCaptureCleanupIgnoresReplacedMailboxPathAfterScanFailure(t *testing.T) {
+	testExecCaptureCleanupIgnoresReplacedMailboxPath(t, true)
+}
+
+func testExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T, failFirstScan bool) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, ContentLength: 4, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
 	})}}
@@ -280,9 +290,58 @@ func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
 		waitExecCaptureTrash(t, moved)
 		waitExecCaptureTrash(t, outside)
 	})
-	stopped := mailbox.captureSweep(t.Context())
-	if len(stopped) != 1 || stopped[0].PID != retained.Process.Pid {
-		t.Fatalf("sweep followed replacement path: stopped=%+v retained=%d replacement=%d", stopped, retained.Process.Pid, replacement.Process.Pid)
+	if failFirstScan {
+		tool := "lsof"
+		if runtime.GOOS == "linux" {
+			tool = "find"
+		}
+		realTool, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin := t.TempDir()
+		t.Setenv("WEFTY_TEST_SCAN_TOOL", realTool)
+		t.Setenv("WEFTY_TEST_SCAN_FAILED", filepath.Join(bin, "failed"))
+		if err := os.WriteFile(filepath.Join(bin, tool), []byte(`#!/bin/sh
+if [ ! -e "$WEFTY_TEST_SCAN_FAILED" ]; then
+  : > "$WEFTY_TEST_SCAN_FAILED"
+  exit 2
+fi
+exec "$WEFTY_TEST_SCAN_TOOL" "$@"
+`), 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	scanFailures := 0
+	for attempt := 1; attempt <= 5; attempt++ {
+		scanFailed := false
+		mailbox.logf = func(format string, args ...any) {
+			t.Logf(format, args...)
+			if strings.Contains(fmt.Sprintf(format, args...), "wefty: warning: could not scan processes in run storage") {
+				scanFailed = true
+			}
+		}
+		stopped := mailbox.captureSweep(t.Context())
+		mailbox.logf = t.Logf
+		for _, process := range stopped {
+			if process.PID != retained.Process.Pid {
+				t.Fatalf("sweep followed replacement path: stopped=%+v retained=%d replacement=%d", stopped, retained.Process.Pid, replacement.Process.Pid)
+			}
+		}
+		if len(stopped) == 1 {
+			break
+		}
+		if len(stopped) != 0 || !scanFailed {
+			t.Fatalf("sweep did not stop retained process: stopped=%+v retained=%d replacement=%d", stopped, retained.Process.Pid, replacement.Process.Pid)
+		}
+		scanFailures++
+		if attempt == 5 {
+			t.Fatal("exec storage process scan never succeeded after 5 attempts")
+		}
+	}
+	if failFirstScan && scanFailures == 0 {
+		t.Fatal("injected first process scan failure was not observed")
 	}
 	waitExecSweepProcess(t, retainedDone)
 	select {
