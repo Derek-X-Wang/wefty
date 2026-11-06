@@ -1,0 +1,53 @@
+name: action-pins
+
+# Every remote `uses:` reference must resolve on GitHub: the commit exists and
+# the action or reusable workflow exists at that commit (#1494). A pin to a
+# commit that does not exist otherwise merges and stays hidden while its job
+# is skipped (#1491). A PR checks only the references it introduces or
+# changes; the weekly run checks all of them. Exit 3 means the GitHub API was
+# unavailable, not that a pin is invalid: re-run the job. The binary is built
+# first and run directly, because go run reports any failure as exit 1.
+# Secretless: only the read-only built-in token.
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: action-pins-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  action-pins:
+    name: action-pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # A PR reads the workflows at its base commit with git show.
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build the checker
+        run: go build -o "$RUNNER_TEMP/action-pins" ./scripts/action-pins
+      - name: Check introduced or changed action refs
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          "$RUNNER_TEMP/action-pins" --base "$BASE_SHA"
+      - name: Check every action ref
+        if: github.event_name == 'schedule'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "$RUNNER_TEMP/action-pins" --all

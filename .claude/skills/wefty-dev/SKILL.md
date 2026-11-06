@@ -77,7 +77,10 @@ aggregates fail-closed and is the only required check. `tsnet-smoke.yml`
 `TSNET_SMOKE_REQUIRED=true`. `tsnet-headscale.yml` (PR + main, secretless)
 runs the four `tsnet_smoke` tests and a tagged-key negative control against a
 Headscale and DERP relay that `scripts/tsnet-headscale-lane.sh` starts on the
-runner; it is not yet an `all-tests-pass` input.
+runner; it is not yet an `all-tests-pass` input. `action-pins.yml` (PR +
+weekly, secretless) runs `scripts/action-pins` to resolve each remote `uses:`
+ref through the GitHub API (PR: introduced or changed refs only); exit 3 means
+the API was unavailable, not an invalid pin. It is not an `all-tests-pass` input.
 
 ## Dogfood
 
