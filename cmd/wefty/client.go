@@ -252,7 +252,8 @@ func (c *apiClients) mutateComputerGrant(
 ) (l1.ComputerGrantMutationResult, error) {
 	var result l1.ComputerGrantMutationResult
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/grants/" + url.PathEscape(userID)
-	responseHeaders, err := c.l1.doWithResponse(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
+	// The same key replays before any grant writes (l1/computer_policy.go:338-356).
+	responseHeaders, err := c.l1.resendOnBareSnapshotExpiry(ctx, http.MethodPut, path, request, nil, &result, http.StatusOK)
 	if err == nil && responseHeaders.Get("Idempotent-Replay") == "true" {
 		result.Replayed = true
 		result.MutationApplied = false
@@ -930,6 +931,30 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 		}
 	}
 	return err
+}
+
+// resendOnBareSnapshotExpiry is an opt-in for server-replayed mutations. A
+// bare expiry can precede or follow a commit; these callers can resend the
+// identical request once and accept L1's current replay. Transport failures
+// and post-change envelopes are not handled here.
+func (c *apiClient) resendOnBareSnapshotExpiry(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
+	responseHeaders, err := c.doWithResponse(ctx, method, path, body, headers, target, success...)
+	var response *apiResponseError
+	if c.name != "L1" || method == http.MethodGet || !isRetryableL1Answer(err) ||
+		!errors.As(err, &response) || ctx.Err() != nil {
+		return responseHeaders, err
+	}
+	reason, _ := response.APIError.Details["reason"].(string)
+	if reason != "read_snapshot_expired" && reason != "read_snapshot_admission_expired" {
+		return responseHeaders, err
+	}
+	if wait := readRetryWait(ctx, readRetryBackoff(0)); wait != nil {
+		if errors.Is(wait, context.Canceled) {
+			return responseHeaders, wait
+		}
+		return responseHeaders, err
+	}
+	return c.doWithResponse(ctx, method, path, body, headers, target, success...)
 }
 
 // postChangeRecovery is one L1 mutation's explicit plan for an answer that

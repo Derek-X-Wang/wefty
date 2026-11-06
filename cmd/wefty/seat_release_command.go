@@ -19,7 +19,9 @@ func executeSeatRelease(ctx context.Context, clients *apiClients, jsonOutput boo
 	}
 	headers := http.Header{l1.SeatCredentialHeader: []string{secret}}
 	var result l1.SeatCallResult
-	if err := clients.l1.do(ctx, http.MethodPost, "/v1/seats/"+id+"/release", nil, headers, &result, http.StatusOK); err != nil {
+	// Released Seats replay without release writes (l1/seat_release.go:18-41);
+	// middleware admits that replay even after ending (l1/seat_log_routes.go:96-98).
+	if _, err := clients.l1.resendOnBareSnapshotExpiry(ctx, http.MethodPost, "/v1/seats/"+id+"/release", nil, headers, &result, http.StatusOK); err != nil {
 		return err
 	}
 	if result.SeatID != id || result.Reason != "released" || result.State != l1.SeatEnding && result.State != l1.SeatEnded {

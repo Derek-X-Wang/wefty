@@ -287,11 +287,11 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		Endpoint string `json:"endpoint"`
 		Unread   int    `json:"unread_events"`
 	}
-	// Screen input is never retried: an interrupted call may already have acted.
-	ctx = withoutClientRetry(ctx)
 	if err = clients.l1.do(ctx, http.MethodGet, "/v1/seats/"+a.id+"/screen-target", nil, http.Header{l1.SeatCredentialHeader: []string{secret}}, &target, http.StatusOK); err != nil {
 		return err
 	}
+	// Screen input is never retried: an interrupted call may already have acted.
+	ctx = withoutClientRetry(ctx)
 	timing.mark("l1_discovery")
 	unread := target.Unread
 	actionDone, replied := false, false
