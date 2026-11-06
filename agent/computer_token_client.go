@@ -45,6 +45,25 @@ func newComputerTokenClient(f fabric.Fabric, address string, timeout time.Durati
 func (c *computerTokenClient) Close() { c.transport.CloseIdleConnections() }
 
 func (c *computerTokenClient) MintComputerToken(ctx context.Context, requestBody l3.ComputerTokenMintRequest) (l3.ComputerTokenGrant, error) {
+	return c.mintComputerTokenWithClock(ctx, requestBody, systemClock{})
+}
+
+func (c *computerTokenClient) mintComputerTokenWithClock(ctx context.Context, requestBody l3.ComputerTokenMintRequest, clock Clock) (l3.ComputerTokenGrant, error) {
+	var grant l3.ComputerTokenGrant
+	err := retryReadSnapshotWithClock(ctx, clock, func(ctx context.Context) error {
+		var err error
+		grant, err = c.mintComputerTokenOnce(ctx, requestBody)
+		return err
+	})
+	var protocol *ProtocolError
+	if errors.As(err, &protocol) {
+		// Preserve the token client's existing public error text and shape.
+		err = fmt.Errorf("agent: Computer token mint rejected: %s: %s", protocol.APIError.Code, protocol.APIError.Message)
+	}
+	return grant, err
+}
+
+func (c *computerTokenClient) mintComputerTokenOnce(ctx context.Context, requestBody l3.ComputerTokenMintRequest) (l3.ComputerTokenGrant, error) {
 	payload, err := json.Marshal(requestBody)
 	if err != nil {
 		return l3.ComputerTokenGrant{}, fmt.Errorf("agent: encode Computer token mint: %w", err)
@@ -64,7 +83,7 @@ func (c *computerTokenClient) MintComputerToken(ctx context.Context, requestBody
 		if err := json.NewDecoder(io.LimitReader(response.Body, computerTokenResponseLimit)).Decode(&responseError); err != nil {
 			return l3.ComputerTokenGrant{}, fmt.Errorf("agent: Computer token mint returned HTTP %d", response.StatusCode)
 		}
-		return l3.ComputerTokenGrant{}, fmt.Errorf("agent: Computer token mint rejected: %s: %s", responseError.Error.Code, responseError.Error.Message)
+		return l3.ComputerTokenGrant{}, &ProtocolError{StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
 	var grant l3.ComputerTokenGrant
 	if err := json.NewDecoder(io.LimitReader(response.Body, computerTokenResponseLimit)).Decode(&grant); err != nil {
