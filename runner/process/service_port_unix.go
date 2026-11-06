@@ -37,13 +37,18 @@ const (
 // serviceListenerInspectTimeout bounds one ownership inspection. Inspection
 // runs beside the Guardian's supervision loop and is cancelled on any stop,
 // so this bounds only how long an answer can take, never a stop.
-const serviceListenerInspectTimeout = 5 * time.Second
+// A variable only so in-process tests can shorten it.
+var serviceListenerInspectTimeout = 5 * time.Second
 
 // serviceOwnershipRecheckInterval is how often a ready service's listener
 // ownership is confirmed again. A takeover with no failed probe in between
 // (the payload closes its listener and another process binds the port, or
 // adds an SO_REUSEPORT listener) is withdrawn within this interval plus one
-// probe interval and one inspection, about 10.3 s. The interval is set by
+// probe cycle and one inspection: nominally about 10.3 s, because an lsof
+// inspection usually answers in tens of milliseconds. Forwarding stays as
+// it is while an inspection runs, so the bound includes the whole
+// inspection timeout: at most about 15 s plus one probe cycle (250 ms
+// interval and up to 200 ms connect timeout), about 15.5 s. The interval is set by
 // the CPU budget of 1% of one core per ready service: one lsof inspection
 // on macOS costs about 0.04 s of CPU, and one ready service measured 0.76%
 // at 10 s (0.39% with no rechecks, 2.3% at 2 s).

@@ -525,6 +525,14 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		case answering := <-probes:
 			probeAnswering = answering
 			if !answering {
+				// A running inspection may have seen a listener that is now
+				// gone, and another process may bind the port before the
+				// next probe. Its answer is discarded, and the next answering
+				// probe starts a fresh inspection.
+				if inspecting != nil {
+					cancelInspection()
+					inspecting, lastInspection = nil, time.Time{}
+				}
 				// Ordinary probe loss withdraws a ready service and never
 				// ends the payload.
 				if ready {

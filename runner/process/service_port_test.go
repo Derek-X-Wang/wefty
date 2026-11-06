@@ -245,6 +245,167 @@ func TestGuardianStalledInspectionNeitherChangesReadinessNorDelaysStop(t *testin
 	})
 }
 
+// A probe failure invalidates an inspection that is still running: the
+// listener it saw may be gone, and whatever answers after recovery must be
+// inspected anew. The gated inspector holds the first inspection after it
+// has seen the payload's own listener; meanwhile the payload closes that
+// listener, a probe fails, and another process takes the port.
+func TestGuardianDiscardsAnInspectionThatAProbeFailureOutdated(t *testing.T) {
+	captured, release, invalidated := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	priorInspector := serviceListenerInspector
+	serviceListenerInspector = func(ctx context.Context, backend serviceBackend, group int) (serviceListenerVerdict, error) {
+		verdict, err := inspectServiceListeners(ctx, backend, group)
+		if calls.Add(1) != 1 {
+			return verdict, err
+		}
+		if err != nil || verdict != serviceListenerOwned {
+			t.Errorf("gated inspection verdict = (%d, %v), want owned", verdict, err)
+		}
+		close(captured)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			close(invalidated)
+		}
+		return verdict, err
+	}
+	t.Cleanup(func() { serviceListenerInspector = priorInspector })
+
+	address := releasedServiceAddress(t)
+	guardian := runInProcessServiceGuardian(t, "listen-toggle", address, 30*time.Second)
+	<-captured
+	if err := syscall.Kill(guardian.pid, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	// The Guardian cancels the held inspection on the failed probe. A
+	// Guardian that does not gives no signal, so wait out many probes.
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+	}
+	foreign, err := net.Listen("tcp4", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer foreign.Close()
+	taken := time.Now()
+	accepted := make(chan struct{}, 64)
+	go func() {
+		for {
+			connection, err := foreign.Accept()
+			if err != nil {
+				return
+			}
+			_ = connection.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	// Probes are sent one at a time through a one-slot buffer, so a third
+	// answered probe proves the Guardian has taken the first: it knows the
+	// port answers again. A fresh inspection may end the payload sooner.
+	var status *guardianStatusMessage
+	for answered := 0; answered < 3 && status == nil; {
+		select {
+		case <-accepted:
+			answered++
+		case next, open := <-guardian.statuses:
+			if !open {
+				t.Fatal("guardian status stream ended")
+			}
+			status = &next
+		case <-time.After(10 * time.Second):
+			t.Fatal("the foreign listener never answered a probe")
+		}
+	}
+	close(release)
+	if status == nil {
+		next := guardian.next(t)
+		status = &next
+	}
+	// The held "owned" answer is about the payload's closed listener. The
+	// fresh inspection after recovery sees the foreign one; before startup
+	// that ends the payload, and nothing is ever published.
+	if status.Type != guardianMessageExited || status.Result.SpawnError == nil ||
+		status.Result.SpawnError.Code != contract.SpawnFailureServicePortTaken ||
+		!strings.Contains(status.Result.SpawnError.Message, "outside the payload's process group") {
+		t.Fatalf("status = %#v, want service_port_taken for the foreign listener", status)
+	}
+	// The production recheck interval is 10 s: only a fresh inspection on
+	// recovery answers this soon.
+	if elapsed := time.Since(taken); elapsed > 2*time.Second {
+		t.Fatalf("the foreign listener was refused %s after it took the port, want at once", elapsed)
+	}
+}
+
+// The exposure bound includes slow inspections: forwarding stays as it is
+// while one runs. Worst case: the inspection that last confirmed ownership
+// saw the payload's listener at once but answered only at its timeout, and
+// the recheck after the takeover runs for its whole timeout. Withdrawal must
+// still come within the recheck interval, one inspection timeout and one
+// probe cycle; the test scales them down from 10 s, 5 s and 450 ms.
+func TestGuardianWithdrawsATakeoverWithinTheBoundWhenInspectionsAreSlow(t *testing.T) {
+	const (
+		interval   = time.Second
+		timeout    = time.Second
+		probeCycle = 20*time.Millisecond + 100*time.Millisecond
+		scheduling = 500 * time.Millisecond
+	)
+	const (
+		inspectNow int32 = iota
+		inspectSlowlyOnce
+		inspectUntilTimeout
+	)
+	var phase atomic.Int32
+	captured := make(chan struct{})
+	priorInspector, priorInterval, priorTimeout := serviceListenerInspector, serviceOwnershipRecheckInterval, serviceListenerInspectTimeout
+	serviceListenerInspector = func(ctx context.Context, backend serviceBackend, group int) (serviceListenerVerdict, error) {
+		switch {
+		case phase.CompareAndSwap(inspectSlowlyOnce, inspectUntilTimeout):
+			verdict, err := inspectServiceListeners(ctx, backend, group)
+			if err != nil || verdict != serviceListenerOwned {
+				t.Errorf("slow inspection verdict = (%d, %v), want owned", verdict, err)
+			}
+			close(captured)
+			<-ctx.Done()
+			return verdict, err
+		case phase.Load() == inspectUntilTimeout:
+			<-ctx.Done()
+			return 0, ctx.Err()
+		}
+		return inspectServiceListeners(ctx, backend, group)
+	}
+	serviceOwnershipRecheckInterval, serviceListenerInspectTimeout = interval, timeout
+	t.Cleanup(func() {
+		serviceListenerInspector, serviceOwnershipRecheckInterval, serviceListenerInspectTimeout = priorInspector, priorInterval, priorTimeout
+	})
+
+	address := releasedServiceAddress(t)
+	guardian := runInProcessServiceGuardian(t, "listen-reuseport", address, 30*time.Second)
+	guardian.expectReadiness(t, true)
+	phase.Store(inspectSlowlyOnce)
+	select {
+	case <-captured:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no recheck inspection started")
+	}
+	foreign := listenReusePort(t, address)
+	defer foreign.Close()
+	taken := time.Now()
+	guardian.expectReadiness(t, false)
+	elapsed := time.Since(taken)
+	t.Logf("takeover withdrawn after %s", elapsed)
+	if bound := interval + timeout + probeCycle; elapsed > bound+scheduling {
+		t.Fatalf("takeover withdrawn after %s, want within %s", elapsed, bound)
+	}
+	// The slow inspections were on the path: the nominal bound (interval,
+	// probe cycle, a quick inspection) would be about 1.1 s here.
+	if elapsed < interval+timeout/2 {
+		t.Fatalf("takeover withdrawn after %s; the slow inspections were not exercised", elapsed)
+	}
+	guardian.stopWithin(t, 5*time.Second)
+}
+
 type inProcessGuardian struct {
 	statuses <-chan guardianStatusMessage
 	pid      int

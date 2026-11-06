@@ -1255,12 +1255,18 @@ makes an unattributed listener inconclusive, never foreign. On macOS it reads
 `/usr/sbin/lsof`. Inspection runs beside the Guardian's supervision loop:
 readiness stays where it is until an inspection answers, and a stop, an exit
 or a deadline cancels a running inspection without waiting for it, so it adds
-no phase to the shutdown bound. The Guardian inspects on every return to
-readiness and every 10 seconds while the service is ready. A takeover with no
-failed probe in between (the payload closes its listener and another process
-binds the port, or another process adds an `SO_REUSEPORT` listener) is
-therefore withdrawn within about 10.3 seconds: the interval, one probe
-interval and one inspection. The interval follows a CPU budget of 1% of one
+no phase to the shutdown bound. A failed probe discards the answer of a
+running inspection, because the listener it saw may be gone, and the next
+answering probe starts a fresh inspection. The Guardian inspects on every
+return to readiness and every 10 seconds while the service is ready. A
+takeover with no failed probe in between (the payload closes its listener and
+another process binds the port, or another process adds an `SO_REUSEPORT`
+listener) is therefore withdrawn within the interval, one probe cycle and one
+inspection. That is nominally about 10.3 seconds, because an inspection
+usually answers in tens of milliseconds. Forwarding stays as it is while an
+inspection runs, and an inspection may take up to its 5-second timeout, so
+the bound is about 15 seconds plus one probe cycle (250 ms interval and up to
+200 ms connect timeout): about 15.5 seconds. The interval follows a CPU budget of 1% of one
 core per ready service; one ready service measured 0.76% on macOS. A listener
 of another process before startup makes the Guardian stop the payload and
 report `service_port_taken`. After startup a foreign owner or a failed
