@@ -97,7 +97,7 @@ func TestKeyedResendKeepsTheFirstReceipt(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer_1", IntentRevision: 4})
 	})
 	withRetryWait(t, func(context.Context, time.Duration) error { return nil })
-	computer, receipt, err := clients.growComputer(t.Context(), "computer_1", l1.ComputerGrowRequest{IdempotencyKey: "grow-key"})
+	computer, receipt, err := clients.restartComputer(t.Context(), "computer_1", l1.ComputerRestartRequest{IdempotencyKey: "restart-key"})
 	if err != nil || computer.IntentRevision != 4 || requests.Load() != 2 || !receipt.Applied || receipt.Replay {
 		t.Fatalf("keyed resend receipt: computer=%+v receipt=%+v err=%v requests=%d", computer, receipt, err, requests.Load())
 	}
@@ -147,6 +147,8 @@ func TestCommittedReadUnavailableWithoutRecoveryKeepsExit13(t *testing.T) {
 		hint     string
 	}{
 		{"no key and no GET", postChangeRecovery{hint: "run `wefty inspect job_1` to read it again"}, nil, 1, "wefty inspect job_1"},
+		{"keyed but not resent", sameKeyReadAgain, nil, 1, "same idempotency key"},
+		{"receipt plan without a first receipt", resendKeepingReceipt, nil, 1, "same idempotency key"},
 		{"resend unavailable again", resendWithKey, func(w http.ResponseWriter) { writeCommittedReadUnavailable(w, true) }, 2, "same idempotency key"},
 		{"read-back refused", readBackWith("/v1/jobs/job_1", "wefty inspect job_1"), writeForbiddenResponse, 2, "wefty inspect job_1"},
 	} {

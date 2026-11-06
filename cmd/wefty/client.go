@@ -342,7 +342,7 @@ type mutationReceipt struct {
 
 func (c *apiClients) createComputer(ctx context.Context, request l1.CreateComputerRequest) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, "/v1/computers", request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, "/v1/computers", request, &computer,
 		http.StatusCreated, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -378,7 +378,7 @@ func (c *apiClients) restartComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/restart"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -397,7 +397,7 @@ func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reimage"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -407,7 +407,7 @@ func (c *apiClients) resetComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-reset"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -417,7 +417,7 @@ func (c *apiClients) growComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/grow"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -427,7 +427,7 @@ func (c *apiClients) abortComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reconfiguration-abort"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -640,7 +640,7 @@ func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string
 func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, string, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	return computer, headers.Get("Backup-Id"), responseWasIdempotentReplay(headers), err
 }
 
@@ -707,7 +707,7 @@ func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backup
 func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, int64, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/restore"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operationRevision int64
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Restore-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		operationRevision = parsed
@@ -736,7 +736,7 @@ type cloneComputerOperation struct {
 func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, cloneComputerOperation, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(sourceComputerID) + "/backups/" + url.PathEscape(backupID) + "/clone"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operation cloneComputerOperation
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Clone-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		if computerID := strings.TrimSpace(headers.Get("Clone-Computer-Id")); computerID != "" {
@@ -795,7 +795,7 @@ func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID 
 func (c *apiClients) attestComputerCustodyDeleted(ctx context.Context, exportID string, request l1.ComputerCustodyAttestationRequest) (l1.ComputerCustodyExport, bool, error) {
 	var export l1.ComputerCustodyExport
 	path := "/v1/custody-exports/" + url.PathEscape(exportID) + "/attest-deleted"
-	headers, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, path, request, &export, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &export, http.StatusOK)
 	return export, responseWasIdempotentReplay(headers), err
 }
 
@@ -935,6 +935,11 @@ type postChangeRecovery struct {
 	// carries its idempotency or dispatch key may: L1 resolves that replay
 	// before any precondition and answers with the committed object.
 	resend bool
+	// keepReceipt marks a resend whose command reports L1's receipt. L1 wrote
+	// that receipt before the read expired, so the first answer says what this
+	// command did; the resend only replays it. Without that receipt the plan
+	// falls back to the plain "applied" answer.
+	keepReceipt bool
 	// readBack is the GET path that observes the committed resource. A
 	// request without a key is never repeated; it is read back instead.
 	readBack string
@@ -942,9 +947,20 @@ type postChangeRecovery struct {
 	hint string
 }
 
-// resendWithKey is the plan for a keyed mutation.
-var resendWithKey = postChangeRecovery{resend: true,
-	hint: "run the same command again with the same idempotency key to read it"}
+const sameKeyHint = "run the same command again with the same idempotency key to read it"
+
+// resendWithKey is the plan for a keyed mutation whose command reports no receipt.
+var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
+
+// resendKeepingReceipt is the plan for a keyed Computer mutation whose
+// command reports L1's receipt.
+var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
+
+// sameKeyReadAgain is the plan for a keyed mutation that is not resent: its
+// first answer has no receipt to say what this command did (backup, restore,
+// clone, custody attestation), or its replay can show another operation
+// (grow, #1516). The answer stays the plain "applied" one.
+var sameKeyReadAgain = postChangeRecovery{hint: sameKeyHint}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
 func readBackWith(path, command string) postChangeRecovery {
@@ -979,11 +995,14 @@ func (c *apiClient) mutate(ctx context.Context, recovery postChangeRecovery, met
 	}
 	var recoveryErr error
 	switch {
-	case recovery.resend:
+	case recovery.resend && (!recovery.keepReceipt || headers.Get("Mutation-Applied") != ""):
 		if recoveryErr = readRetryWait(ctx, readRetryBackoff(0)); recoveryErr == nil {
 			var resent http.Header
 			if resent, recoveryErr = c.doWithResponse(ctx, method, path, body, nil, target, success...); recoveryErr == nil {
-				return keepFirstReceipt(headers, resent), nil
+				if recovery.keepReceipt {
+					return keepFirstReceipt(headers, resent), nil
+				}
+				return resent, nil
 			}
 		}
 	case recovery.readBack != "":
@@ -1002,12 +1021,9 @@ func (c *apiClient) mutate(ctx context.Context, recovery postChangeRecovery, met
 }
 
 // keepFirstReceipt returns the resend's headers, which name the replayed
-// operation, but keeps the first answer's receipt when it sent one: that
-// receipt is what this command did. The resend is only a replay of it.
+// operation, with the first answer's receipt: that receipt is what this
+// command did. The resend is only a replay of it.
 func keepFirstReceipt(first, resent http.Header) http.Header {
-	if first.Get("Mutation-Applied") == "" {
-		return resent
-	}
 	merged := resent.Clone()
 	if merged == nil {
 		merged = http.Header{}
