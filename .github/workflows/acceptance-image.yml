@@ -380,7 +380,7 @@ jobs:
           - {arch: arm64, variant: xfce, dockerfile: examples/computer/Dockerfile, local_name: wefty-computer-reference, artifact: wefty-computer-reference, edge: 'wefty-rfb-websocket --port', elf_path: usr/lib/chromium/chromium}
           - {arch: amd64, variant: wayland, dockerfile: examples/computer-wayland/Dockerfile, local_name: wefty-computer-wayland-reference, artifact: wefty-computer-wayland-reference, edge: 'wayvnc -w', elf_path: usr/bin/wayvnc}
           - {arch: arm64, variant: wayland, dockerfile: examples/computer-wayland/Dockerfile, local_name: wefty-computer-wayland-reference, artifact: wefty-computer-wayland-reference, edge: 'wayvnc -w', elf_path: usr/bin/wayvnc}
-    runs-on: ${{ matrix.arch == 'arm64' && matrix.variant == 'wayland' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     services:
       registry:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
@@ -391,7 +391,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - if: matrix.arch != 'arm64' || matrix.variant != 'wayland'
+      - if: matrix.arch != 'arm64'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
