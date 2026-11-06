@@ -294,7 +294,8 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	// view-role connection: a separate x11vnc process, so its requests and
 	// frames cannot wake the control role or reset its idle clocks. It
 	// compares every update with its first frame, so a changed screen fails
-	// the premise instead of passing warm.
+	// the premise instead of passing warm. A repaint of the last warm call
+	// within IdleWakeSettle of that frame becomes the new reference (#1520).
 	idleCtx, stopIdle := context.WithTimeout(ctx, computerconformance.IdleWakeQuiet+30*time.Second)
 	var idle computerconformance.IdleWakeObservation
 	if wire, closeWire, err := openWire(idleCtx, "view"); err != nil {
@@ -319,7 +320,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 			t.Error("SC-1 idle-wake call omitted phase frame_baseline")
 		}
 		idleBaseline = time.Duration((baseline - idlePhases["rfb_banner"]) * float64(time.Millisecond))
-		t.Logf("SC-1 idle-wake: baseline %.3f ms (gate %d ms); click + PNG %.3f ms (SC-1 1000 ms, data); idle %.1f s since input, observed static %.1f s over %d updates", float64(idleBaseline.Microseconds())/1000, computerconformance.IdleWakeBaselineGate.Milliseconds(), float64(idleWake.Microseconds())/1000, idle.SinceInput.Seconds(), idle.Observed.Seconds(), idle.Updates)
+		t.Logf("SC-1 idle-wake: baseline %.3f ms (gate %d ms); click + PNG %.3f ms (SC-1 1000 ms, data); idle %.1f s since input, observed static %.1f s over %d updates (%d early repaints, settled %.1f s)", float64(idleBaseline.Microseconds())/1000, computerconformance.IdleWakeBaselineGate.Milliseconds(), float64(idleWake.Microseconds())/1000, idle.SinceInput.Seconds(), idle.Observed.Seconds(), idle.Updates, idle.Repaints, idle.Settled.Seconds())
 	}
 	// Prove the CLI's timeout capture on this Seat's x11vnc, through the node
 	// front door (#1484). Run after SC-1 so the colour page cannot affect its

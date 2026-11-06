@@ -34,14 +34,21 @@ const (
 	// After the deadline the observer still compares an update already in
 	// flight for this long, then closes its connection.
 	IdleWakeGrace = time.Second
+	// The last warm call's own repaint can arrive after the observer's first
+	// frame (#1520 saw one 0.8 s later). A change this soon after the first
+	// frame becomes the new reference, and the static window starts there.
+	// Any later change fails the premise.
+	IdleWakeSettle = 3 * time.Second
 )
 
 // IdleWakeObservation is what the lane saw before it timed the idle-wake call.
 type IdleWakeObservation struct {
 	SinceInput time.Duration   // from the test's last input to the timed call
-	Observed   time.Duration   // first full frame to the deadline, with no changed update
+	Observed   time.Duration   // the static window: the reference frame to the deadline, with no changed update
+	Settled    time.Duration   // first frame to the reference frame; 0 without an early repaint
+	Repaints   int             // early changed updates folded into the reference
 	Updates    int             // completed updates compared; 0 is normal on a static screen
-	Changed    int             // differing pixels in the first update that changed
+	Changed    int             // differing pixels in the first update that changed after the settle
 	ChangedBox image.Rectangle // where they are
 	ChangedAt  time.Duration   // when that update arrived, after the first frame
 	Err        error           // the observer failed
@@ -66,10 +73,15 @@ func (o IdleWakeObservation) Premise() error {
 // ObserveIdleScreen watches one view-role RFB connection until `until`, then
 // for IdleWakeGrace more, and closes wire. It takes a full first frame with
 // rfbclient, then keeps one incremental request outstanding and compares
-// every completed update's pixels with the first frame as it arrives, so a
+// every completed update's pixels with the reference as it arrives, so a
 // change that reverts before a later frame still counts. rfbclient reports
 // only whether an update arrived, and its frame captures fold updates
 // together, so neither can show this.
+//
+// The reference starts as the first frame. A changed update that arrives
+// within IdleWakeSettle of the first frame is a late repaint of the last
+// input: it is folded into the reference, and the static window restarts
+// when it arrives. After the settle, any changed pixel fails the premise.
 //
 // There is no final full frame. x11vnc 0.9.16 sends no heartbeat without
 // -ping, so it may never answer a held request on a static screen; a fresh
@@ -95,10 +107,13 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 		return observation
 	}
 	firstAt := now()
+	referenceAt := firstAt
 	// rfbclient reads the wire unbuffered and has no request outstanding
 	// after Frame, so the next byte on the wire starts a new server message.
 	// An update counts as completed once the reader has handed it over (into
 	// this one-slot buffer); anything later is incomplete at the grace end.
+	// Only the reader touches first after this point: it folds every changed
+	// pixel into it, so first is always the latest reference.
 	updates := make(chan idleWakeUpdate, 1)
 	done := make(chan struct{})
 	defer close(done)
@@ -128,15 +143,21 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 	if observation.Err = request(); observation.Err != nil {
 		return observation
 	}
-	// failed reports a reader error or a changed pixel, and counts the rest.
+	// failed reports a reader error or a changed pixel after the settle, and
+	// counts the rest. An early change restarts the static window.
 	failed := func(update idleWakeUpdate) bool {
 		if update.err != nil {
 			observation.Err = update.err
 			return true
 		}
 		if update.changed > 0 {
-			observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, now().Sub(firstAt)
-			return true
+			at := now()
+			if at.Sub(firstAt) > IdleWakeSettle {
+				observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, at.Sub(firstAt)
+				return true
+			}
+			referenceAt = at
+			observation.Repaints++
 		}
 		observation.Updates++
 		return false
@@ -164,7 +185,7 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 				}
 			default:
 			}
-			observation.Observed = max(until.Sub(firstAt), 0)
+			observation.Observed, observation.Settled = max(until.Sub(referenceAt), 0), referenceAt.Sub(firstAt)
 			return observation
 		}
 	}
@@ -178,10 +199,11 @@ type idleWakeUpdate struct {
 }
 
 // readIdleWakeUpdate reads one FramebufferUpdate in rfbclient's negotiated
-// format (Raw, 32-bit B,G,R,padding) and compares its pixels with first.
-func readIdleWakeUpdate(wire io.Reader, first *image.RGBA) (update idleWakeUpdate) {
+// format (Raw, 32-bit B,G,R,padding), compares its pixels with reference and
+// writes every changed pixel into reference.
+func readIdleWakeUpdate(wire io.Reader, reference *image.RGBA) (update idleWakeUpdate) {
 	fail := func(err error) idleWakeUpdate { update.err = err; return update }
-	bounds := first.Bounds()
+	bounds := reference.Bounds()
 	for {
 		var kind [1]byte
 		if _, err := io.ReadFull(wire, kind[:]); err != nil {
@@ -231,7 +253,8 @@ func readIdleWakeUpdate(wire io.Reader, first *image.RGBA) (update idleWakeUpdat
 				}
 				for xx := r.Min.X; xx < r.Max.X; xx++ {
 					o := (xx - r.Min.X) * 4
-					if (color.RGBA{R: row[o+2], G: row[o+1], B: row[o], A: 255}) != first.RGBAAt(xx, yy) {
+					if pixel := (color.RGBA{R: row[o+2], G: row[o+1], B: row[o], A: 255}); pixel != reference.RGBAAt(xx, yy) {
+						reference.SetRGBA(xx, yy, pixel)
 						update.changed++
 						update.box = update.box.Union(image.Rect(xx, yy, xx+1, yy+1))
 					}
@@ -352,7 +375,7 @@ func (f *idleWakeFake) answer(t *testing.T, r image.Rectangle, colour color.RGBA
 	if f.held > 0 {
 		f.held--
 	} else {
-		<-f.requests
+		f.request(t)
 	}
 	if err := f.send(r, colour); err != nil {
 		t.Fatalf("fake update: %v", err)
@@ -361,7 +384,18 @@ func (f *idleWakeFake) answer(t *testing.T, r image.Rectangle, colour color.RGBA
 
 // awaitRequest waits until the observer has asked again, so it has compared
 // the previous update.
-func (f *idleWakeFake) awaitRequest() { <-f.requests; f.held++ }
+func (f *idleWakeFake) awaitRequest(t *testing.T) { t.Helper(); f.request(t); f.held++ }
+
+// request takes one incremental request. An observer that returned early
+// never asks again, so this fails instead of hanging the test.
+func (f *idleWakeFake) request(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.requests:
+	case <-time.After(10 * time.Second):
+		t.Fatal("observer stopped asking for updates")
+	}
+}
 
 // idleWakeTimers hands the observer channels that the test fires, so the
 // deadline and the grace never race the fake server's replies.
@@ -380,24 +414,49 @@ func (w *idleWakeTimers) after(d time.Duration) <-chan time.Time {
 	return w.grace
 }
 
+// idleWakeClock is the observer's clock. A test step sets it before it sends
+// an update, so the observer reads that time when it compares the update.
+type idleWakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *idleWakeClock) now() time.Time  { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *idleWakeClock) set(t time.Time) { c.mu.Lock(); defer c.mu.Unlock(); c.t = t }
+
 func TestObserveIdleScreen(t *testing.T) {
 	a, b := color.RGBA{R: 24, G: 32, B: 48, A: 255}, color.RGBA{G: 255, A: 255}
 	base := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	until := base.Add(IdleWakeQuiet)
 	all := image.Rect(0, 0, 4, 3)
 	type env struct {
-		f      *idleWakeFake
-		timers *idleWakeTimers
+		f       *idleWakeFake
+		timers  *idleWakeTimers
+		clock   *idleWakeClock
+		firstAt time.Time
 	}
 	type step func(*testing.T, env)
-	unchanged := func(r image.Rectangle) step {
-		return func(t *testing.T, e env) { e.f.answer(t, r, a); e.f.awaitRequest() }
+	unchangedAs := func(r image.Rectangle, colour color.RGBA) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, colour); e.f.awaitRequest(t) }
 	}
-	changed := func(r image.Rectangle) step {
-		return func(t *testing.T, e env) { e.f.answer(t, r, b) }
+	unchanged := func(r image.Rectangle) step { return unchangedAs(r, a) }
+	changed := func(r image.Rectangle, colour color.RGBA) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, colour) }
+	}
+	// repaintIn sends an early change that the observer folds and asks again.
+	repaintIn := func(r image.Rectangle, colour color.RGBA) step {
+		return func(t *testing.T, e env) { e.f.answer(t, r, colour); e.f.awaitRequest(t) }
+	}
+	repaint := func(colour color.RGBA) step { return repaintIn(all, colour) }
+	// started waits until the observer has read its first-frame time.
+	started := func(t *testing.T, e env) { e.f.awaitRequest(t) }
+	at := func(d time.Duration) step {
+		return func(t *testing.T, e env) { e.clock.set(e.firstAt.Add(d)) }
 	}
 	deadline := func(t *testing.T, e env) {
-		<-e.timers.asked
+		if got, want := <-e.timers.asked, until.Sub(e.firstAt); got != want {
+			t.Errorf("deadline %s, want %s: a repaint must not move it", got, want)
+		}
 		e.timers.deadline <- until
 		if got := <-e.timers.asked; got != IdleWakeGrace {
 			t.Errorf("grace %s, want %s", got, IdleWakeGrace)
@@ -411,8 +470,10 @@ func TestObserveIdleScreen(t *testing.T) {
 		steps    []step
 		after    step // runs once the observer has returned
 		updates  int
+		repaints int
 		changed  int
 		observed time.Duration
+		settled  time.Duration
 		premise  string // "" for nil
 	}{
 		// (a) x11vnc holds every request on a static screen: nothing arrives.
@@ -420,11 +481,27 @@ func TestObserveIdleScreen(t *testing.T) {
 		// Unchanged updates are compared and counted, never required.
 		{name: "unchanged updates", firstAt: base, steps: []step{unchanged(image.Rect(0, 0, 1, 1)), unchanged(all), deadline, unchanged(all), grace}, updates: 3, observed: IdleWakeQuiet},
 		// (b) B is seen when it arrives, though A would follow.
-		{name: "A to B to A", firstAt: base, steps: []step{unchanged(image.Rect(0, 0, 1, 1)), changed(image.Rect(1, 1, 3, 3))}, updates: 1, changed: 4, premise: "4 pixels in (1,1)-(3,3) changed"},
+		{name: "A to B to A", firstAt: base, steps: []step{unchanged(image.Rect(0, 0, 1, 1)), at(10 * time.Second), changed(image.Rect(1, 1, 3, 3), b)}, updates: 1, changed: 4, premise: "4 pixels in (1,1)-(3,3) changed 10.0 s after"},
 		// (c) An update that arrives within the grace is still compared.
-		{name: "change within the grace", firstAt: base, steps: []step{deadline, changed(all)}, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed"},
+		{name: "change within the grace", firstAt: base, steps: []step{deadline, at(IdleWakeQuiet), changed(all, b)}, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed 70.0 s after"},
 		// (d) The bound: a change after the grace is not seen.
 		{name: "change after the grace", firstAt: base, steps: []step{deadline, grace}, after: func(t *testing.T, e env) { _ = e.f.send(all, b) }, observed: IdleWakeQuiet},
+		// (h) #1520: the last warm call's repaint arrives 0.8 s after the first
+		// frame. It becomes the reference, and the window restarts there.
+		{name: "late repaint restarts the window", firstAt: base, steps: []step{started, at(800 * time.Millisecond), repaint(b), deadline, grace}, updates: 1, repaints: 1, observed: IdleWakeQuiet - 800*time.Millisecond, settled: 800 * time.Millisecond},
+		// (i) Several early repaints, one reverting the other, each restart it.
+		{name: "repaints within the settle", firstAt: base, steps: []step{started, at(time.Second), repaint(b), at(IdleWakeSettle), repaint(a), deadline, grace}, updates: 2, repaints: 2, observed: IdleWakeQuiet - IdleWakeSettle, settled: IdleWakeSettle},
+		// (j) After the settle the premise stays strict, against the folded
+		// reference: going back to the first frame's pixels is a change.
+		{name: "change after an early repaint", firstAt: base, steps: []step{started, at(800 * time.Millisecond), repaint(b), at(IdleWakeSettle + time.Nanosecond), changed(all, a)}, updates: 1, repaints: 1, changed: 12, premise: "12 pixels in (0,0)-(4,3) changed 3.0 s after"},
+		// (j2) A partial repaint folds only its own pixels: later updates that
+		// repeat it, or show the untouched pixels, are unchanged.
+		{name: "partial repaint then unchanged updates", firstAt: base, steps: []step{started, at(800 * time.Millisecond), repaintIn(image.Rect(0, 0, 2, 3), b), at(10 * time.Second), unchangedAs(image.Rect(0, 0, 2, 3), b), unchangedAs(image.Rect(2, 0, 4, 3), a), deadline, grace}, updates: 3, repaints: 1, observed: IdleWakeQuiet - 800*time.Millisecond, settled: 800 * time.Millisecond},
+		// (k) The settle bound: a change just after it fails.
+		{name: "change just after the settle", firstAt: base, steps: []step{started, at(IdleWakeSettle + time.Nanosecond), changed(all, b)}, changed: 12, premise: "changed 3.0 s after the first frame"},
+		// (l) An early repaint never extends the deadline: a late first frame
+		// and a repaint can leave too short a window.
+		{name: "repaint after a delayed first frame", firstAt: base.Add(3 * time.Second), steps: []step{started, at(2500 * time.Millisecond), repaint(b), deadline, grace}, updates: 1, repaints: 1, observed: IdleWakeQuiet - 5500*time.Millisecond, settled: 2500 * time.Millisecond, premise: "static screen for only 64.5 s, need 65 s"},
 		// (e) The window starts at the first frame, not at the caller's clock.
 		{name: "delayed first frame", firstAt: base.Add(10 * time.Second), steps: []step{deadline, grace}, observed: 60 * time.Second, premise: "static screen for only 60.0 s, need 65 s"},
 		// (f) A read error that the observer did not cause fails.
@@ -434,10 +511,10 @@ func TestObserveIdleScreen(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f, wire := newIdleWakeFake(t, a)
-			e := env{f, &idleWakeTimers{asked: make(chan time.Duration, 2), deadline: make(chan time.Time, 1), grace: make(chan time.Time, 1)}}
+			e := env{f, &idleWakeTimers{asked: make(chan time.Duration, 2), deadline: make(chan time.Time, 1), grace: make(chan time.Time, 1)}, &idleWakeClock{t: test.firstAt}, test.firstAt}
 			result := make(chan IdleWakeObservation, 1)
 			go func() {
-				result <- observeIdleScreen(wire, until, func() time.Time { return test.firstAt }, e.timers.after, nil)
+				result <- observeIdleScreen(wire, until, e.clock.now, e.timers.after, nil)
 			}()
 			for _, step := range test.steps {
 				step(t, e)
@@ -453,8 +530,8 @@ func TestObserveIdleScreen(t *testing.T) {
 			if test.after != nil {
 				test.after(t, e)
 			}
-			if observation.Updates != test.updates || observation.Changed != test.changed || observation.Observed != test.observed {
-				t.Fatalf("observation = %+v, want %d updates, %d changed, observed %s", observation, test.updates, test.changed, test.observed)
+			if observation.Updates != test.updates || observation.Repaints != test.repaints || observation.Changed != test.changed || observation.Observed != test.observed || observation.Settled != test.settled {
+				t.Fatalf("observation = %+v, want %d updates, %d repaints, %d changed, observed %s, settled %s", observation, test.updates, test.repaints, test.changed, test.observed, test.settled)
 			}
 			observation.SinceInput = IdleWakeQuiet
 			err := observation.Premise()
@@ -488,11 +565,13 @@ func TestObserveIdleScreenChecksAHandedOverUpdateAtGrace(t *testing.T) {
 		}
 		handed := make(chan struct{}, 4)
 		result := make(chan IdleWakeObservation, 1)
+		clock := &idleWakeClock{t: base}
 		go func() {
-			result <- observeIdleScreen(wire, base.Add(IdleWakeQuiet), func() time.Time { return base }, after, func() { handed <- struct{}{} })
+			result <- observeIdleScreen(wire, base.Add(IdleWakeQuiet), clock.now, after, func() { handed <- struct{}{} })
 		}()
 		deadline <- base
 		<-inGrace
+		clock.set(base.Add(IdleWakeQuiet)) // the grace is long after the settle
 		f.answer(t, image.Rect(0, 0, 4, 3), b)
 		<-handed
 		close(release)
