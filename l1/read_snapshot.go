@@ -22,6 +22,7 @@ type readModel interface {
 	seatApprovalWindows(context.Context, string) ([]SeatApprovalWindow, error)
 	owedComputerRevocation(context.Context, int64) (owedRevocationRow, error)
 	computerReimageReplayHash(context.Context, string, string) (string, error)
+	computerStorageGrowOutcome(context.Context, string, int64) (*ComputerStorageGrowOutcome, error)
 	custodyExport(context.Context, string) (ComputerCustodyExport, error)
 	proveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
 	proveHostBootSession(context.Context, string, string, string) error

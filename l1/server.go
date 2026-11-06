@@ -1812,9 +1812,11 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
-		writeError(w, err)
-		return
+	if !replayed {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	status := http.StatusAccepted
 	if replayed {

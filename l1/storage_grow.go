@@ -73,6 +73,10 @@ func readComputerStorageGrowOutcomeByRevision(ctx context.Context, q queryer, co
 		computerID, operationRevision))
 }
 
+func (r *databaseReads) computerStorageGrowOutcome(ctx context.Context, computerID string, operationRevision int64) (*ComputerStorageGrowOutcome, error) {
+	return readComputerStorageGrowOutcomeByRevision(ctx, r.q, computerID, operationRevision)
+}
+
 func scanComputerStorageGrowOutcome(row interface{ Scan(...any) error }) (*ComputerStorageGrowOutcome, error) {
 	var outcome ComputerStorageGrowOutcome
 	var receiptJSON []byte
