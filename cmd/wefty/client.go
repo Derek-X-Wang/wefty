@@ -987,8 +987,8 @@ var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
 // command reports L1's receipt.
 var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
 
-// sameKeyReadAgain is the plan for reimage, whose replay revokes the
-// Computer's tokens again (#1527). Keep the plain "applied" answer.
+// sameKeyReadAgain is the plan for reimage. Its replay is now safe to resend
+// (#1516, #1527); moving it to resendKeepingReceipt is #1532.
 var sameKeyReadAgain = postChangeRecovery{hint: sameKeyHint}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
