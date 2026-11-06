@@ -443,16 +443,17 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 	}
 	if wait.timeout > 0 {
 		operationRevision := computer.IntentRevision
-		if receipt.Replay {
-			if computer.LastGrowOperation == nil {
-				projection := newComputerProjection(computer, &receipt.Applied, &receipt.Replay)
-				return writeComputerProjectionThenError(stdout, projection, jsonOutput,
-					computerGrowOutcomeMismatch(operationRevision, "idempotent replay omitted its durable grow operation"))
-			}
+		if computer.LastGrowOperation != nil {
+			// A resend keeps the first receipt, but its projection names the
+			// original grow even when a later intent has already advanced.
 			operationRevision = computer.LastGrowOperation.OperationRevision
+		} else if receipt.Replay {
+			projection := newComputerProjection(computer, &receipt.Applied, &receipt.Replay)
+			return writeComputerProjectionThenError(stdout, projection, jsonOutput,
+				computerGrowOutcomeMismatch(operationRevision, "idempotent replay omitted its durable grow operation"))
 		}
 		projection := newComputerProjection(computer, &receipt.Applied, &receipt.Replay)
-		if receipt.Replay && operationRevision != computer.IntentRevision {
+		if operationRevision != computer.IntentRevision {
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			projection.Observation = &storageWaitObservation{Status: "observed", StartedAt: now, EndedAt: now}
 			if failureErr := awaitedComputerGrowFailure(computer, operationRevision, true); failureErr != nil {
