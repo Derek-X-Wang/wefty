@@ -157,6 +157,17 @@ one committed write per call; an attestation commits before its response reload,
 so reload failure cannot undo the evidence. A failed attestation reload returns
 503 `unavailable`, `reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
 `export_id`, and `read_reason`; only snapshot availability failures are retryable.
+
+Keyed Computer Backup create, restore, clone, grow and Custody deletion
+attestation set `Mutation-Applied` and, for replay, `Idempotent-Replay: true`
+before the post-change Read snapshot. A first application reports
+`Mutation-Applied: true`; an identical replay reports `Mutation-Applied: false`.
+The CLI resends each of these mutations at most once after a retryable
+post-change failure. It keeps the first response's receipt and the resend's
+operation selection. Resize `--wait` follows that selected grow revision even
+when a later intent has advanced. If the resend fails, exit 13 and the existing
+applied-change message remain unchanged.
+
 Import acknowledgement dispatch and settlement share one write transaction and
 one pinned clock, avoiding a second immediate-writer admission wait.
 

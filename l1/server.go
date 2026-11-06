@@ -1577,6 +1577,7 @@ func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	var operation ComputerBackupOperationOutcome
 	projection, err := s.projectComputerForCallerWithSelection(r, computer, func(ctx context.Context, reads readModel) error {
 		var err error
@@ -1645,6 +1646,7 @@ func (s *Server) restoreComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	var operation ComputerRestoreOperation
 	projection, err := s.projectComputerForCallerWithSelection(r, computer, func(ctx context.Context, reads readModel) error {
 		var err error
@@ -1679,6 +1681,7 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	writeComputerMutationHeaders(w, !replayed, replayed)
 	var operation ComputerCloneOperation
 	projection, err := s.projectComputerForCallerWithSelection(r, computer, func(ctx context.Context, reads readModel) error {
 		var err error
@@ -1741,13 +1744,16 @@ func (s *Server) attestComputerCustodyDeleted(w http.ResponseWriter, r *http.Req
 		return
 	}
 	request.Actor = identityFromRequest(r).NodeID
-	export, replayed, err := s.store.AttestComputerCustodyDeletedWithReplay(r.Context(), r.PathValue("export_id"), request)
+	replayed, err := s.store.attestComputerCustodyDeleted(r.Context(), r.PathValue("export_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if replayed {
-		w.Header().Set("Idempotent-Replay", "true")
+	writeComputerMutationHeaders(w, !replayed, replayed)
+	export, err := s.store.readAttestedComputerCustodyExport(r.Context(), r.PathValue("export_id"))
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, export)
 }

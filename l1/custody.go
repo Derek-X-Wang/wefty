@@ -537,15 +537,24 @@ func (s *Store) AttestComputerCustodyDeleted(ctx context.Context, exportID strin
 }
 
 func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, exportID string, request ComputerCustodyAttestationRequest) (ComputerCustodyExport, bool, error) {
+	replayed, err := s.attestComputerCustodyDeleted(ctx, exportID, request)
+	if err != nil {
+		return ComputerCustodyExport{}, false, err
+	}
+	exported, err := s.readAttestedComputerCustodyExport(ctx, exportID)
+	return exported, replayed, err
+}
+
+func (s *Store) attestComputerCustodyDeleted(ctx context.Context, exportID string, request ComputerCustodyAttestationRequest) (bool, error) {
 	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
 	request.Actor = strings.TrimSpace(request.Actor)
 	if exportID == "" || request.IdempotencyKey == "" || request.Actor == "" {
-		return ComputerCustodyExport{}, false, protocolError(contract.ErrorInvalidRequest, "export_id, idempotency_key, and actor are required")
+		return false, protocolError(contract.ErrorInvalidRequest, "export_id, idempotency_key, and actor are required")
 	}
 	now := canonicalTime(s.clock.Now())
 	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
-		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
+		return false, internalError(err, "record operator_attested_deleted evidence")
 	}
 	defer write.rollback()
 	tx := write.tx
@@ -553,7 +562,7 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 		operator_attestation_actor=?, operator_attested_ns=? WHERE export_id=? AND operator_attestation_key IS NULL`,
 		request.IdempotencyKey, request.Actor, now.UnixNano(), exportID)
 	if err != nil {
-		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
+		return false, internalError(err, "record operator_attested_deleted evidence")
 	}
 	replayed := false
 	if changed, _ := result.RowsAffected(); changed == 0 {
@@ -561,29 +570,33 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 		var key, actor string
 		if err := tx.QueryRowContext(ctx, `SELECT operator_attestation_key, operator_attestation_actor
 			FROM computer_custody_exports WHERE export_id=?`, exportID).Scan(&key, &actor); errors.Is(err, sql.ErrNoRows) {
-			return ComputerCustodyExport{}, false, protocolError(contract.ErrorNotFound, "Custody export %q was not found", exportID)
+			return false, protocolError(contract.ErrorNotFound, "Custody export %q was not found", exportID)
 		} else if err != nil {
-			return ComputerCustodyExport{}, false, internalError(err, "read Custody deletion attestation")
+			return false, internalError(err, "read Custody deletion attestation")
 		} else if key != request.IdempotencyKey || actor != request.Actor {
-			return ComputerCustodyExport{}, false, protocolError(contract.ErrorIdempotencyConflict, "Custody deletion attestation is immutable")
+			return false, protocolError(contract.ErrorIdempotencyConflict, "Custody deletion attestation is immutable")
 		}
 	}
-	// The evidence commits before the response reload, as with the original
-	// autocommit UPDATE. A reload failure must not undo the attestation.
+	// Commit the evidence before any response reload. A reload failure must
+	// not undo the attestation.
 	if err := write.commit(); err != nil {
-		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
+		return false, internalError(err, "record operator_attested_deleted evidence")
 	}
+	return replayed, nil
+}
+
+func (s *Store) readAttestedComputerCustodyExport(ctx context.Context, exportID string) (ComputerCustodyExport, error) {
 	var exported ComputerCustodyExport
-	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		var err error
 		exported, err = reads.custodyExport(ctx, exportID)
 		return err
 	})
 	if err != nil {
-		return exported, replayed, appliedResourceReadError(err, "export_id", exportID,
+		return exported, appliedResourceReadError(err, "export_id", exportID,
 			"Custody deletion attestation committed but its view is unavailable")
 	}
-	return exported, replayed, nil
+	return exported, nil
 }
 
 func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string, request ComputerCustodyImportRequest) (ComputerCustodyImport, bool, error) {

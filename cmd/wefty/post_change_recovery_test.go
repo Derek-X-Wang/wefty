@@ -151,34 +151,14 @@ func TestNoResendCallSitesSendOneMutation(t *testing.T) {
 		name string
 		call func(context.Context, *apiClients) error
 	}{
-		{"grow", func(ctx context.Context, c *apiClients) error {
-			_, _, err := c.growComputer(ctx, "computer_1", l1.ComputerGrowRequest{IdempotencyKey: "k"})
-			return err
-		}},
 		{"reimage", func(ctx context.Context, c *apiClients) error {
 			_, _, err := c.reimageComputer(ctx, "computer_1", l1.ComputerReimageRequest{IdempotencyKey: "k"})
 			return err
 		}},
-		{"backup create", func(ctx context.Context, c *apiClients) error {
-			_, _, _, err := c.createComputerBackup(ctx, "computer_1", l1.ComputerBackupCreateRequest{IdempotencyKey: "k"})
-			return err
-		}},
-		{"restore", func(ctx context.Context, c *apiClients) error {
-			_, _, _, err := c.restoreComputerBackup(ctx, "computer_1", "backup_1", l1.ComputerRestoreRequest{IdempotencyKey: "k"})
-			return err
-		}},
-		{"clone", func(ctx context.Context, c *apiClients) error {
-			_, _, _, err := c.cloneComputerBackup(ctx, "computer_1", "backup_1", l1.ComputerCloneRequest{IdempotencyKey: "k"})
-			return err
-		}},
-		{"custody attest", func(ctx context.Context, c *apiClients) error {
-			_, _, err := c.attestComputerCustodyDeleted(ctx, "export_1", l1.ComputerCustodyAttestationRequest{IdempotencyKey: "k"})
-			return err
-		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			// L1 sends grow's and reimage's receipt before the read, so the
-			// first answer carries one: only the plan keeps them from resending.
+			// L1 sends reimage's receipt before the read, so only the
+			// plan keeps it from resending.
 			clients, requests := readRetryStub(t, func(requests int32, r *http.Request, w http.ResponseWriter) {
 				if requests > 1 {
 					t.Error("a no-resend mutation sent a second request")

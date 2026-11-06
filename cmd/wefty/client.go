@@ -418,7 +418,7 @@ func (c *apiClients) growComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/grow"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -647,7 +647,7 @@ func (c *apiClients) setComputerBackupCap(ctx context.Context, computerID string
 func (c *apiClients) createComputerBackup(ctx context.Context, computerID string, request l1.ComputerBackupCreateRequest) (l1.Computer, string, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	return computer, headers.Get("Backup-Id"), responseWasIdempotentReplay(headers), err
 }
 
@@ -714,7 +714,7 @@ func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backup
 func (c *apiClients) restoreComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerRestoreRequest) (l1.Computer, int64, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups/" + url.PathEscape(backupID) + "/restore"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operationRevision int64
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Restore-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		operationRevision = parsed
@@ -743,7 +743,7 @@ type cloneComputerOperation struct {
 func (c *apiClients) cloneComputerBackup(ctx context.Context, sourceComputerID, backupID string, request l1.ComputerCloneRequest) (l1.Computer, cloneComputerOperation, bool, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(sourceComputerID) + "/backups/" + url.PathEscape(backupID) + "/clone"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer, http.StatusAccepted, http.StatusOK)
 	var operation cloneComputerOperation
 	if parsed, parseErr := strconv.ParseInt(headers.Get("Clone-Operation-Revision"), 10, 64); parseErr == nil && parsed > 0 {
 		if computerID := strings.TrimSpace(headers.Get("Clone-Computer-Id")); computerID != "" {
@@ -802,7 +802,7 @@ func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID 
 func (c *apiClients) attestComputerCustodyDeleted(ctx context.Context, exportID string, request l1.ComputerCustodyAttestationRequest) (l1.ComputerCustodyExport, bool, error) {
 	var export l1.ComputerCustodyExport
 	path := "/v1/custody-exports/" + url.PathEscape(exportID) + "/attest-deleted"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &export, http.StatusOK)
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &export, http.StatusOK)
 	return export, responseWasIdempotentReplay(headers), err
 }
 
@@ -987,11 +987,8 @@ var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
 // command reports L1's receipt.
 var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
 
-// sameKeyReadAgain is the plan for a keyed mutation that is not resent: its
-// first answer has no receipt to say what this command did (backup, restore,
-// clone, custody attestation), its replay can show another operation (grow,
-// #1516), or its replay revokes the Computer's tokens again (reimage). The
-// answer stays the plain "applied" one.
+// sameKeyReadAgain is the plan for reimage, whose replay revokes the
+// Computer's tokens again (#1527). Keep the plain "applied" answer.
 var sameKeyReadAgain = postChangeRecovery{hint: sameKeyHint}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
