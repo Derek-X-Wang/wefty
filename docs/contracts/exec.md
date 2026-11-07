@@ -285,11 +285,12 @@ stopped, and emits the stop warning. Failed confirmation sends no SIGKILL,
 emits the stop warning, and reports only pids confirmed gone by `kill -0`.
 A 100 ms release wait follows. At the default node agent grace, these timed
 stages total at most 3.9 seconds plus inventory processing, command and
-scheduling overhead. Polling adds at most one 100 ms poll interval plus
-process-start overhead per inventory. This is not
-an end-to-end bound. The CLI's timed stages
-still total at most 1.9 seconds, leaving 100 ms within its two-second foreground
-sweep budget before overhead. A shorter configured runner grace can interrupt
+scheduling overhead. A separate timer measures each inventory deadline.
+Polling detects expiry at most one 100 ms interval late, plus scheduling delay;
+the deadline no longer drifts with the number of polls. This is not an end-to-end
+bound.
+The CLI stale-storage sweep (`cmd/wefty/exec_storage.go`, 2 s foreground budget) uses a 1 s first inventory; its timed stages total ≤ 1.9 s plus at most one 100 ms poll interval and scheduling.
+A shorter configured runner grace can interrupt
 the wrapper trap.
 A pid and a command name are not a stable process identity, and macOS has no
 pidfd. Neither the name nor the cwd check is atomic with the signal. An

@@ -21,15 +21,15 @@ func TestFirstInventoryDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shim := t.TempDir()
-	if err := os.WriteFile(filepath.Join(shim, tool), []byte(fmt.Sprintf("#!/bin/sh\nsleep 1.5\nexec %q \"$@\"\n", actual)), 0700); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct{ name, setup, want string }{
-		{"node", "exec_scan_deadline=3", "complete"},
-		{"cli_default", "", "skipped"},
+	for _, tc := range []struct{ name, setup, delay, want string }{
+		{"node", "exec_scan_deadline=3", "1.5", "complete"},
+		{"cli_default", "", "2.5", "skipped"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			shim := t.TempDir()
+			if err := os.WriteFile(filepath.Join(shim, tool), []byte(fmt.Sprintf("#!/bin/sh\nsleep %s\nexec %q \"$@\"\n", tc.delay, actual)), 0700); err != nil {
+				t.Fatal(err)
+			}
 			command := exec.CommandContext(t.Context(), "/bin/bash", "-c", Script+"\n"+tc.setup+`
 sweep_exec_storage_processes "$1"
 printf '%s\n' "$exec_sweep_outcome"

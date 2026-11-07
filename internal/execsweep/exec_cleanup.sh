@@ -47,9 +47,11 @@ exec_storage_process_inventory() {
 # killing a waiting Bash 3.2 subshell can orphan its sleep in the run's group.
 exec_storage_bounded_inventory() {
   cd / || return 1
-  local scan='' job marker status='' candidate running polls=0 limit deadline=${3:-1} interval=0.1
-  limit=$(awk -v deadline="$deadline" -v interval="$interval" 'BEGIN { n=deadline/interval; print int(n)+(n>int(n)) }') || return 1
+  local scan='' job timer marker status='' candidate running timer_running deadline=${3:-1} interval=0.1
   marker=$(umask 077; mktemp /tmp/wefty-exec-scan.XXXXXXXXXX) || return 1
+  # A direct sleep child measures elapsed time and can be stopped/reaped itself.
+  /bin/sleep "$deadline" </dev/null >/dev/null 2>&1 &
+  timer=$!
   (
     exec_storage_process_inventory "$1" "$2" 2>/dev/null &
     scan=$!
@@ -73,22 +75,28 @@ exec_storage_bounded_inventory() {
       fi
     } < "$marker"
     [ -z "$status" ] || break
-    if [ "$polls" -ge "$limit" ]; then
+    timer_running=0 running=0
+    for candidate in $(jobs -rp); do
+      [ "$candidate" != "$timer" ] || timer_running=1
+      [ "$candidate" != "$job" ] || running=1
+    done
+    if [ "$timer_running" -eq 0 ]; then
       if [ -n "$scan" ]; then
         kill -KILL "$scan" 2>/dev/null || :
         break
       fi
       # PID publication can lag the deadline. Keep polling until it arrives
       # or the job exits (including a failed PID write), without signalling it.
-      running=0
-      for candidate in $(jobs -rp); do
-        [ "$candidate" != "$job" ] || running=1
-      done
       [ "$running" -ne 0 ] || break
     fi
     /bin/sleep "$interval"
-    polls=$((polls+1))
   done
+  # Signal the timer only while Bash still lists it: once it has expired it
+  # is already reaped, and its PID may belong to another process.
+  for candidate in $(jobs -rp); do
+    [ "$candidate" != "$timer" ] || kill "$timer" 2>/dev/null || :
+  done
+  wait "$timer" 2>/dev/null || :
   wait "$job" 2>/dev/null
   status=$?
   /bin/rm -f -- "$marker"
