@@ -536,7 +536,7 @@ func retireExecStorageContext(caller context.Context, storage, kind string) erro
 	// The shell waits only for retirement. Its background helper has its own
 	// process group and no inherited output pipes; cancelling this wait cannot
 	// kill deletion or delay command completion until deletion finishes.
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", execCleanupScript+"\nretire_exec_storage \"$1\" \"$2\"", "wefty-exec-cleanup", storage, kind)
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", execCleanupScript+"\nexec_scan_deadline=1\nretire_exec_storage \"$1\" \"$2\"", "wefty-exec-cleanup", storage, kind)
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {

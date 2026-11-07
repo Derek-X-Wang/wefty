@@ -263,9 +263,18 @@ backslash escapes or caret text (`^A` for byte 0x01).
 Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
 or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
 `/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
-shell memory, without a scratch directory or a foreground removal.
-The first inventory has a one-second deadline. At most the first 64 matching
-processes receive SIGTERM; further matches emit one cap warning. This bounds
+shell memory, without a scratch directory; one private status file in `/tmp`
+is removed in the foreground. The inventory leaves no helper process behind.
+The first inventory defaults to a one-second deadline on CLI cleanup paths.
+For exec versions 1 and 2, the node agent reads the process runner's actual
+TERM grace and derives `clamp(grace - 2 s, 1 s, 3 s)`. It passes that bound
+to the wrapper through `WEFTY_EXEC_SCAN_DEADLINE`, and uses the same bound
+for its post-reap and stale-input sweeps. The default five-second grace gives
+a three-second first inventory; a grace of three seconds or less keeps one
+second. The wrapper validates the value once; an absent or invalid value falls
+back to one second, including when an older node agent starts the wrapper.
+The value does not reach the user's command, which clears all `WEFTY_*` names.
+At most the first 64 matching processes receive SIGTERM; further matches emit one cap warning. This bounds
 the confirmation lookups and result escaping to 64 processes. After 200 ms
 of TERM grace, a second inventory, bounded to 600 ms, confirms the same pid
 and command name still have a working folder in storage before SIGKILL. Both
@@ -273,21 +282,42 @@ passes exclude the retiring shell, its parent, and `wefty-agent`. A pid absent
 from the second inventory counts as stopped only if `kill -0` confirms it is
 gone. An absent pid that is still alive receives no SIGKILL, is not reported
 stopped, and emits the stop warning. Failed confirmation sends no SIGKILL,
-emits one warning, and reports only pids confirmed gone by `kill -0`.
-A 100 ms release wait follows. These bounded stages total at most 1.9 seconds,
-excluding inventory processing, command and scheduling overhead. They leave
-100 ms within the CLI's two-second foreground sweep budget and 3.1 seconds
-within the agent's default five-second TERM grace. A shorter configured runner
-grace can interrupt the wrapper trap.
+emits the stop warning, and reports only pids confirmed gone by `kill -0`.
+A 100 ms release wait follows. At the default node agent grace, these timed
+stages total at most 3.9 seconds plus inventory processing, command and
+scheduling overhead. Polling adds at most one 100 ms poll interval plus
+process-start overhead per inventory. This is not
+an end-to-end bound. The CLI's timed stages
+still total at most 1.9 seconds, leaving 100 ms within its two-second foreground
+sweep budget before overhead. A shorter configured runner grace can interrupt
+the wrapper trap.
 A pid and a command name are not a stable process identity, and macOS has no
 pidfd. Neither the name nor the cwd check is atomic with the signal. An
 unrelated same-user process that reuses a selected pid after the inventory
 that selected it can receive SIGTERM or SIGKILL, whatever its name or working
 folder. The second inventory narrows this window before SIGKILL; it does not
 close it. Discovery or signalling failure never fails storage retirement.
-The agent re-verifies the retained folder's device and inode inside Bash after
-entering it. A same-user workload process that renames storage during the sweep
-can still redirect it, but can already signal those processes itself, so this
+The shared shell sets `exec_sweep_outcome`, and the Go sweep returns the same
+internal outcome beside its stopped list:
+
+- `complete`: the scan succeeded and all matched processes were confirmed
+  stopped, or none matched.
+- `skipped`: the path was rejected, physical directory resolution failed, or
+  the first inventory failed. Go also reports this for a probe timeout or
+  error, an identity mismatch, or a Bash failure.
+- `incomplete`: the scan succeeded but the 64-process cap was hit, a signal
+  failed while the process remained alive, or confirmation failed. A selected
+  process whose cwd or command name changed is not confirmed stopped.
+
+Only `incomplete` adds
+`wefty: warning: process cleanup in run storage was incomplete`.
+Existing diagnostic lines remain. All three outcomes keep the same retirement
+and asynchronous deletion behavior. This change does not retry a skipped sweep;
+the notebook and periodic re-sweep in #1534 are deferred to a separate PR.
+These internal outcomes add no wire or contract field.
+The node agent re-verifies the retained folder's device and inode inside Bash
+after entering it. A same-user workload process that renames storage during
+the sweep can still redirect it, but can already signal those processes itself, so this
 grants no new power.
 
 Each stopped process emits one run-stderr line:
@@ -300,11 +330,12 @@ its absence on cancellation. The node carries this list into the Attempt's
 retirement emits the same diagnostics but has no live Attempt result to amend.
 For version 2, the node agent also runs the shared Bash sweep after successful
 runtime reap and receipt validation, before mailbox finalization and log
-closure. This covers a wrapper force-killed before its cleanup runs. The agent
-sweeps `wefty-exec-work` and its validated temp allocation; deferred capture cleanup still owns retirement
-and asynchronous deletion. Bash runs as the agent's direct child, so its parent
-exclusion protects the agent even if its executable has another name.
-The agent derives the physical mailbox path from its open directory handle,
+closure. This covers a wrapper force-killed before its cleanup runs. The node
+agent sweeps `wefty-exec-work` and its validated temp allocation; deferred capture
+cleanup still owns retirement and asynchronous deletion. Bash runs as the node
+agent's direct child, so its parent exclusion protects the node agent even if
+its executable has another name.
+The node agent derives the physical mailbox path from its open directory handle,
 using `F_GETPATH` on macOS and `/proc/self/fd` on Linux. It checks that the
 resolved path and the held directory have the same file identity, then Bash
 enters that path and checks its device and inode against the retained handle
@@ -312,15 +343,18 @@ before scanning. A mismatch or failed shell check warns and returns empty eviden
 A moved mailbox is scanned
 at its physical location; a replacement at the old pathname is not scanned.
 If physical resolution fails, the sweep warns and skips. The shared script's
-inventory deadlines stay unchanged. A five-second outer deadline covers the
-filesystem probes and Bash together, with a bounded pipe wait. Probes run in a
+confirmation deadline stays at 600 ms. A five-second outer deadline covers the
+filesystem probes and Bash together, with a bounded pipe wait. With the
+three-second inventory, about 1.1 seconds of that deadline remain for probes and
+overhead; if the deadline ends Bash after TERM, its stopped list is lost and the
+outcome is `skipped`. Probes run in a
 goroutine so a stalled filesystem cannot block sweep finalization indefinitely;
 the goroutine can stay blocked, but closes any handle it returns after timeout.
-Sweep diagnostics use the run's stderr while open, otherwise the agent log.
-The agent retains its stopped list separately until wrapper evidence has been
+Sweep diagnostics use the run's stderr while open, otherwise the node agent log.
+The node agent retains its stopped list separately until wrapper evidence has been
 read, then appends it to the Attempt's `StoppedProcesses`. Neither source of
 cleanup evidence changes the runtime verdict or adds a wire field. This sweep
-does not expand process-group quiescence proof after an agent crash.
+does not expand process-group quiescence proof after a node agent crash.
 
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``

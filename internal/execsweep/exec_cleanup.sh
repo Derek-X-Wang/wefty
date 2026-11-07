@@ -41,20 +41,57 @@ exec_storage_process_inventory() {
   esac
 }
 
-# Only the scanner owns the captured pipe. The watchdog has no inherited pipe,
-# so cancelling its sleep cannot hold command substitution open. Both helpers
-# use / as cwd; there is no scratch directory to delete before retirement.
+# The private marker stays outside the run's TMPDIR and storage. Its first
+# line identifies the actual scanner; its second records completion/status.
+# Poll sleeps run in the foreground. Always reap the scan job, never signal it:
+# killing a waiting Bash 3.2 subshell can orphan its sleep in the run's group.
 exec_storage_bounded_inventory() {
   cd / || return 1
-  local scan watchdog status deadline=${3:-1}
-  exec_storage_process_inventory "$1" "$2" 2>/dev/null &
-  scan=$!
-  ( sleep "$deadline"; kill -KILL "$scan" 2>/dev/null || : ) </dev/null >/dev/null 2>&1 &
-  watchdog=$!
-  wait "$scan" 2>/dev/null
+  local scan='' job marker status='' candidate running polls=0 limit deadline=${3:-1} interval=0.1
+  limit=$(awk -v deadline="$deadline" -v interval="$interval" 'BEGIN { n=deadline/interval; print int(n)+(n>int(n)) }') || return 1
+  marker=$(umask 077; mktemp /tmp/wefty-exec-scan.XXXXXXXXXX) || return 1
+  (
+    exec_storage_process_inventory "$1" "$2" 2>/dev/null &
+    scan=$!
+    if ! printf '%s\n' "$scan" > "$marker"; then
+      kill -KILL "$scan" 2>/dev/null || :
+      wait "$scan" 2>/dev/null
+      exit 2
+    fi
+    wait "$scan" 2>/dev/null
+    status=$?
+    printf '%s\n' "$status" >> "$marker" || exit 2
+    exit "$status"
+  ) &
+  job=$!
+  while :; do
+    # A read without its final newline is not a published PID or status.
+    status=''
+    { if IFS= read -r candidate; then
+        scan=$candidate
+        IFS= read -r status || status=''
+      fi
+    } < "$marker"
+    [ -z "$status" ] || break
+    if [ "$polls" -ge "$limit" ]; then
+      if [ -n "$scan" ]; then
+        kill -KILL "$scan" 2>/dev/null || :
+        break
+      fi
+      # PID publication can lag the deadline. Keep polling until it arrives
+      # or the job exits (including a failed PID write), without signalling it.
+      running=0
+      for candidate in $(jobs -rp); do
+        [ "$candidate" != "$job" ] || running=1
+      done
+      [ "$running" -ne 0 ] || break
+    fi
+    /bin/sleep "$interval"
+    polls=$((polls+1))
+  done
+  wait "$job" 2>/dev/null
   status=$?
-  kill "$watchdog" 2>/dev/null || :
-  wait "$watchdog" 2>/dev/null || :
+  /bin/rm -f -- "$marker"
   return "$status"
 }
 
@@ -118,9 +155,10 @@ exec_storage_parse_inventory() {
 }
 
 # This runs before retirement, with stderr still connected to the run log.
-# Discovery has a one-second bound; confirmation before KILL has 600 ms.
+# Discovery defaults to one second; confirmation before KILL has 600 ms.
 sweep_exec_storage_processes() {
   exec_stopped_processes=''
+  exec_sweep_outcome=skipped
   local source=$1 inventory status platform pid name cwd
   local tmp_dir physical_tmp=''
   exec_storage_temp_dir "$source" "${2:-$source}"
@@ -142,7 +180,7 @@ sweep_exec_storage_processes() {
   esac
   platform=$(uname -s)
   uid=$(id -u)
-  inventory=$(exec_storage_bounded_inventory "$platform" "$uid" 1)
+  inventory=$(exec_storage_bounded_inventory "$platform" "$uid" "${exec_scan_deadline:-1}")
   status=$?
   # A proc entry can vanish between the glob and find's stat/readlink. Keep
   # complete usable records from that scan; a wholly failed scan still warns.
@@ -151,10 +189,12 @@ sweep_exec_storage_processes() {
     printf 'wefty: warning: could not scan processes in run storage\n' >&2
     return 0
   fi
+  exec_sweep_outcome=complete
   exec_storage_parse_inventory "$inventory" "$platform" "$source"
   for ((i=0; i<${#pids[@]}; i++)); do
     [ "${matches[i]}" -eq 1 ] || continue
     if [ "$selected" -eq 64 ]; then
+      exec_sweep_outcome=incomplete
       printf 'wefty: warning: too many processes in run storage; limited cleanup to the first 64 matching processes\n' >&2
       break
     fi
@@ -189,7 +229,10 @@ sweep_exec_storage_processes() {
           if [ "${pids[j]}" = "$pid" ]; then index=$j; break; fi
         done
         if [ "$index" -ge 0 ]; then
-          [ "${matches[index]}" -eq 1 ] && [ "${names[index]}" = "$name" ] || continue
+          if [ "${matches[index]}" -ne 1 ] || [ "${names[index]}" != "$name" ]; then
+            exec_sweep_outcome=incomplete
+            continue
+          fi
           if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
             if kill -0 "$pid" 2>/dev/null; then warning=1; continue; fi
           fi
@@ -210,7 +253,11 @@ sweep_exec_storage_processes() {
     sleep 0.1
   fi
   if [ "$warning" -ne 0 ]; then
+    exec_sweep_outcome=incomplete
     printf 'wefty: warning: could not stop a process in run storage\n' >&2
+  fi
+  if [ "$exec_sweep_outcome" = incomplete ]; then
+    printf 'wefty: warning: process cleanup in run storage was incomplete\n' >&2
   fi
   return 0
 }

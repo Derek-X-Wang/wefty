@@ -1871,6 +1871,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 		mailbox = prepared
+		if execJob(claim.Job.Spec) {
+			var grace time.Duration
+			if runtime, ok := runtimeAdapter.(interface{ TerminationGraceTime() time.Duration }); ok {
+				grace = runtime.TerminationGraceTime()
+			}
+			mailbox.execScanDeadline = execScanDeadline(grace)
+			executionSpec.Env = cloneEnvironment(executionSpec.Env)
+			executionSpec.Env[execScanDeadlineEnv] = execScanDeadlineSeconds(mailbox.execScanDeadline)
+		}
 		mailbox.captureStderr = func(ctx context.Context, output []byte) error {
 			if redactingSink == nil {
 				return errors.New("run stderr is unavailable")
