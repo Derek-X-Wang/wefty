@@ -171,6 +171,10 @@ func sweepTempDir(ctx context.Context, path string, ownerRoots []string, now tim
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Check last: a wrapper can publish protection while this pass walks.
+	if _, err := os.Lstat(filepath.Join(path, "sweep-pending")); !os.IsNotExist(err) {
+		return err
+	}
 	// RemoveAll unlinks entries inside the allocation without following links.
 	return os.RemoveAll(path)
 }

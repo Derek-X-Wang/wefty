@@ -169,8 +169,11 @@ sweep_exec_storage_processes() {
   exec_sweep_outcome=skipped
   local source=$1 inventory status platform pid name cwd
   local tmp_dir physical_tmp=''
-  exec_storage_temp_dir "$source" "${2:-$source}"
-  if [ -n "$tmp_dir" ]; then physical_tmp=$(cd -- "$tmp_dir" && pwd -P); fi
+  # A notebook caller verifies and sweeps each recorded directory separately.
+  if [ "${3:-}" != separate ]; then
+    exec_storage_temp_dir "$source" "${2:-$source}"
+    if [ -n "$tmp_dir" ]; then physical_tmp=$(cd -- "$tmp_dir" && pwd -P); fi
+  fi
   local uid i j index warning=0 selected=0
   local pids=() names=() folders=() matches=()
   local termed_pids=() termed_names=() termed_folders=()
@@ -270,6 +273,108 @@ sweep_exec_storage_processes() {
   return 0
 }
 
+# Read identity only for a real directory owned by this user.
+exec_storage_identity() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] || return 1
+  case "$(uname -s)" in
+    Darwin) stat -f '%d:%i' "$1" ;;
+    Linux) stat -c '%d:%i' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Remove only this storage's recorded short alias, as ordinary retirement
+# does. Run this before publication so a recovered entry has no alias to lose.
+exec_storage_unlink_temp_link() {
+  local source=$1 tmp_dir=$2 tmp_link='' target suffix link_failure=0
+  # Only unlink our short alias. Never follow it or remove another run's
+  # link, even when the command has replaced the record or the path.
+  # A link that is already gone is fine: the wrapper and the CLI can
+  # retire the same capture at once. Only a link that stays is status 3.
+  if [ -f "$source/tmp-link" ] && [ ! -L "$source/tmp-link" ]; then
+    tmp_link=''
+    # A record without a final newline still sets the value.
+    IFS= read -r tmp_link < "$source/tmp-link" || :
+    case "$tmp_link" in
+      /tmp/wefty-run.?*)
+        suffix=${tmp_link#/tmp/wefty-run.}
+        case "$suffix" in
+          *[!a-zA-Z0-9._-]*) ;;
+          *)
+            if [ -L "$tmp_link" ]; then
+              target=$(readlink "$tmp_link")
+              if [ "$target" = "$source/tmp" ] || { [ -n "$tmp_dir" ] && [ "$target" = "$tmp_dir/tmp" ]; }; then
+                /bin/rm -f -- "$tmp_link" || [ ! -L "$tmp_link" ] || link_failure=3
+              fi
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  fi
+  return "$link_failure"
+}
+
+# Publish before the one-way rename. A killed publisher leaves enough facts
+# for the node agent to recover after a successful runtime reap receipt.
+defer_exec_storage_sweep() (
+  local source=$1 tmp_dir='' identity allocation_identity pending id staging entry created
+  local own_staging=0 own_entry=0
+  umask 077
+  [ -n "${exec_sweep_notebook:-}" ] && [ -n "${WEFTY_EXEC_SWEEP_ATTEMPT_ID:-}" ] || return 1
+  exec_storage_temp_dir "$source" "$source"
+  [ -n "$tmp_dir" ] || return 1
+  identity=$(exec_storage_identity "$source") || return 1
+  allocation_identity=$(exec_storage_identity "$tmp_dir") || return 1
+  exec_storage_unlink_temp_link "$source" "$tmp_dir" || return 1
+  pending="${source%/*}/.wefty-sweep-pending-${source##*/}-$$"
+  created=$(date +%s) || return 1
+  id="sweep-$created-$$"
+  staging="$exec_sweep_notebook/$id.tmp"
+  entry="$exec_sweep_notebook/$id"
+  # The wrapper calls retirement from its EXIT trap. Bash 3.2 suppresses
+  # nested EXIT traps in that context, so rollback must run explicitly.
+  publish_pending_sweep() {
+    local field value
+    [ ! -e "$entry" ] && [ ! -L "$entry" ] || return 1
+    mkdir -p -- "$exec_sweep_notebook" && mkdir -- "$staging" || return 1
+    own_staging=1
+    {
+      printf '{' || return 1
+      for field in source pending storage_identity attempt_id original_storage allocation allocation_identity; do
+        case "$field" in
+          source|original_storage) value=$source ;;
+          pending) value=$pending ;;
+          storage_identity) value=$identity ;;
+          attempt_id) value=$WEFTY_EXEC_SWEEP_ATTEMPT_ID ;;
+          allocation) value=$tmp_dir ;;
+          allocation_identity) value=$allocation_identity ;;
+        esac
+        exec_storage_json_string "$value"
+        printf '"%s":%s,' "$field" "$exec_process_json" || return 1
+      done
+      printf '"created_at":%s}\n' "$created"
+    } > "$staging/entry.json" || return 1
+    /bin/mv -- "$staging" "$entry" || return 1
+    own_staging=0 own_entry=1
+    [ "$(exec_storage_identity "$tmp_dir")" = "$allocation_identity" ] || return 1
+    [ -f "$entry/entry.json" ] || return 1
+    : > "$tmp_dir/sweep-pending" || return 1
+    [ "$(exec_storage_identity "$source")" = "$identity" ] || return 1
+    [ ! -e "$pending" ] && [ ! -L "$pending" ] || return 1
+    /bin/chmod u+w "$source" 2>/dev/null || :
+    [ -f "$entry/entry.json" ] || return 1
+    /bin/mv -- "$source" "$pending"
+  }
+  if publish_pending_sweep; then return 0; fi
+  if [ "$(exec_storage_identity "$tmp_dir")" = "$allocation_identity" ]; then
+    /bin/rm -f -- "$tmp_dir/sweep-pending"
+  fi
+  [ "$own_staging" != 1 ] || /bin/rm -rf -- "$staging"
+  [ "$own_entry" != 1 ] || /bin/rm -rf -- "$entry"
+  return 1
+)
+
 # Shared by the wrapper and observing/sweeping CLI. The caller only waits
 # for atomic retirement; the helper owns deletion for as long as it takes.
 retire_exec_storage() {
@@ -280,6 +385,10 @@ retire_exec_storage() {
   # rename can outlast the agent's TERM grace; CLI stale sweeps pass neither.
   if [ -n "${3:-}" ] && [ -n "$exec_stopped_processes" ]; then
     printf '{"exit_code":%s,"stopped_processes":[%s]}\n' "$4" "$exec_stopped_processes" > "$3/result.json"
+  fi
+  if [ "$kind" = capture ] && [ -n "${exec_sweep_notebook:-}" ] && [ "$exec_sweep_outcome" != complete ]; then
+    if defer_exec_storage_sweep "$source"; then return 0; fi
+    printf 'wefty: warning: could not defer run storage process sweep; deleting storage\n' >&2
   fi
   if [ "$kind" = trash ]; then
     trash=$source
@@ -317,31 +426,7 @@ retire_exec_storage() {
       # command may lock its own storage. Only the top directory, so this
       # stays instant; deletion unlocks the tree.
       /bin/chmod u+w "$source" 2>/dev/null || :
-      # Only unlink our short alias. Never follow it or remove another run's
-      # link, even when the command has replaced the record or the path.
-      # A link that is already gone is fine: the wrapper and the CLI can
-      # retire the same capture at once. Only a link that stays is status 3.
-      if [ -f "$source/tmp-link" ] && [ ! -L "$source/tmp-link" ]; then
-        tmp_link=''
-        # A record without a final newline still sets the value.
-        IFS= read -r tmp_link < "$source/tmp-link" || :
-        case "$tmp_link" in
-          /tmp/wefty-run.?*)
-            suffix=${tmp_link#/tmp/wefty-run.}
-            case "$suffix" in
-              *[!a-zA-Z0-9._-]*) ;;
-              *)
-                if [ -L "$tmp_link" ]; then
-                  target=$(readlink "$tmp_link")
-                  if [ "$target" = "$source/tmp" ] || { [ -n "$tmp_dir" ] && [ "$target" = "$tmp_dir/tmp" ]; }; then
-                    /bin/rm -f -- "$tmp_link" || [ ! -L "$tmp_link" ] || link_failure=3
-                  fi
-                fi
-                ;;
-            esac
-            ;;
-        esac
-      fi
+      exec_storage_unlink_temp_link "$source" "$tmp_dir" || link_failure=3
       /bin/mv -- "$source" "$trash" || exit 1
     fi
     # This child keeps the helper's independent lifetime. Exiting the

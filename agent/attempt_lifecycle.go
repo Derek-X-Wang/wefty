@@ -1590,6 +1590,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if reapErr == nil && reapReceipt.Evidence == "" {
 			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
 		}
+		if reapErr == nil && execJobVersion(claim.Job.Spec) == 1 && lifecycle.dependencies.handoffs != nil {
+			lifecycle.dependencies.handoffs.noteExecSweepReaped(claim.Lease.AttemptID)
+		}
 		// Group absence does not cover descendants that escaped the wrapper.
 		// Sweep while the retained root and run stderr are still open. Keep this
 		// evidence separate until the wrapper's result document has been read.
@@ -1879,6 +1882,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			mailbox.execScanDeadline = execScanDeadline(grace)
 			executionSpec.Env = cloneEnvironment(executionSpec.Env)
 			executionSpec.Env[execScanDeadlineEnv] = execScanDeadlineSeconds(mailbox.execScanDeadline)
+			if execJobVersion(claim.Job.Spec) == 1 && lifecycle.dependencies.handoffs != nil {
+				executionSpec.Env[execSweepNotebookEnv] = lifecycle.dependencies.handoffs.execSweepNotebook()
+				executionSpec.Env[execSweepAttemptEnv] = claim.Lease.AttemptID
+			}
 		}
 		mailbox.captureStderr = func(ctx context.Context, output []byte) error {
 			if redactingSink == nil {

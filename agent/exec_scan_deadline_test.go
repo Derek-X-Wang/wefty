@@ -63,6 +63,17 @@ func TestExecScanDeadlineEnvironment(t *testing.T) {
 					if got, present := request.Execution.Env[execScanDeadlineEnv]; got != tc.want || present != (tc.want != "") {
 						t.Errorf("wrapper deadline = %q, present=%v; want %q", got, present, tc.want)
 					}
+					wantNotebook, wantAttempt := "", ""
+					if execJobVersion(claim.Job.Spec) == 1 {
+						wantNotebook = harness.manager.execSweepNotebook()
+						wantAttempt = claim.Lease.AttemptID
+					}
+					for name, want := range map[string]string{execSweepNotebookEnv: wantNotebook, execSweepAttemptEnv: wantAttempt} {
+						got, present := request.Execution.Env[name]
+						if got != want || present != (wantNotebook != "") {
+							t.Errorf("%s=%q present=%v; want %q", name, got, present, want)
+						}
+					}
 					code := 0
 					return contract.ProcessResult{ExitCode: &code}, nil
 				},
