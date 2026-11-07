@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -43,7 +44,7 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			control := network.NewFabric(fabric.Identity{NodeID: "control"})
 			store, err := l1.OpenStore(filepath.Join(dir, "l1.sqlite"), l1.StoreOptions{LeaseDuration: 60 * time.Second})
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			defer store.Close()
 			server, err := l1.NewServer(control, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"node": {MaxOneshotSlots: 1}}})
@@ -80,7 +81,7 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			}
 			job, _, err := store.CreateJob(t.Context(), contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "term-retirement", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", `touch "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; exit 17`, "sh", ready, release}, WorkingDirectory: dir, HandoffDirectory: dir}})
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			deadline := time.Now().Add(10 * time.Second)
 			for {
@@ -94,15 +95,15 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			}
 			current, err := store.GetNode(t.Context(), "node")
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			current, err = store.SetNodeClaimsByOperator(t.Context(), "node", "operator", l1.NodeIntentRequest{IntentRevision: current.IntentRevision, ClaimsEnabled: false, Reason: "upgrade"})
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			inventory, err := store.NodeGenerations(t.Context(), "agent", "node")
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			primary := inventory.Generations[0]
 			candidate := primary.Registration
@@ -110,11 +111,11 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			candidate.BootSessionID = "next-boot"
 			inventory, err = store.StageNodeGeneration(t.Context(), "agent", candidate)
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			_, err = store.PromoteNodeGeneration(t.Context(), "agent", "node", l1.PromoteNodeGenerationRequest{OperationID: "promote", ExpectedPrimaryGenerationID: primary.AgentGenerationID, ExpectedPrimaryBootSessionID: primary.BootSessionID, ExpectedAuthorityGeneration: primary.AuthorityGeneration, CandidateGenerationID: candidate.AgentGenerationID, CandidateBootSessionID: candidate.BootSessionID, ExpectedCatalogRevision: inventory.CatalogRevision, CatalogRevision: inventory.CatalogRevision + 1, IntentRevision: current.IntentRevision, SelectedProtocol: 1, RetiringGenerationIDs: []string{}, ResidentAttempts: primary.ResidentAttempts})
 			if err != nil {
-				t.Fatal(err)
+				fatalStoreError(t, err)
 			}
 			if latch {
 				if _, err := node.Retire(t.Context()); err != nil {
@@ -167,8 +168,11 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			cancel()
 			<-handlerDone
 			attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
-			if err != nil || len(attempts) != 1 || attempts[0].Result == nil {
-				t.Fatalf("missing result: %+v %v", attempts, err)
+			if err != nil {
+				fatalStoreError(t, err)
+			}
+			if len(attempts) != 1 || attempts[0].Result == nil {
+				t.Fatalf("missing result: %+v", attempts)
 			}
 			result := attempts[0].Result
 			if forced {
@@ -180,4 +184,15 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			}
 		})
 	}
+}
+
+// fatalStoreError fails the test with a store error and the cause under it.
+// An l1.Error prints only its message, so a bare t.Fatal would hide why, for
+// example, a transaction could not begin (#1544).
+func fatalStoreError(t *testing.T, err error) {
+	t.Helper()
+	if cause := errors.Unwrap(err); cause != nil {
+		t.Fatalf("%v (cause: %v)", err, cause)
+	}
+	t.Fatal(err)
 }
