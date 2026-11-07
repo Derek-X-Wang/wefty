@@ -86,10 +86,9 @@ func computerRevocationNothingOwed(err error) error {
 }
 
 // computerRevocationNotRecorded refuses when a call that committed no new
-// authority loss -- an accepted replay, or a stop or remove that found
-// nothing to change -- could not re-drive the explicit revocation. The
-// original mutation's owed revocation, if it has one, is unaffected and still
-// settles on the heartbeat.
+// authority loss -- an accepted replay -- could not re-drive the explicit
+// revocation. The original mutation's owed revocation, if it has one, is
+// unaffected and still settles on the heartbeat.
 func computerRevocationNotRecorded(err error) error {
 	message := "the Computer mutation applied, but the run ledger could not be reached, so the explicit revocation " +
 		"of its token grants was not recorded; retrying the request is not guaranteed to perform it, and L3's " +

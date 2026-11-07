@@ -124,6 +124,106 @@ func TestComputerGrowKeyedReplayProjectsSelectedOutcome(t *testing.T) {
 	}
 }
 
+func TestComputerStopSameStateRetryDoesNotRevokeAgain(t *testing.T) {
+	for _, state := range []string{"running", "unclaimed"} {
+		t.Run(state, func(t *testing.T) {
+			h, node, computer := computerKeyedReplayHarness(t)
+			if state == "running" {
+				startComputerAttempt(t, h, node, nil)
+				computer = mustGetComputer(t, h, computer.ComputerID)
+			}
+			var revocations []ComputerTokenRevocation
+			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+				revocations = append(revocations, request)
+				return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+					ComputerAttemptID: request.ComputerAttemptID, CommittedAt: h.clock.Now()}, nil
+			}}
+			client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+			path := "/v1/computers/" + computer.ComputerID + "/desired-state"
+			status, headers, body := h.do(client, http.MethodPut, path, computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+			var accepted Computer
+			if status != http.StatusAccepted || headers.Get("Mutation-Applied") != "true" || json.Unmarshal(body, &accepted) != nil ||
+				accepted.IntentRevision != computer.IntentRevision+1 {
+				t.Fatalf("original stop: status=%d headers=%v body=%s", status, headers, body)
+			}
+			if len(revocations) != 1 || !revocations[0].RevokeAll || revocations[0].Reason != "computer_stopped" ||
+				revocations[0].ComputerID != computer.ComputerID || revocations[0].ComputerAttemptID != "" {
+				t.Fatalf("original stop did not revoke exactly once: %#v", revocations)
+			}
+			before := owedRevocationAuditRows(t, h, computer.ComputerID)
+			if len(before) != 1 || before[0].verb != ComputerRevocationVerbStop || before[0].scope != ComputerRevocationScopeRevokeAll ||
+				(state == "unclaimed" && len(before[0].recorded) != 0) || (state == "running" && len(before[0].recorded) != 1) {
+				t.Fatalf("original stop omitted its Computer-wide revocation row: %#v", before)
+			}
+			computer = accepted
+			status, headers, body = h.do(client, http.MethodPut, path, computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator"))
+			var result Computer
+			if status != http.StatusAccepted || headers.Get("Mutation-Applied") != "false" || json.Unmarshal(body, &result) != nil {
+				t.Fatalf("repeated stop: status=%d headers=%v body=%s", status, headers, body)
+			}
+			if len(revocations) != 1 {
+				t.Errorf("repeated stop requested a new revocation: %#v", revocations)
+			}
+			if after := owedRevocationAuditRows(t, h, computer.ComputerID); !reflect.DeepEqual(after, before) {
+				t.Errorf("repeated stop changed revocation records: before=%#v after=%#v", before, after)
+			}
+			if result.IntentRevision != accepted.IntentRevision || result.DesiredState != accepted.DesiredState || result.CurrentJobID != accepted.CurrentJobID {
+				t.Errorf("repeated stop changed Computer: %#v", result)
+			}
+		})
+	}
+}
+
+func TestComputerRemoveSameStateRetryDoesNotRevokeAgain(t *testing.T) {
+	for _, state := range []string{"running", "unclaimed"} {
+		t.Run(state, func(t *testing.T) {
+			h, node, computer := computerKeyedReplayHarness(t)
+			if state == "running" {
+				startComputerAttempt(t, h, node, nil)
+				computer = mustGetComputer(t, h, computer.ComputerID)
+			}
+			var revocations []ComputerTokenRevocation
+			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+				revocations = append(revocations, request)
+				return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+					ComputerAttemptID: request.ComputerAttemptID, CommittedAt: h.clock.Now()}, nil
+			}}
+			client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+			path := "/v1/computers/" + computer.ComputerID + "/remove"
+			status, headers, body := h.do(client, http.MethodPost, path, ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator")})
+			var accepted Computer
+			if status != http.StatusAccepted || headers.Get("Mutation-Applied") != "true" || json.Unmarshal(body, &accepted) != nil ||
+				accepted.IntentRevision != computer.IntentRevision+1 {
+				t.Fatalf("original remove: status=%d headers=%v body=%s", status, headers, body)
+			}
+			if len(revocations) != 1 || !revocations[0].RevokeAll || revocations[0].Reason != "computer_removed" ||
+				revocations[0].ComputerID != computer.ComputerID || revocations[0].ComputerAttemptID != "" {
+				t.Fatalf("original remove did not revoke exactly once: %#v", revocations)
+			}
+			before := owedRevocationAuditRows(t, h, computer.ComputerID)
+			if len(before) != 1 || before[0].verb != ComputerRevocationVerbRemove || before[0].scope != ComputerRevocationScopeRevokeAll ||
+				(state == "unclaimed" && len(before[0].recorded) != 0) || (state == "running" && len(before[0].recorded) != 1) {
+				t.Fatalf("original remove omitted its Computer-wide revocation row: %#v", before)
+			}
+			computer = accepted
+			status, headers, body = h.do(client, http.MethodPost, path, ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator")})
+			var result Computer
+			if status != http.StatusAccepted || headers.Get("Mutation-Applied") != "false" || json.Unmarshal(body, &result) != nil {
+				t.Fatalf("repeated remove: status=%d headers=%v body=%s", status, headers, body)
+			}
+			if len(revocations) != 1 {
+				t.Errorf("repeated remove requested a new revocation: %#v", revocations)
+			}
+			if after := owedRevocationAuditRows(t, h, computer.ComputerID); !reflect.DeepEqual(after, before) {
+				t.Errorf("repeated remove changed revocation records: before=%#v after=%#v", before, after)
+			}
+			if result.IntentRevision != accepted.IntentRevision || result.DesiredState != accepted.DesiredState || result.CurrentJobID != accepted.CurrentJobID {
+				t.Errorf("repeated remove changed Computer: %#v", result)
+			}
+		})
+	}
+}
+
 func TestComputerProjectionSamePhaseRetryDoesNotRevokeAgain(t *testing.T) {
 	for _, stage := range []string{"quiescing", "finalizing"} {
 		t.Run(stage, func(t *testing.T) {
