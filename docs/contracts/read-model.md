@@ -158,9 +158,11 @@ so reload failure cannot undo the evidence. A failed attestation reload returns
 503 `unavailable`, `reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
 `export_id`, and `read_reason`; only snapshot availability failures are retryable.
 
-Keyed Computer Backup create, restore, clone, grow, reimage and Custody deletion
-attestation set `Mutation-Applied` and, for replay, `Idempotent-Replay: true`
-before the post-change Read snapshot. A first application reports
+Keyed Computer Backup create, restore, clone, grow, restart, storage reset,
+reimage and Custody deletion attestation set `Mutation-Applied` and, for replay,
+`Idempotent-Replay: true` before any post-change read, including the
+owed-revocation read that restart, storage reset and reimage make before calling
+L3 (#1552). A first application reports
 `Mutation-Applied: true`; an identical replay reports `Mutation-Applied: false`.
 A same-digest reimage no-op reports `Mutation-Applied: false`: it changes nothing
 and stores no key, so an identical resend hits the same no-op while the

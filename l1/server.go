@@ -1454,18 +1454,20 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if !replayed {
-		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_restarted"); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
+	// The receipt goes out before the owed-revocation read: if that read
+	// expires, the committed-unread answer still lets the CLI resend (#1552).
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
+	if !replayed {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_restarted"); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	s.writeComputerForCaller(w, r, status, computer)
 }
 
@@ -1481,18 +1483,20 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if !replayed {
-		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "storage_generation_advanced"); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
+	// The receipt goes out before the owed-revocation read: if that read
+	// expires, the committed-unread answer still lets the CLI resend (#1552).
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
+	if !replayed {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "storage_generation_advanced"); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	s.writeComputerForCaller(w, r, status, computer)
 }
 
@@ -1822,6 +1826,14 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// The receipt goes out before the owed-revocation read: if that read
+	// expires, the committed-unread answer still lets the CLI resend (#1552).
+	status := http.StatusAccepted
+	if replayed {
+		status = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeComputerMutationHeaders(w, computer.owedRevocationID != 0, replayed)
 	// Only a new revision carries an owed revocation; no-ops and replays do not.
 	if computer.owedRevocationID != 0 {
 		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_reimaged"); err != nil {
@@ -1829,12 +1841,6 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	status := http.StatusAccepted
-	if replayed {
-		status = http.StatusOK
-		w.Header().Set("Idempotent-Replay", "true")
-	}
-	writeComputerMutationHeaders(w, computer.owedRevocationID != 0, replayed)
 	s.writeComputerForCaller(w, r, status, computer)
 }
 

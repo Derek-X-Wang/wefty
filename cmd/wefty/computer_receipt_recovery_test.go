@@ -29,6 +29,10 @@ func TestComputerCommandsResendKeepingReceipt(t *testing.T) {
 		{"custody attest", []string{"services", "custody", "attest", "export-1", "--idempotency-key=receipt-key"}, "/v1/custody-exports/export-1/attest-deleted"},
 		{"grow", append([]string{"services", "resize", "computer-1", "--disk-bytes=1000"}, cas...), "/v1/computers/computer-1/grow"},
 		{"reimage", append([]string{"services", "reimage", "computer-1", "--image=ghcr.io/example/reimaged@" + computerCLITestDigestB}, cas...), "/v1/computers/computer-1/reimage"},
+		{"create", []string{"services", "create", "--computer", "--name=c", "--image=ghcr.io/example/c@" + computerCLITestDigestB, "--node=node-1", "--disk-bytes=1000", "--idempotency-key=receipt-key"}, "/v1/computers"},
+		{"restart", append([]string{"services", "restart", "computer-1"}, cas...), "/v1/computers/computer-1/restart"},
+		{"reset", append([]string{"services", "reset", "computer-1", "--terminate-sessions"}, cas...), "/v1/computers/computer-1/storage-reset"},
+		{"abort", append([]string{"services", "abort", "computer-1"}, cas...), "/v1/computers/computer-1/reconfiguration-abort"},
 	} {
 		for _, secondFailure := range []bool{false, true} {
 			t.Run(test.name+map[bool]string{false: "/success", true: "/second failure"}[secondFailure], func(t *testing.T) {
@@ -73,7 +77,9 @@ func TestComputerCommandsResendKeepingReceipt(t *testing.T) {
 				err := execute(t.Context(), clients, true, test.args, &stdout, &stderr)
 				mu.Lock()
 				defer mu.Unlock()
-				if len(mutations) != 2 || mutations[0] != mutations[1] || mutations[0].path != test.path || !strings.Contains(mutations[0].body, `"idempotency_key":"receipt-key"`) {
+				// Create carries its key as the Job spec's dispatch_key.
+				if len(mutations) != 2 || mutations[0] != mutations[1] || mutations[0].path != test.path ||
+					(!strings.Contains(mutations[0].body, `"idempotency_key":"receipt-key"`) && !strings.Contains(mutations[0].body, `"dispatch_key":"receipt-key"`)) {
 					t.Fatalf("mutations=%+v err=%v stdout=%s stderr=%s", mutations, err, &stdout, &stderr)
 				}
 				if secondFailure {
