@@ -1416,7 +1416,8 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
-	if request.DesiredState == contract.ServiceDesiredStopped {
+	// Only a new stop carries an owed revocation; same-state retries do not.
+	if request.DesiredState == contract.ServiceDesiredStopped && computer.owedRevocationID != 0 {
 		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_stopped"); err != nil {
 			writeError(w, err)
 			return
@@ -1849,9 +1850,12 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_removed"); err != nil {
-		writeError(w, err)
-		return
+	// Only a new removal carries an owed revocation; no-ops do not.
+	if computer.owedRevocationID != 0 {
+		if err := s.revokeAfterAuthorityLoss(r.Context(), computer.owedRevocationID, computer.ComputerID, "", "computer_removed"); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	writeComputerMutationHeaders(w, computer.IntentRevision > request.IntentRevision, false)
 	s.writeComputerForCaller(w, r, http.StatusAccepted, computer)
