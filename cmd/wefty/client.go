@@ -398,7 +398,7 @@ func (c *apiClients) reimageComputer(ctx context.Context, computerID string,
 ) (l1.Computer, mutationReceipt, error) {
 	var computer l1.Computer
 	path := "/v1/computers/" + url.PathEscape(computerID) + "/reimage"
-	headers, err := c.l1.mutate(ctx, sameKeyReadAgain, http.MethodPost, path, request, &computer,
+	headers, err := c.l1.mutate(ctx, resendKeepingReceipt, http.MethodPost, path, request, &computer,
 		http.StatusAccepted, http.StatusOK)
 	return computer, mutationReceiptFromHeaders(headers), err
 }
@@ -986,10 +986,6 @@ var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
 // resendKeepingReceipt is the plan for a keyed Computer mutation whose
 // command reports L1's receipt.
 var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
-
-// sameKeyReadAgain is the plan for reimage. Its replay is now safe to resend
-// (#1516, #1527); moving it to resendKeepingReceipt is #1532.
-var sameKeyReadAgain = postChangeRecovery{hint: sameKeyHint}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
 func readBackWith(path, command string) postChangeRecovery {
