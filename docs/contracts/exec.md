@@ -315,9 +315,12 @@ Only `incomplete` adds
 Existing diagnostic lines remain. These internal outcomes add no wire or
 contract field. A complete sweep keeps the usual retirement and asynchronous
 deletion. Version 1 can defer a skipped or incomplete sweep as described below.
-Version 2 keeps delete-and-warn for all outcomes. Its storage lives inside the
-Attempt mailbox; protecting that storage from per-run trimming, expiry, and
-budget eviction is follow-up [#1540](https://github.com/Derek-X-Wang/wefty/issues/1540).
+Version 2 keeps delete-and-warn for all outcomes. This is a documented limit,
+not planned work ([#1540](https://github.com/Derek-X-Wang/wefty/issues/1540)):
+version 2 storage lives inside the Attempt mailbox, and deferring its sweep
+would need per-run trimming, expiry and budget eviction to keep storage that a
+notebook entry names. Version 2 does not schedule a deferred notebook re-sweep
+after a skipped or incomplete sweep.
 
 For version 1, the node agent supplies a notebook folder through
 `WEFTY_EXEC_SWEEP_NOTEBOOK`. The notebook is

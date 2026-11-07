@@ -65,8 +65,9 @@ func TestComputerMutationReceiptBeforePostChangeRead(t *testing.T) {
 				w := httptest.NewRecorder()
 				handler(receiptExpiryResponseWriter{w, h.store}, r)
 				var answer contract.ErrorResponse
-				// The body says mutation_applied=true even for the reimage no-op: today's
-				// behaviour, which #1538 may change together with the CLI resend.
+				// The body says mutation_applied=true even for the reimage no-op. This is
+				// the contract (#1538): the field means the request succeeded, and the CLI
+				// resend depends on it.
 				if w.Code != http.StatusServiceUnavailable || json.Unmarshal(w.Body.Bytes(), &answer) != nil || answer.Error.Code != contract.ErrorUnavailable || !answer.Error.Retryable || answer.Error.Details["reason"] != "read_snapshot_post_change_failed" || answer.Error.Details["mutation_applied"] != true {
 					t.Fatalf("replay=%t response=%d %s", replay, w.Code, w.Body.String())
 				}
