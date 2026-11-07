@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,11 +17,40 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/execsweep"
 )
 
+const execScanDeadlineEnv = "WEFTY_EXEC_SCAN_DEADLINE"
+
+func execScanDeadline(grace time.Duration) time.Duration {
+	return min(3*time.Second, max(time.Second, grace-2*time.Second))
+}
+
+// Exec jobs of both versions carry their version in the immutable run params.
+func execJob(spec contract.JobSpec) bool {
+	if spec.Kind != contract.JobKindProcess {
+		return false
+	}
+	var params struct {
+		Version int `json:"exec_version"`
+	}
+	return json.Unmarshal([]byte(spec.Labels[contract.LabelRunParams]), &params) == nil && (params.Version == 1 || params.Version == 2)
+}
+
+func execScanDeadlineSeconds(deadline time.Duration) string {
+	return strconv.FormatFloat(max(time.Second, deadline).Seconds(), 'f', -1, 64)
+}
+
+type execSweepOutcome string
+
+const (
+	execSweepComplete   execSweepOutcome = "complete"
+	execSweepSkipped    execSweepOutcome = "skipped"
+	execSweepIncomplete execSweepOutcome = "incomplete"
+)
+
 // sweepExecCaptureRoot uses only the retained mailbox directory, never its
 // workload-visible pathname. Derive its physical path from the open directory
 // (F_GETPATH on Darwin, /proc/self/fd on Linux), then check its identity against
 // that handle. Failed or stale resolution skips the sweep with a warning.
-func (m *runMailbox) sweepExecCaptureRoot(ctx context.Context, root *os.Root, stale bool) []contract.StoppedProcess {
+func (m *runMailbox) sweepExecCaptureRoot(ctx context.Context, root *os.Root, stale bool) ([]contract.StoppedProcess, execSweepOutcome) {
 	return m.sweepExecCaptureRootWithProbe(ctx, root, stale, 5*time.Second, probeExecSweepDirectory)
 }
 
@@ -62,7 +92,7 @@ func probeExecSweepDirectory(root *os.Root) (target execSweepDirectory, err erro
 	return target, nil
 }
 
-func (m *runMailbox) sweepExecCaptureRootWithProbe(ctx context.Context, root *os.Root, stale bool, budget time.Duration, probe func(*os.Root) (execSweepDirectory, error)) []contract.StoppedProcess {
+func (m *runMailbox) sweepExecCaptureRootWithProbe(ctx context.Context, root *os.Root, stale bool, budget time.Duration, probe func(*os.Root) (execSweepDirectory, error)) ([]contract.StoppedProcess, execSweepOutcome) {
 	// Cancellation must not skip cleanup. This single budget starts before
 	// filesystem probes; Bash receives only the time remaining after them.
 	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
@@ -102,23 +132,23 @@ func (m *runMailbox) sweepExecCaptureRootWithProbe(ctx context.Context, root *os
 		}
 	case <-sweepCtx.Done():
 		diagnose([]byte("wefty: warning: exec storage process sweep probes exceeded deadline; skipping sweep\n"))
-		return nil
+		return nil, execSweepSkipped
 	}
 	if sweepCtx.Err() != nil {
 		diagnose([]byte("wefty: warning: exec storage process sweep probes exceeded deadline; skipping sweep\n"))
-		return nil
+		return nil, execSweepSkipped
 	}
 	if result.err != nil {
 		diagnose([]byte(fmt.Sprintf("wefty: warning: could not probe retained exec mailbox for process sweep: %v\n", result.err)))
-		return nil
+		return nil, execSweepSkipped
 	}
 	if result.target.directory == nil {
-		return nil
+		return nil, execSweepSkipped
 	}
 	command := exec.CommandContext(sweepCtx, "/bin/bash", "-c", execsweep.Script+`
 skip_sweep() {
   printf 'wefty: warning: could not verify retained exec mailbox identity; skipping process sweep\n' >&2
-  printf '[]\n'
+  printf '{"outcome":"skipped"}\n'
   exit 0
 }
 cd -P -- "$1" || skip_sweep
@@ -132,9 +162,10 @@ esac
 # Preserve trailing newlines so the shared script rejects unsupported paths.
 physical=$(pwd -P && printf '.') || skip_sweep
 physical=${physical%$'\n.'}
+exec_scan_deadline=$4
 sweep_exec_storage_processes "$physical/wefty-exec-work" "$3/wefty-exec-work"
-printf '[%s]\n' "$exec_stopped_processes"
-`, "wefty-agent-exec-sweep", result.target.physical, result.target.identity, m.directory)
+printf '{"outcome":"%s","stopped":[%s]}\n' "$exec_sweep_outcome" "$exec_stopped_processes"
+`, "wefty-agent-exec-sweep", result.target.physical, result.target.identity, m.directory, execScanDeadlineSeconds(m.execScanDeadline))
 	command.Dir = "/"
 	command.WaitDelay = 100 * time.Millisecond
 	var stdout, stderr bytes.Buffer
@@ -147,13 +178,18 @@ printf '[%s]\n' "$exec_stopped_processes"
 	}
 	if err != nil {
 		diagnose([]byte(fmt.Sprintf("wefty: warning: exec storage process sweep failed: %v\n", err)))
+		return nil, execSweepSkipped
 	}
-	var stopped []contract.StoppedProcess
+	var evidence struct {
+		Outcome execSweepOutcome          `json:"outcome"`
+		Stopped []contract.StoppedProcess `json:"stopped"`
+	}
+	evidence.Outcome = execSweepSkipped
 	if stdout.Len() > 0 {
-		if err := json.Unmarshal(stdout.Bytes(), &stopped); err != nil {
+		if err := json.Unmarshal(stdout.Bytes(), &evidence); err != nil {
 			diagnose([]byte(fmt.Sprintf("wefty: warning: could not read exec storage process sweep evidence: %v\n", err)))
-			return nil
+			return nil, execSweepSkipped
 		}
 	}
-	return stopped
+	return evidence.Stopped, evidence.Outcome
 }

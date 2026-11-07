@@ -19,11 +19,31 @@ import (
 	"time"
 )
 
-// Invoked by the wrapper as its command. The child leaves the wrapper's
-// process group and closes its inherited output pipes, just like a daemon.
+// Wrapper modes create a daemon that leaves the wrapper's process group.
+// The budget mode exercises CLI retirement in the test's isolated group.
 func TestExecStorageProcessHelper(t *testing.T) {
 	mode := os.Getenv("EXEC_STORAGE_PROCESS_HELPER")
 	if mode == "" {
+		return
+	}
+	if mode == "stale-retirement-budget" {
+		if execSweepBudget != 2*time.Second {
+			t.Fatalf("CLI sweep budget = %s, want 2s", execSweepBudget)
+		}
+		storage := os.Getenv("EXEC_STORAGE_BUDGET_STORAGE")
+		ctx, cancel := context.WithTimeout(t.Context(), execSweepBudget)
+		defer cancel()
+		started := time.Now()
+		err := retireExecStorageContext(ctx, storage, "capture")
+		elapsed, contextErr := time.Since(started), ctx.Err()
+		// Include filesystem and rename scheduling in the real two-second budget.
+		if err != nil || contextErr != nil || elapsed >= execSweepBudget {
+			t.Fatalf("retirement: error=%v context=%v elapsed=%s", err, contextErr, elapsed)
+		}
+		if _, err := os.Lstat(storage); !os.IsNotExist(err) {
+			t.Errorf("storage was not retired: %v", err)
+		}
+		t.Logf("retirement completed in %s before its 2s deadline", elapsed)
 		return
 	}
 	if mode == "sleep" {
@@ -69,6 +89,71 @@ func TestExecStorageProcessHelper(t *testing.T) {
 			time.Sleep(time.Hour)
 		}
 	}
+}
+
+func TestExecStaleRetirementScanFitsForegroundBudget(t *testing.T) {
+	root := execTestStorageRoot(t)
+	storage := filepath.Join(root, "wefty-exec-stale-timeout")
+	writeExecFile(t, filepath.Join(storage, "leftover"), "data")
+	shim := t.TempDir()
+	for _, name := range []string{"lsof", "find"} {
+		path := filepath.Join(shim, name)
+		writeExecFile(t, path, "#!/bin/sh\nexec /bin/sleep 30\n")
+		if err := os.Chmod(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outcome := filepath.Join(t.TempDir(), "outcome")
+	observer := filepath.Join(t.TempDir(), "bash-env")
+	// Observe the existing shell variable without changing the real CLI path.
+	// Fresh deletion shells have no sweep outcome and leave this file alone.
+	writeExecFile(t, observer, `trap 'if [ -n "${exec_sweep_outcome:-}" ]; then
+  printf "%s\n" "$exec_sweep_outcome" > "$EXEC_STORAGE_SWEEP_OUTCOME"
+fi' EXIT
+`)
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "-test.run=^TestExecStorageProcessHelper$", "-test.v")
+	command.Env = append(os.Environ(),
+		"EXEC_STORAGE_PROCESS_HELPER=stale-retirement-budget",
+		"EXEC_STORAGE_BUDGET_STORAGE="+storage,
+		"EXEC_STORAGE_SWEEP_OUTCOME="+outcome,
+		"BASH_ENV="+observer,
+		"PATH="+shim+":"+os.Getenv("PATH"))
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	group := command.Process.Pid
+	t.Cleanup(func() { _ = syscall.Kill(-group, syscall.SIGKILL) })
+	if err := command.Wait(); err != nil {
+		t.Errorf("retirement helper: %v\n%s\n%s", err, &stdout, &stderr)
+	}
+	t.Logf("retirement helper:\n%s", &stdout)
+	if got := stderr.String(); got != "wefty: warning: could not scan processes in run storage\n" {
+		t.Errorf("scan diagnostics = %q", got)
+	}
+	if got, err := os.ReadFile(outcome); err != nil || string(got) != "skipped\n" {
+		t.Errorf("outcome = %q, want skipped: %v", got, err)
+	}
+	// Inspect only the isolated fixture's process group.
+	processes, err := exec.Command("ps", "-axo", "pid=,pgid=,comm=").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(processes), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == strconv.Itoa(group) {
+			t.Errorf("retirement left a process in group %d: %s", group, line)
+		}
+	}
+	waitExecStorageEmpty(t, root)
 }
 
 func TestExecStorageSweepStopsEscapedProcesses(t *testing.T) {

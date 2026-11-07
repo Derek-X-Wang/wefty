@@ -3,6 +3,9 @@ set -u
 # Values below are shell-quoted by the CLI, never evaluated as shell source.
 __WEFTY_EXEC_INPUT__
 __WEFTY_EXEC_CLEANUP__
+# The node agent supplies seconds from the process runner's TERM grace.
+exec_scan_deadline=${WEFTY_EXEC_SCAN_DEADLINE:-1}
+if ! [[ "$exec_scan_deadline" =~ ^[12]([.][0-9]+)?$|^3([.]0+)?$ ]]; then exec_scan_deadline=1; fi
 work="$storage/work"
 # The liveness loop stops on these markers, not on a signal from this shell.
 # A signal that reaches a new subshell while it still carries this shell's

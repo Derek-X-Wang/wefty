@@ -56,6 +56,10 @@ func TestExecCaptureSweepRemovesOnlyRetiredStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		// Inventory may unlink its private status file, never a scratch folder.
+		if strings.HasPrefix(line, "-f -- /tmp/wefty-exec-scan.") {
+			continue
+		}
 		target := strings.TrimPrefix(line, "-rf -- ")
 		if !strings.HasPrefix(filepath.Base(target), ".wefty-trash-") {
 			t.Errorf("sweep removed a scratch path before retirement: %s", line)
@@ -104,6 +108,8 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 		warning     bool
 		scanWarning bool
 		capWarning  bool
+		termFailure bool
+		killFailure bool
 	}{
 		{name: "absent", warning: true},
 		{name: "absent-and-gone", gone: true, stopped: 1},
@@ -114,6 +120,9 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 		{name: "failed", second: "return 1", warning: true},
 		{name: "timeout", second: "return 137", warning: true},
 		{name: "failed-and-gone", second: "return 1", gone: true, stopped: 1, warning: true},
+		{name: "term-failed-alive", termFailure: true, warning: true},
+		{name: "term-failed-gone", termFailure: true, gone: true},
+		{name: "kill-failed-alive", second: `printf 'p4194400\ncsleep\nn%s\n' "$test_storage"`, killFailure: true, kill: true, warning: true},
 		{name: "escaped-cwd", first: `printf 'p4194400\ncsleep\nn%s/%s\n' "$test_storage" 'escaped\folder'`, noTerm: true},
 		{name: "backslash-storage", folder: `capture\folder`, noTerm: true, scanWarning: true},
 		{name: "caret-cwd", first: `printf 'p4194400\ncsleep\nn%s/%s\n' "$test_storage" '^A'`, noTerm: true},
@@ -159,11 +168,13 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
  kill() {
    printf '%%s\n' "$*" >> "$test_signals"
    if [ "$1" = -0 ] && [ %t = true ]; then return 1; fi
+   if [ "$1" = -TERM ] && [ %t = true ]; then return 1; fi
+   if [ "$1" = -KILL ] && [ %t = true ]; then return 1; fi
    return 0
  }
  sweep_exec_storage_processes "$test_storage"
- printf '[%%s]\n' "$exec_stopped_processes"
-`, first, test.second+"\n   :", test.gone)
+ printf '{"outcome":"%%s","stopped":[%%s]}\n' "$exec_sweep_outcome" "$exec_stopped_processes"
+`, first, test.second+"\n   :", test.gone, test.termFailure, test.killFailure)
 			command := exec.CommandContext(t.Context(), "/bin/bash", "-c", script, "confirm-kill", storage, signals)
 			var stderr strings.Builder
 			command.Stderr = &stderr
@@ -193,8 +204,24 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 				Name string `json:"name"`
 				CWD  string `json:"cwd"`
 			}
-			if err := json.Unmarshal(output, &stopped); err != nil {
+			var evidence struct {
+				Outcome string          `json:"outcome"`
+				Stopped json.RawMessage `json:"stopped"`
+			}
+			if err := json.Unmarshal(output, &evidence); err != nil {
 				t.Fatal(err)
+			}
+			if err := json.Unmarshal(evidence.Stopped, &stopped); err != nil {
+				t.Fatal(err)
+			}
+			wantOutcome := "complete"
+			if test.scanWarning {
+				wantOutcome = "skipped"
+			} else if test.warning || test.capWarning || test.name == "outside" || test.name == "different-name" || test.name == "agent" {
+				wantOutcome = "incomplete"
+			}
+			if evidence.Outcome != wantOutcome {
+				t.Errorf("outcome=%q, want %s", evidence.Outcome, wantOutcome)
 			}
 			if len(stopped) != test.stopped {
 				t.Errorf("stopped count = %d, want %d: %s", len(stopped), test.stopped, output)
@@ -226,6 +253,102 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 			if got := strings.Count(stderr.String(), "wefty: warning: could not stop a process in run storage\n"); got != wantWarning {
 				t.Errorf("warning count = %d: %s", got, &stderr)
 			}
+			wantIncompleteWarning := 0
+			if wantOutcome == "incomplete" {
+				wantIncompleteWarning = 1
+			}
+			if got := strings.Count(stderr.String(), "wefty: warning: process cleanup in run storage was incomplete\n"); got != wantIncompleteWarning {
+				t.Errorf("incomplete warning count = %d: %s", got, &stderr)
+			}
+		})
+	}
+}
+
+func TestExecSweepOutcomesRetireStorage(t *testing.T) {
+	for _, outcome := range []string{"complete", "skipped", "incomplete"} {
+		t.Run(outcome, func(t *testing.T) {
+			root := execTestStorageRoot(t)
+			storage := filepath.Join(root, "capture")
+			writeExecFile(t, filepath.Join(storage, "leftover"), "data")
+			// The sweep matches physical cwd paths (cd -P), so report the same
+			// path even where the temp root is a symlink, such as /var on macOS.
+			physical, err := filepath.EvalSymlinks(storage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shim := t.TempDir()
+			calls := filepath.Join(shim, "calls")
+			// Darwin records let this fixture use a fabricated PID on both OSes.
+			// The second scanner invocation fails to inject confirmation failure.
+			writeExecFile(t, filepath.Join(shim, "lsof"), fmt.Sprintf(`#!/bin/sh
+if [ %q = skipped ]; then exit 2; fi
+if [ %q = complete ]; then exit 0; fi
+if [ -e %q ]; then exit 2; fi
+: > %q
+printf 'p4194400\ncsleep\nn%%s\n' %q
+`, outcome, outcome, calls, calls, physical))
+			if err := os.Chmod(filepath.Join(shim, "lsof"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := execCleanupScript + `
+uname() { printf 'Darwin\n'; }
+kill() {
+  case "$*" in *' 4194400') return 0 ;; esac
+  command kill "$@"
+}
+retire_exec_storage "$1" capture || exit $?
+printf '%s\n' "$exec_sweep_outcome"
+`
+			command := exec.CommandContext(t.Context(), "/bin/bash", "-c", script, "sweep-outcome", storage)
+			command.Env = append(os.Environ(), "PATH="+shim+":"+os.Getenv("PATH"))
+			var stderr strings.Builder
+			command.Stderr = &stderr
+			output, err := command.Output()
+			if err != nil || strings.TrimSpace(string(output)) != outcome {
+				t.Fatalf("retirement outcome=%q want=%s: %v; %s", output, outcome, err, &stderr)
+			}
+			warnings := ""
+			switch outcome {
+			case "skipped":
+				warnings = "wefty: warning: could not scan processes in run storage\n"
+			case "incomplete":
+				warnings = "wefty: warning: could not stop a process in run storage\nwefty: warning: process cleanup in run storage was incomplete\n"
+			}
+			if stderr.String() != warnings {
+				t.Errorf("diagnostics=%q, want %q", &stderr, warnings)
+			}
+			waitExecStorageEmpty(t, root)
+		})
+	}
+}
+
+func TestExecWrapperScanDeadlineValidation(t *testing.T) {
+	for _, tc := range []struct{ value, want string }{
+		{"", "1"}, {"3", "3"}, {"2.5", "2.5"}, {"0", "1"}, {"4", "1"},
+		{"-1", "1"}, {"1; exit 99", "1"}, {"NaN", "1"}, {"3.1", "1"},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			root := execTestStorageRoot(t)
+			storage := filepath.Join(root, "capture")
+			writeExecFile(t, filepath.Join(storage, "leftover"), "data")
+			deadline := filepath.Join(t.TempDir(), "deadline")
+			// A missing snapshot enters the real wrapper's cleanup trap early.
+			// Observe the scanner argument without creating an executable snapshot.
+			cleanup := execCleanupScript + fmt.Sprintf(`
+exec_storage_bounded_inventory() { printf '%%s' "$3" > %q; }
+`, deadline)
+			script := strings.Replace(execWrapper, "__WEFTY_EXEC_CLEANUP__", cleanup, 1)
+			script = strings.Replace(script, "__WEFTY_EXEC_INPUT__", fmt.Sprintf("storage=%q", storage), 1)
+			command := exec.CommandContext(t.Context(), "/bin/bash", "-c", script)
+			command.Env = append(os.Environ(), "WEFTY_EXEC_SCAN_DEADLINE="+tc.value)
+			if out, err := command.CombinedOutput(); err == nil {
+				t.Fatalf("missing snapshot unexpectedly succeeded: %s", out)
+			}
+			got, err := os.ReadFile(deadline)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("deadline=%q want=%s: %v", got, tc.want, err)
+			}
+			waitExecStorageEmpty(t, root)
 		})
 	}
 }

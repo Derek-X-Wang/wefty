@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
@@ -32,6 +33,15 @@ type Adapter struct {
 
 func NewAdapter(executor Executor) *Adapter {
 	return &Adapter{executor: executor, hostBootIdentity: hostboot.Identity, queryGroup: queryProcessGroup, reaped: make(map[workloadrunner.AttemptAuthority]error)}
+}
+
+// TerminationGraceTime exposes the executor's actual TERM grace to the node agent.
+// Executors without that contract retain the one-second exec scan deadline.
+func (adapter *Adapter) TerminationGraceTime() time.Duration {
+	if executor, ok := adapter.executor.(interface{ TerminationGraceTime() time.Duration }); ok {
+		return executor.TerminationGraceTime()
+	}
+	return 0
 }
 
 // NewAdapterForBoot binds Guardian's agent-disconnect guarantee to the

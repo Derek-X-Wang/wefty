@@ -5,17 +5,122 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
+
+func TestExecSweepOutcomeReturn(t *testing.T) {
+	tool := "find"
+	if runtime.GOOS == "darwin" {
+		tool = "lsof"
+	}
+	actual, err := exec.LookPath(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, outcome := range []execSweepOutcome{execSweepComplete, execSweepSkipped, execSweepIncomplete} {
+		t.Run(string(outcome), func(t *testing.T) {
+			mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
+			work := filepath.Join(mailbox.directory, "wefty-exec-work", "work")
+			if err := os.MkdirAll(work, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if outcome == execSweepIncomplete {
+				startExecSweepProcess(t, work)
+			}
+			shim := t.TempDir()
+			calls := filepath.Join(shim, "called")
+			body := "exit 0\n"
+			if outcome == execSweepSkipped {
+				body = "exit 2\n"
+			} else if outcome == execSweepIncomplete {
+				body = fmt.Sprintf("if [ -e %q ]; then exit 2; fi\n: > %q\nexec %q \"$@\"\n", calls, calls, actual)
+			}
+			if err := os.WriteFile(filepath.Join(shim, tool), []byte("#!/bin/sh\n"+body), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", shim+":"+os.Getenv("PATH"))
+			var diagnostics strings.Builder
+			mailbox.captureStderr = func(_ context.Context, output []byte) error {
+				_, _ = diagnostics.Write(output)
+				return nil
+			}
+			stopped, got := mailbox.sweepExecCaptureRoot(t.Context(), mailbox.root, false)
+			if got != outcome || len(stopped) != 0 {
+				t.Fatalf("outcome=%s want=%s stopped=%+v; %s", got, outcome, stopped, &diagnostics)
+			}
+			wantWarnings := 0
+			if outcome == execSweepIncomplete {
+				wantWarnings = 1
+			}
+			if got := strings.Count(diagnostics.String(), "wefty: warning: process cleanup in run storage was incomplete\n"); got != wantWarnings {
+				t.Fatalf("incomplete warning count=%d: %s", got, &diagnostics)
+			}
+		})
+	}
+}
+
+func TestExecSweepProbeAndBashErrorsSkip(t *testing.T) {
+	for _, phase := range []string{"probe", "bash"} {
+		t.Run(phase, func(t *testing.T) {
+			mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
+			if err := mailbox.root.MkdirAll("wefty-exec-work/work", 0700); err != nil {
+				t.Fatal(err)
+			}
+			probe := probeExecSweepDirectory
+			if phase == "probe" {
+				probe = func(*os.Root) (execSweepDirectory, error) {
+					return execSweepDirectory{}, errors.New("injected probe failure")
+				}
+			} else {
+				env := filepath.Join(t.TempDir(), "bash-env")
+				if err := os.WriteFile(env, []byte("exit 2\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("BASH_ENV", env)
+			}
+			stopped, outcome := mailbox.sweepExecCaptureRootWithProbe(t.Context(), mailbox.root, false, 5*time.Second, probe)
+			if len(stopped) != 0 || outcome != execSweepSkipped {
+				t.Fatalf("%s failure: outcome=%s stopped=%+v", phase, outcome, stopped)
+			}
+		})
+	}
+}
+
+func TestExecCaptureSweepUsesNodeDeadline(t *testing.T) {
+	tool := "find"
+	if runtime.GOOS == "darwin" {
+		tool = "lsof"
+	}
+	actual, err := exec.LookPath(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shim, tool), []byte(fmt.Sprintf("#!/bin/sh\nsleep 1.5\nexec %q \"$@\"\n", actual)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+":"+os.Getenv("PATH"))
+	for _, stale := range []bool{false, true} {
+		mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
+		if err := mailbox.root.MkdirAll("wefty-exec-work/work", 0700); err != nil {
+			t.Fatal(err)
+		}
+		mailbox.execScanDeadline = 3 * time.Second
+		if stopped, outcome := mailbox.sweepExecCaptureRoot(t.Context(), mailbox.root, stale); outcome != execSweepComplete || len(stopped) != 0 {
+			t.Fatalf("stale=%v: outcome=%s stopped=%+v", stale, outcome, stopped)
+		}
+	}
+}
 
 func TestExecCaptureSweepRejectsPathSwapAfterProbe(t *testing.T) {
 	mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
@@ -54,8 +159,8 @@ func TestExecCaptureSweepRejectsPathSwapAfterProbe(t *testing.T) {
 		}
 		return target, os.Symlink(outside, mailbox.directory)
 	}
-	stopped := mailbox.sweepExecCaptureRootWithProbe(t.Context(), mailbox.root, false, 5*time.Second, probe)
-	if len(stopped) != 0 {
+	stopped, outcome := mailbox.sweepExecCaptureRootWithProbe(t.Context(), mailbox.root, false, 5*time.Second, probe)
+	if len(stopped) != 0 || outcome != execSweepSkipped {
 		t.Fatalf("path swap produced stopped evidence: %+v", stopped)
 	}
 	if !strings.Contains(diagnostics.String(), "wefty: warning: could not verify retained exec mailbox identity") {
@@ -97,9 +202,13 @@ func TestExecCaptureSweepBoundsBlockedProbeAndClosesLateHandle(t *testing.T) {
 				}
 				return execSweepDirectory{directory: directory}, err
 			}
-			done := make(chan []contract.StoppedProcess, 1)
+			done := make(chan execSweepOutcome, 1)
 			go func() {
-				done <- mailbox.sweepExecCaptureRootWithProbe(t.Context(), mailbox.root, false, 100*time.Millisecond, probe)
+				stopped, outcome := mailbox.sweepExecCaptureRootWithProbe(t.Context(), mailbox.root, false, 100*time.Millisecond, probe)
+				if len(stopped) != 0 {
+					t.Errorf("blocked probe produced evidence: %+v", stopped)
+				}
+				done <- outcome
 			}()
 			var directory *os.File
 			select {
@@ -111,9 +220,9 @@ func TestExecCaptureSweepBoundsBlockedProbeAndClosesLateHandle(t *testing.T) {
 				t.Fatal("probe did not enter")
 			}
 			select {
-			case stopped := <-done:
-				if len(stopped) != 0 {
-					t.Fatalf("blocked probe produced evidence: %+v", stopped)
+			case outcome := <-done:
+				if outcome != execSweepSkipped {
+					t.Fatalf("blocked probe outcome: %s", outcome)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("sweep did not return after its 100 ms probe deadline")

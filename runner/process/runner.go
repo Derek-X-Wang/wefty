@@ -142,6 +142,11 @@ func New(config Config) *Runner {
 	}
 }
 
+// TerminationGraceTime returns the resolved grace used before SIGKILL.
+func (runner *Runner) TerminationGraceTime() time.Duration {
+	return runner.terminationGraceTime
+}
+
 // Run executes one process and waits for it and all captured output to finish.
 // Process outcomes, including spawn failures and nonzero exits, are represented
 // in ProcessResult. The returned error reports supervision failures such as a

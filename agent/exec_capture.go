@@ -116,7 +116,8 @@ func seedExecCaptureWithRemoval(ctx context.Context, spec contract.JobSpec, mail
 			}
 			var once sync.Once
 			mailbox.captureSweep = func(ctx context.Context) []contract.StoppedProcess {
-				return mailbox.sweepExecCaptureRoot(ctx, root, false)
+				stopped, _ := mailbox.sweepExecCaptureRoot(ctx, root, false)
+				return stopped
 			}
 			mailbox.captureCleanup = func() {
 				once.Do(func() {
