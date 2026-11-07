@@ -199,13 +199,19 @@ func TestSeatCopyProgramSignalDuringReaderSetup(t *testing.T) {
 // This CPython hook must fail loudly if tarfile changes, rather than silently
 // losing the regression coverage. readSeatCopyHandshake rejects HOOK_MISSING
 // and also bounds the wait if the patched tell() is never called.
-const seatReaderSetupSignal = seatCopyStackDump + `import os, signal, tarfile
+//
+// The hook waits in short sleeps, not signal.pause() (#1546). A SIGTERM that
+// lands after Python's last signal check but before the pause syscall starts
+// is never seen by pause(), so the handler would not run inside tell(). Each
+// sleep returns to the interpreter, which then runs any pending handler here.
+const seatReaderSetupSignal = seatCopyStackDump + `import os, tarfile, time
 if not (hasattr(tarfile, '_FileInFile') and 'tell' in vars(tarfile._FileInFile)):
     os.write(1, b'HOOK_MISSING tarfile._FileInFile.tell\n')
     sys.exit(3)
 def interrupted_tell(self):
     os.write(1, b'STAGED\n')
-    signal.pause()
+    while True:
+        time.sleep(0.01)
 tarfile._FileInFile.tell = interrupted_tell
 `
 
