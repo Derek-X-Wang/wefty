@@ -745,11 +745,53 @@ func TestGuardianPublishesOnlyThePayloadsOwnListenerAfterStartup(t *testing.T) {
 	}
 	_ = foreign.Close()
 
+	waitServiceAddressBindable(t, address)
+
 	if err := syscall.Kill(guardian.pid, syscall.SIGUSR2); err != nil {
 		t.Fatal(err)
 	}
 	guardian.expectReadiness(t, true)
 	guardian.stopWithin(t, 5*time.Second)
+}
+
+// waitServiceAddressBindable waits for the foreign listener's final release.
+// Match the payload's SO_REUSEADDR bind without listening: a listening check
+// could accept readiness probes and delay the next release on macOS again.
+// The check socket is close-on-exec, set under ForkLock as net does, so an
+// lsof started by the in-process Guardian cannot inherit it and keep the
+// port bound after this check closes it.
+func waitServiceAddressBindable(t *testing.T, address string) {
+	t.Helper()
+	syscall.ForkLock.RLock()
+	descriptor, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err == nil {
+		syscall.CloseOnExec(descriptor)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(descriptor)
+	if err := syscall.SetsockoptInt(descriptor, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		t.Fatal(err)
+	}
+	backend := mustServiceBackend(t, address)
+	socketAddress := &syscall.SockaddrInet4{Port: backend.port}
+	copy(socketAddress.Addr[:], backend.ip.To4())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := syscall.Bind(descriptor, socketAddress)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("bind %s: %v", address, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting to bind %s: %v", address, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func serviceTestRunner(startupDeadline time.Duration) *Runner {
