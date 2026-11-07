@@ -273,7 +273,13 @@ snapshot as the returned Computer. As for jobs, projection failure after success
 returns 503 `unavailable`,
 `reason=read_snapshot_post_change_failed`, `mutation_applied=true`, `computer_id`
 and `read_reason`. Only snapshot availability failures are retryable; retry a
-read, and retain the original replay key when retrying a mutation. Applied
+read, and retain the original replay key when retrying a mutation. As for jobs,
+`mutation_applied=true` means the request succeeded, including an idempotent
+success or a no-op such as a reimage to the digest the Computer already runs;
+it does not promise that the request made a new change. The `Mutation-Applied`
+header, when present, says whether the store changed anything. The CLI relies
+on `mutation_applied=true` to resend a keyed Computer mutation and read its
+receipt, so a no-op whose post-change read expires is resent the same way. Applied
 submission changes fall back to the committed Computer and its committed
 `submit_policy_revision` if their post-change snapshot fails, and the response
 carries `projection: "committed-fallback"` so consumers can tell that fallback
