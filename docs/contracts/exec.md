@@ -312,10 +312,77 @@ internal outcome beside its stopped list:
 
 Only `incomplete` adds
 `wefty: warning: process cleanup in run storage was incomplete`.
-Existing diagnostic lines remain. All three outcomes keep the same retirement
-and asynchronous deletion behavior. This change does not retry a skipped sweep;
-the notebook and periodic re-sweep in #1534 are deferred to a separate PR.
-These internal outcomes add no wire or contract field.
+Existing diagnostic lines remain. These internal outcomes add no wire or
+contract field. A complete sweep keeps the usual retirement and asynchronous
+deletion. Version 1 can defer a skipped or incomplete sweep as described below.
+Version 2 keeps delete-and-warn for all outcomes. Its storage lives inside the
+Attempt mailbox; protecting that storage from per-run trimming, expiry, and
+budget eviction is follow-up [#1540](https://github.com/Derek-X-Wang/wefty/issues/1540).
+
+For version 1, the node agent supplies a notebook folder through
+`WEFTY_EXEC_SWEEP_NOTEBOOK`. The notebook is
+`<HandoffRoot>/.wefty-exec-sweep/<nodeID>/`. Without that setting, cleanup keeps
+its usual delete-and-warn behavior. The setting and the publishing Attempt ID
+are cleared with other `WEFTY_*` names before the user's command starts.
+
+After a skipped or incomplete sweep, the wrapper removes its recorded short
+temp link as in normal cleanup. It first writes `entry.json`
+inside a new `<id>.tmp/` folder, then renames that folder to `<id>/` in the
+notebook. The entry records the source and pending paths, the storage's device
+and inode, the publishing Attempt ID, the original storage path, the temp
+allocation path and its device and inode, and the creation time. Next, the
+wrapper writes `sweep-pending` inside the allocation. Last, it renames storage
+once, within its parent, to `.wefty-sweep-pending-<name>-<pid>`. Before writing
+the marker, and again immediately before the storage rename, the wrapper
+checks that its own `<id>/entry.json` still exists. If the entry is gone or
+any step fails, cleanup removes any marker it wrote, removes its partial
+entry, and falls back to the usual delete-and-warn.
+
+The existing result collector reads this node's notebook when it starts and
+then hourly, under the node-scoped `node-results-collection` lease. It checks
+the source first, then the pending path. A source that still has the recorded
+identity is recovered only after this node agent has a successful runtime reap
+receipt with evidence for that exact Attempt. This proves that the publishing
+wrapper has ended. The collector protects the allocation if the wrapper died
+before writing the marker, then renames source to pending. Without that proof,
+it leaves the entry alone. A node agent restart does not supply missing proof.
+
+For pending storage, the collector uses the shared process sweep and the
+node agent's derived scan bound. It checks each directory's device and inode
+before acting. A complete scan permits deletion through the verified directory
+handle. A skipped or incomplete scan keeps the entry and logs one warning for
+the next hourly retry. Storage and allocation are resolved separately. An
+absent or replaced path resolves only that part; a replacement is left alone.
+The entry is removed only after both parts are resolved, so a crash between
+the two deletions leaves enough information to finish the remaining part.
+
+An entry still unresolved after 24 hours is given up with one warning naming
+the entry. This path never scans processes or sends a signal. It removes the
+allocation's marker after checking its identity and leaves the allocation for
+`SweepTempDirs`. It deletes storage at the pending name through its verified
+handle. Storage still at the source is left for the CLI stale sweep. It then
+removes the entry. Staging folders ending in `.tmp` are removed after one hour;
+the storage rename cannot have run before publication.
+
+The publisher's entry checks and its next file operations are separate. A
+small check-then-act window remains: a publisher paused for more than 24 hours
+can resume exactly as give-up removes its entry, after a successful entry check
+but before the marker write or storage rename. It can then leave pending
+storage or a marker with no entry. This is an accepted cleanup limit. A pause
+or crash longer than 24 hours, or a same-user workload acting against its own
+cleanup, can also leave cleanup unfinished. No extra coordination is added for
+these cases.
+
+The CLI stale sweep ignores pending storage names. The shared `SweepTempDirs`
+code used by the CLI and node agent checks `sweep-pending` last, immediately
+before deletion. Before the storage rename, the existing source already keeps
+its allocation alive. A workload can forge the marker and block cleanup of
+its own abandoned allocation. This is an accepted cleanup limit; it grants no
+permission to act on another workload.
+A same-user workload can also forge or corrupt a notebook entry, or make its
+own storage or allocation unreadable, to keep or block cleanup of its own run;
+this is a cleanup limit, not a privilege.
+
 The node agent re-verifies the retained folder's device and inode inside Bash
 after entering it. A same-user workload process that renames storage during
 the sweep can still redirect it, but can already signal those processes itself, so this

@@ -83,8 +83,9 @@ type handoffManager struct {
 	// budget pass says out loud rather than silently failing to converge.
 	ociEvictor workloadrunner.RetainedHandoffEvictor
 
-	mu    sync.Mutex
-	paths map[string]*handoffPathLock
+	mu              sync.Mutex
+	paths           map[string]*handoffPathLock
+	execSweepReaped map[string]bool
 
 	// collectMu serializes collection with itself. Two sweeps racing would
 	// each select candidates the other is deleting.

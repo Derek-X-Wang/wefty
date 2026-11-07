@@ -343,3 +343,67 @@ exec_storage_temp_dir "$1" "$2"; [ -z "$tmp_dir" ]`, "bash", record, storage)
 		})
 	}
 }
+
+// The marker can appear after enumeration. Check it at the last deletion
+// boundary, even when the owner storage has already gone.
+func TestSweepTempDirsPendingMarkerLast(t *testing.T) {
+	root := t.TempDir()
+	allocation := filepath.Join(root, "wefty-run-data.pending")
+	unlockedLast := filepath.Join(allocation, "last")
+	if err := os.MkdirAll(unlockedLast, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unlockedLast, "data"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(allocation, "owner"), []byte(filepath.Join(root, "gone")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unlockedLast, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unlockedLast, 0700) })
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-2 * time.Hour)
+	if err := os.Chtimes(allocation, old, old); err != nil {
+		t.Fatal(err)
+	}
+	published := false
+	ctx := tempMarkerContext{Context: t.Context(), publish: func() {
+		info, err := os.Stat(unlockedLast)
+		if !published && err == nil && info.Mode().Perm() == 0700 {
+			if err := os.WriteFile(filepath.Join(allocation, "sweep-pending"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			published = true
+		}
+	}}
+	if err := sweepTempDirs(ctx, []string{root}, []string{root}, now); err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("walk did not reach the publication seam")
+	}
+	if _, err := os.Stat(allocation); err != nil {
+		t.Fatalf("late marker ignored: %v", err)
+	}
+	if err := os.Remove(filepath.Join(allocation, "sweep-pending")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(allocation, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := sweepTempDirs(t.Context(), []string{root}, []string{root}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(allocation); !os.IsNotExist(err) {
+		t.Fatalf("unprotected allocation remained: %v", err)
+	}
+}
+
+type tempMarkerContext struct {
+	context.Context
+	publish func()
+}
+
+func (ctx tempMarkerContext) Err() error { ctx.publish(); return ctx.Context.Err() }

@@ -25,13 +25,21 @@ func execScanDeadline(grace time.Duration) time.Duration {
 
 // Exec jobs of both versions carry their version in the immutable run params.
 func execJob(spec contract.JobSpec) bool {
+	version := execJobVersion(spec)
+	return version == 1 || version == 2
+}
+
+func execJobVersion(spec contract.JobSpec) int {
 	if spec.Kind != contract.JobKindProcess {
-		return false
+		return 0
 	}
 	var params struct {
 		Version int `json:"exec_version"`
 	}
-	return json.Unmarshal([]byte(spec.Labels[contract.LabelRunParams]), &params) == nil && (params.Version == 1 || params.Version == 2)
+	if json.Unmarshal([]byte(spec.Labels[contract.LabelRunParams]), &params) != nil {
+		return 0
+	}
+	return params.Version
 }
 
 func execScanDeadlineSeconds(deadline time.Duration) string {

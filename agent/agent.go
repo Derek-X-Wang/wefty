@@ -873,6 +873,7 @@ func (a *Agent) startResultCollector(parent context.Context) {
 	}
 	go func() {
 		defer close(a.collectorDone)
+		a.sweepExecNotebook(ctx)
 		timer := a.clock.NewTimer(resultCollectionInterval)
 		defer stopTimer(timer)
 		for {
@@ -894,6 +895,7 @@ func (a *Agent) startResultCollector(parent context.Context) {
 			if err := a.handoffs.collect(); err != nil {
 				a.log("collect retained results: %v", err)
 			}
+			a.sweepExecNotebook(ctx)
 			a.sweepExecTemp()
 			// Measuring is this goroutine's work and nobody else's. It carries
 			// the collector's context, so a shutdown interrupts a walk partway
@@ -1213,5 +1215,15 @@ func (a *Agent) RequestHeartbeat() {
 	select {
 	case a.session.heartbeatWake <- struct{}{}:
 	default:
+	}
+}
+
+func (a *Agent) sweepExecNotebook(ctx context.Context) {
+	var grace time.Duration
+	if runtime, ok := a.runtimes[contract.JobKindProcess].(interface{ TerminationGraceTime() time.Duration }); ok {
+		grace = runtime.TerminationGraceTime()
+	}
+	if err := a.handoffs.collectExecSweeps(ctx, execScanDeadline(grace)); err != nil {
+		a.log("collect exec sweep notebook: %v", err)
 	}
 }

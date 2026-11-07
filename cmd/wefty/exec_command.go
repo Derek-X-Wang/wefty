@@ -315,6 +315,11 @@ func buildExecWrapperFromTemplate(template string, capture execCapture, argv []s
 	var input strings.Builder
 	tick, ticks := execHeartbeatSchedule()
 	fmt.Fprintf(&input, "storage=%s\nfolder=%s\nheartbeat_tick=%s\nheartbeat_ticks=%d\ncommand=()\n", quote(capture.Storage), quote(capture.Folder), quote(tick), ticks)
+	if capture.Storage != "" {
+		input.WriteString("exec_sweep_notebook=${WEFTY_EXEC_SWEEP_NOTEBOOK:-}\n")
+	} else {
+		input.WriteString("exec_sweep_notebook=''\n")
+	}
 	// Scalar assignment avoids Bash 3.2 compound-array parsing of control bytes.
 	for i, arg := range argv {
 		fmt.Fprintf(&input, "command[%d]=%s\n", i, quote(arg))
