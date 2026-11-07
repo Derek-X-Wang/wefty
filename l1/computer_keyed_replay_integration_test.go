@@ -124,6 +124,73 @@ func TestComputerGrowKeyedReplayProjectsSelectedOutcome(t *testing.T) {
 	}
 }
 
+func TestComputerProjectionSamePhaseRetryDoesNotRevokeAgain(t *testing.T) {
+	for _, stage := range []string{"quiescing", "finalizing"} {
+		t.Run(stage, func(t *testing.T) {
+			h, node, computer := computerKeyedReplayHarness(t)
+			claim := startComputerAttempt(t, h, node, nil)
+			computer = mustGetComputer(t, h, computer.ComputerID)
+			var revocations []ComputerTokenRevocation
+			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+				revocations = append(revocations, request)
+				return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID,
+					ComputerAttemptID: request.ComputerAttemptID, CommittedAt: h.clock.Now()}, nil
+			}}
+			request := ComputerProjectionRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+				Spec: computerCapabilityJobSpec("computer:projection-retry:v2")}
+			client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+			path := "/v1/computers/" + computer.ComputerID + "/projections"
+			status, _, body := h.do(client, http.MethodPost, path, request)
+			var accepted Computer
+			if status != http.StatusAccepted || json.Unmarshal(body, &accepted) != nil ||
+				accepted.ReconfigurationPhase != ComputerReconfigurationProjecting || accepted.CurrentJob.State != contract.JobStopping ||
+				accepted.IntentRevision != computer.IntentRevision+1 || accepted.CurrentJobID != computer.CurrentJobID {
+				t.Fatalf("original projection: status=%d body=%s", status, body)
+			}
+			if len(revocations) != 1 || !revocations[0].RevokeAll || revocations[0].Reason != "computer_reimaged" ||
+				revocations[0].ComputerID != computer.ComputerID {
+				t.Fatalf("original projection did not revoke exactly once: %#v", revocations)
+			}
+			if stage == "finalizing" {
+				if _, err := h.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID,
+					CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "projection-quiesced",
+						Result: ProcessResult{OutputError: "quiesced"}, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt}); err != nil {
+					t.Fatal(err)
+				}
+				stopped := mustGetComputer(t, h, computer.ComputerID)
+				if stopped.CurrentJob.State != contract.JobStopped || stopped.ReconfigurationPhase != ComputerReconfigurationProjecting {
+					t.Fatalf("projection was not awaiting finalization: %#v", stopped)
+				}
+			}
+			before := owedRevocationAuditRows(t, h, computer.ComputerID)
+			calls := len(revocations)
+			status, _, body = h.do(client, http.MethodPost, path, request)
+			var result Computer
+			if status != http.StatusAccepted || json.Unmarshal(body, &result) != nil {
+				t.Fatalf("same-phase projection retry: status=%d body=%s", status, body)
+			}
+			if len(revocations) != calls {
+				t.Errorf("same-phase projection retry requested a new revocation: before=%d after=%d", calls, len(revocations))
+			}
+			if after := owedRevocationAuditRows(t, h, computer.ComputerID); !reflect.DeepEqual(after, before) {
+				t.Errorf("same-phase projection retry changed revocation records: before=%#v after=%#v", before, after)
+			}
+			if result.IntentRevision != accepted.IntentRevision {
+				t.Errorf("same-phase projection retry changed revision: got=%d want=%d", result.IntentRevision, accepted.IntentRevision)
+			}
+			if stage == "quiescing" {
+				if result.ReconfigurationPhase != ComputerReconfigurationProjecting || result.CurrentJobID != computer.CurrentJobID ||
+					result.CurrentJob.State != contract.JobStopping {
+					t.Errorf("quiescing retry changed projection: %#v", result)
+				}
+			} else if result.ReconfigurationPhase != ComputerReconfigurationStable || result.CurrentJobID == computer.CurrentJobID ||
+				result.CurrentJob.State != contract.JobQueued || result.AppliedRevision != result.IntentRevision {
+				t.Errorf("retry did not finalize projection: %#v", result)
+			}
+		})
+	}
+}
+
 func TestComputerReimageSameDigestDoesNotRevoke(t *testing.T) {
 	for _, reference := range []string{"current-reference", "new-tag"} {
 		for _, revision := range []string{"current-revision", "stale-revision"} {
