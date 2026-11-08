@@ -964,7 +964,9 @@ func (c *apiClient) resendOnBareSnapshotExpiry(ctx context.Context, method, path
 type postChangeRecovery struct {
 	// resend repeats the identical request once. Only a request whose body
 	// carries its idempotency or dispatch key may: L1 resolves that replay
-	// before any precondition and answers with the committed object.
+	// before any precondition and answers with the committed object. A run
+	// cancel carries no key but is idempotent by state: L3 and L1 answer a
+	// repeat with the first committed outcome.
 	resend bool
 	// keepReceipt marks a resend whose command reports L1's receipt. L1 wrote
 	// that receipt before the read expired, so the first answer says what this
@@ -986,6 +988,11 @@ var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
 // resendKeepingReceipt is the plan for a keyed Computer mutation whose
 // command reports L1's receipt.
 var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
+
+// resendRunCancel is the plan for a run cancel (#1558).
+func resendRunCancel(runID string) postChangeRecovery {
+	return postChangeRecovery{resend: true, hint: "run `wefty cancel " + runID + "` again to read it"}
+}
 
 // readBackWith is the plan for an unkeyed mutation with a matching GET.
 func readBackWith(path, command string) postChangeRecovery {
