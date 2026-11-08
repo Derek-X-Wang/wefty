@@ -989,7 +989,7 @@ var resendWithKey = postChangeRecovery{resend: true, hint: sameKeyHint}
 // command reports L1's receipt.
 var resendKeepingReceipt = postChangeRecovery{resend: true, keepReceipt: true, hint: sameKeyHint}
 
-// resendRunCancel is the plan for a run cancel (#1558).
+// resendRunCancel is the plan for every run cancel (#1558, #1560).
 func resendRunCancel(runID string) postChangeRecovery {
 	return postChangeRecovery{resend: true, hint: "run `wefty cancel " + runID + "` again to read it"}
 }

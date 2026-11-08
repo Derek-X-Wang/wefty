@@ -263,7 +263,7 @@ func runSetupSmoke(ctx context.Context, clients *apiClients, nodeID string) (run
 			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), statusProbeBudget)
 			defer cancel()
 			var record contract.RunRecord
-			cancelErr := clients.l3.do(cleanup, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, nil, &record, http.StatusOK)
+			_, cancelErr := clients.l3.mutate(cleanup, resendRunCancel(runID), http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, &record, http.StatusOK)
 			if cancelErr != nil {
 				result = errors.Join(result, errors.New("smoke cancellation was not confirmed"))
 			}

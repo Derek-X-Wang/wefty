@@ -39,7 +39,7 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 			return usageError("this command requires --l3, which is not configured")
 		}
 		var run contract.RunRecord
-		if err := clients.l3.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(args[0])+"/cancel", nil, nil, &run, http.StatusOK); err != nil {
+		if _, err := clients.l3.mutate(ctx, resendRunCancel(args[0]), http.MethodPost, "/v1/runs/"+url.PathEscape(args[0])+"/cancel", nil, &run, http.StatusOK); err != nil {
 			return clients.cancelIdentityHint(err)
 		}
 		if jsonOutput {
