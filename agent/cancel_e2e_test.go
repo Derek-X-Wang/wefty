@@ -142,29 +142,9 @@ func TestAgentCancelProcessEndToEnd(t *testing.T) {
 			case <-time.After(testwait.Bound):
 				t.Fatal("real agent sent no completion")
 			}
-			var uploaded l1.JobResult
-			uploadDeadline := time.Now().Add(5 * time.Second)
-			for {
-				resultRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://control-plane.invalid/v1/jobs/"+job.JobID+"/result", nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				resultResponse, err := client.Do(resultRequest)
-				if err != nil {
-					t.Fatal(err)
-				}
-				decodeErr := json.NewDecoder(resultResponse.Body).Decode(&uploaded)
-				resultResponse.Body.Close()
-				if resultResponse.StatusCode == http.StatusOK {
-					if decodeErr != nil || string(uploaded.Document) != `{"cancellation_evidence":true}` || uploaded.AttemptID != done.Attempts[0].AttemptID {
-						t.Fatalf("canceled result upload=%+v err=%v", uploaded, decodeErr)
-					}
-					break
-				}
-				if resultResponse.StatusCode != http.StatusNotFound || time.Now().After(uploadDeadline) {
-					t.Fatalf("canceled result upload=%+v status=%d err=%v", uploaded, resultResponse.StatusCode, decodeErr)
-				}
-				time.Sleep(10 * time.Millisecond)
+			uploaded, err := pollCanceledE2EResult(t, client, job.JobID, 5*time.Second)
+			if err != nil || string(uploaded.Document) != `{"cancellation_evidence":true}` || uploaded.AttemptID != done.Attempts[0].AttemptID {
+				t.Fatalf("canceled result upload=%+v err=%v", uploaded, err)
 			}
 			events, _ := pollAllE2ELogs(t, client, job.JobID, "")
 			output := joinAgentLogStream(events, contract.LogStdout)
@@ -180,5 +160,46 @@ func TestAgentCancelProcessEndToEnd(t *testing.T) {
 			follow := submitE2EJob(t, client, contract.JobSpec{SchemaVersion: 1, DispatchKey: "after-cancel", Kind: "process", Class: "one-shot", RoutingTags: []string{"linux"}, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: agentHelperPath}, Argv: []string{"processhelper", "stdout", "after cancel"}, WorkingDirectory: directory, HandoffDirectory: directory}})
 			waitForE2EJobState(t, client, follow.JobID, contract.JobSucceeded, 10*time.Second)
 		})
+	}
+}
+
+// pollCanceledE2EResult reads the uploaded result through the real L1 child,
+// which keeps the production read-snapshot limit. Until the deadline it polls
+// past 404 (not uploaded yet) and a typed retryable unavailable answer, which a
+// slow runner can get and production clients retry (#1556, #1511). Any other
+// answer is an error.
+func pollCanceledE2EResult(t *testing.T, client *http.Client, jobID string, wait time.Duration) (l1.JobResult, error) {
+	t.Helper()
+	deadline := time.Now().Add(wait)
+	for {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID+"/result", nil)
+		if err != nil {
+			return l1.JobResult{}, err
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return l1.JobResult{}, err
+		}
+		raw, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			return l1.JobResult{}, err
+		}
+		if response.StatusCode == http.StatusOK {
+			var uploaded l1.JobResult
+			err := json.Unmarshal(raw, &uploaded)
+			return uploaded, err
+		}
+		var answer struct {
+			Error struct {
+				Retryable bool `json:"retryable"`
+			} `json:"error"`
+		}
+		retryable := response.StatusCode == http.StatusNotFound ||
+			(response.StatusCode == http.StatusServiceUnavailable && json.Unmarshal(raw, &answer) == nil && answer.Error.Retryable)
+		if !retryable || time.Now().After(deadline) {
+			return l1.JobResult{}, fmt.Errorf("result status=%d body=%s", response.StatusCode, raw)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
