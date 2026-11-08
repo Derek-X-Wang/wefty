@@ -478,7 +478,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 	// setReady reports a readiness change. It returns done when the Guardian
 	// has ended: an exit observable at first readiness wins, and a failed
 	// report stops the payload.
-	setReady := func(value bool) (bool, error) {
+	setReady := func(value bool, reason string) (bool, error) {
 		if value && !startupSatisfied {
 			select {
 			case outcome := <-wait:
@@ -494,6 +494,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			}
 		}
 		ready = value
+		guardianReadinessReason(value, reason)
 		if err := writeReadiness(value); err != nil {
 			cancelInspection()
 			_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
@@ -542,7 +543,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				// Ordinary probe loss withdraws a ready service and never
 				// ends the payload.
 				if ready {
-					if done, err := setReady(false); done {
+					if done, err := setReady(false, "the readiness probe did not connect"); done {
 						return err
 					}
 				}
@@ -566,7 +567,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 					ownershipTimer, ownershipDeadline = nil, nil
 				}
 				if probeAnswering && !ready {
-					if done, err := setReady(true); done {
+					if done, err := setReady(true, "an inspection confirmed that the payload owns the listener"); done {
 						return err
 					}
 				}
@@ -587,7 +588,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				ownershipProblem = fmt.Errorf("no listener that receives %s and that this user can see belongs to the payload", start.ServiceAddress)
 			}
 			if ready {
-				if done, err := setReady(false); done {
+				if done, err := setReady(false, "ownership was not confirmed: "+ownershipProblem.Error()); done {
 					return err
 				}
 			}
