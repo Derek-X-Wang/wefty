@@ -52,6 +52,11 @@ func validateSnapshotCacheJob(name string, job snapshotCacheJob, wantBuilds int)
 	hostNetwork := false
 	fileFlag := regexp.MustCompile(`--file\s+("[^"]+"|[^\s]+)`)
 	for i, step := range job.Steps {
+		// Other caches in the job (the pinned release assets, #1567) are not
+		// the Debian snapshot cache.
+		if key, _ := step.With["key"].(string); strings.HasPrefix(step.Uses, "actions/cache/") && !strings.HasPrefix(key, "debian-snapshot-") {
+			continue
+		}
 		switch step.Uses {
 		case "actions/cache/restore@" + snapshotCacheAction:
 			restore = i

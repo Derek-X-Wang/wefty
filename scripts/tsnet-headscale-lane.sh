@@ -97,11 +97,29 @@ wait_ready() {
   die "$name not ready after 60 attempts"
 }
 
-say "downloading Headscale v$HEADSCALE_VERSION ($headscale_arch)"
-curl --fail --silent --show-error --location --retry 3 \
-  -o "$root/headscale" \
-  "https://github.com/juanfont/headscale/releases/download/v$HEADSCALE_VERSION/headscale_${HEADSCALE_VERSION}_linux_$headscale_arch"
+# HEADSCALE_CACHE_DIR, when set, keeps the verified binary between runs; CI
+# restores it with actions/cache, so a short GitHub release-download outage
+# does not fail the lane (#1567). A cached binary gets the same pinned SHA-256
+# check as a download, and only a binary that passed it is stored.
+headscale_asset=headscale_${HEADSCALE_VERSION}_linux_$headscale_arch
+headscale_cached=${HEADSCALE_CACHE_DIR:+$HEADSCALE_CACHE_DIR/$headscale_asset}
+if [ -n "$headscale_cached" ] && [ -f "$headscale_cached" ]; then
+  say "using the cached Headscale v$HEADSCALE_VERSION ($headscale_arch); no download"
+  cp "$headscale_cached" "$root/headscale"
+else
+  say "downloading Headscale v$HEADSCALE_VERSION ($headscale_arch)"
+  # The window rides out a short burst of 5xx answers from the release host;
+  # --max-time ends a stalled attempt so that it is retried.
+  curl --fail --silent --show-error --location \
+    --connect-timeout 20 --max-time 120 --retry 7 --retry-all-errors --retry-max-time 180 \
+    -o "$root/headscale" \
+    "https://github.com/juanfont/headscale/releases/download/v$HEADSCALE_VERSION/$headscale_asset"
+fi
 echo "$headscale_sha256  $root/headscale" | sha256sum --check --quiet - || die "Headscale checksum mismatch"
+if [ -n "$headscale_cached" ] && [ ! -f "$headscale_cached" ]; then
+  mkdir -p "$HEADSCALE_CACHE_DIR"
+  cp "$root/headscale" "$headscale_cached"
+fi
 chmod 700 "$root/headscale"
 "$root/headscale" version
 

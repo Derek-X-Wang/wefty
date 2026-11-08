@@ -45,7 +45,8 @@ RUN case "$TARGETARCH" in \
       arm64) mise_arch=arm64; mise_sha=bc2c447a7e498b0bed0a421cc2101b407fef09a3195670d35a4aa3f43cd868a1 ;; \
       *) exit 64 ;; \
     esac \
-    && curl --fail --location --retry 5 --output /tmp/mise \
+    # The window rides out a short burst of 5xx answers from the release host (#1567).
+    && curl --fail --location --connect-timeout 20 --max-time 120 --retry 7 --retry-all-errors --retry-max-time 180 --output /tmp/mise \
       "https://github.com/jdx/mise/releases/download/v2026.8.14/mise-v2026.8.14-linux-${mise_arch}" \
     && printf '%s  %s\n' "$mise_sha" /tmp/mise | sha256sum --check - \
     && install --mode=0755 /tmp/mise /opt/mise
