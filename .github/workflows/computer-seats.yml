@@ -22,6 +22,7 @@ on:
       - scripts/test-debian-snapshot-cache-proxy.py
       - scripts/debian_snapshot_cache_contract_test.go
       - scripts/oci-tested-versions.env
+      - scripts/fetch-oci-runtime-release.sh
       - docs/contracts/oci-helper-protocol.md
       - docs/contracts/computer-image.md
       - docs/guides/computer-images.md
@@ -152,24 +153,45 @@ jobs:
               npm install --ignore-scripts --no-audit --no-fund --save-exact playwright@1.56.1
               PLAYWRIGHT_BROWSERS_PATH=/kit/browsers ./node_modules/.bin/playwright install chromium
             '
-      - name: Prepare the pinned Linux real-time runtime
-        env:
-          ARCH: ${{ matrix.arch }}
+      - name: Read the pinned containerd and runc versions
+        id: oci-runtime-pin
         run: |
           set -euo pipefail
           source scripts/oci-tested-versions.env
           containerd_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*containerd=\([^ ]*\).*/\1/p')"
           runc_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*runc=\([^ ]*\).*/\1/p')"
-          cd "$RUNNER_TEMP"
-          curl -fLsS --retry 5 -o containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v$containerd_version/containerd-$containerd_version-linux-$ARCH.tar.gz"
-          curl -fLsS --retry 5 -o containerd.sha256 "https://github.com/containerd/containerd/releases/download/v$containerd_version/containerd-$containerd_version-linux-$ARCH.tar.gz.sha256sum"
-          sed -i "s/containerd-$containerd_version-linux-$ARCH.tar.gz/containerd.tar.gz/" containerd.sha256
-          sha256sum --check containerd.sha256
-          sudo tar -xzf containerd.tar.gz -C /usr/local
-          curl -fLsS --retry 5 -o "runc.$ARCH" "https://github.com/opencontainers/runc/releases/download/v$runc_version/runc.$ARCH"
-          curl -fLsS --retry 5 -o runc.sha256 "https://github.com/opencontainers/runc/releases/download/v$runc_version/runc.sha256sum"
-          grep " runc.$ARCH$" runc.sha256 | sha256sum --check
-          sudo install -m0755 "runc.$ARCH" /usr/local/sbin/runc
+          test -n "$containerd_version" && test -n "$runc_version"
+          printf 'containerd=%s\nrunc=%s\n' "$containerd_version" "$runc_version" >> "$GITHUB_OUTPUT"
+      # The release assets survive a short GitHub release-download outage
+      # (#1567). The fetch script checks them on every run, cached or not.
+      - name: Restore the pinned containerd and runc release assets
+        id: oci-runtime-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/oci-runtime-release
+          key: oci-runtime-release-v1-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-linux-${{ matrix.arch }}
+      - name: Fetch and verify the pinned containerd and runc release assets
+        env:
+          ARCH: ${{ matrix.arch }}
+          CONTAINERD_VERSION: ${{ steps.oci-runtime-pin.outputs.containerd }}
+          RUNC_VERSION: ${{ steps.oci-runtime-pin.outputs.runc }}
+        timeout-minutes: 10
+        run: bash scripts/fetch-oci-runtime-release.sh "$ARCH" "$CONTAINERD_VERSION" "$RUNC_VERSION" "$RUNNER_TEMP/oci-runtime-release"
+      - name: Save the verified containerd and runc release assets
+        if: steps.oci-runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/oci-runtime-release
+          key: oci-runtime-release-v1-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-linux-${{ matrix.arch }}
+      - name: Prepare the pinned Linux real-time runtime
+        env:
+          ARCH: ${{ matrix.arch }}
+          CONTAINERD_VERSION: ${{ steps.oci-runtime-pin.outputs.containerd }}
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/oci-runtime-release"
+          sudo tar -xzf "$assets/containerd-$CONTAINERD_VERSION-linux-$ARCH.tar.gz" -C /usr/local
+          sudo install -m0755 "$assets/runc.$ARCH" /usr/local/sbin/runc
           sudo apt-get update
           sudo apt-get install --yes e2fsprogs util-linux
           sudo modprobe loop
@@ -300,7 +322,15 @@ jobs:
           if-no-files-found: error
       - name: Stop the CI-owned runtime
         if: always()
-        run: sudo systemctl stop wefty-seat-containerd.service
+        run: |
+          set -euo pipefail
+          # A prepare step that failed before systemd-run leaves no unit; the
+          # failed step is then the only red one.
+          if [ "$(systemctl show --property=LoadState --value wefty-seat-containerd.service)" != loaded ]; then
+            echo "wefty-seat-containerd.service was never started; nothing to stop"
+            exit 0
+          fi
+          sudo systemctl stop wefty-seat-containerd.service
 
   publish-default-computer:
     name: publish-default-computer-index-and-archive

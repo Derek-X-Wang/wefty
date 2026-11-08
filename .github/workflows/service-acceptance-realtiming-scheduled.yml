@@ -179,6 +179,9 @@ jobs:
       WEFTY_LINUX_COMPUTER_MUTATE_ROW: ${{ inputs.mutation_row != 'none' && inputs.mutation_row || '' }}
       WAYLAND_COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-wayland-reference
       COMPUTER_VARIANT: ${{ matrix.image }}
+      # The pinned runtime of the Linux rows, read by the asset cache key too.
+      CONTAINERD_VERSION: 2.3.7
+      RUNC_VERSION: 1.5.1
     steps:
       - name: Check out trusted main history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -196,6 +199,9 @@ jobs:
             *) exit 64 ;;
           esac
           git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
+          # The selected publication can predate the release-asset fetch
+          # script (#1567); keep this workflow revision's copy.
+          install -m 0755 scripts/fetch-oci-runtime-release.sh "$RUNNER_TEMP/fetch-oci-runtime-release.sh"
           git checkout --detach "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download the triggering publication artifact
@@ -241,12 +247,28 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # The release assets survive a short GitHub release-download outage
+      # (#1567). The fetch script checks them on every run, cached or not.
+      - name: Restore the pinned containerd and runc release assets
+        id: oci-runtime-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/oci-runtime-release
+          key: oci-runtime-release-v1-containerd-${{ env.CONTAINERD_VERSION }}-runc-${{ env.RUNC_VERSION }}-linux-amd64
+      - name: Fetch and verify the pinned containerd and runc release assets
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: bash "$RUNNER_TEMP/fetch-oci-runtime-release.sh" amd64 "$CONTAINERD_VERSION" "$RUNC_VERSION" "$RUNNER_TEMP/oci-runtime-release"
+      - name: Save the verified containerd and runc release assets
+        if: runner.os == 'Linux' && steps.oci-runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/oci-runtime-release
+          key: oci-runtime-release-v1-containerd-${{ env.CONTAINERD_VERSION }}-runc-${{ env.RUNC_VERSION }}-linux-amd64
       - name: Provision pinned Linux OCI engine and probe
         if: runner.os == 'Linux'
         timeout-minutes: 10
-        env:
-          CONTAINERD_VERSION: 2.3.7
-          RUNC_VERSION: 1.5.1
         run: |
           set -euo pipefail
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update
@@ -261,15 +283,9 @@ jobs:
           fi
           sudo modprobe loop
           test -e /dev/loop-control
-          curl --fail --location --retry 5 --output containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
-          curl --fail --location --retry 5 --output containerd.sha256 "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz.sha256sum"
-          sed -i "s/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz/containerd.tar.gz/" containerd.sha256
-          sha256sum --check containerd.sha256
-          sudo tar --extract --gzip --file containerd.tar.gz --directory /usr/local
-          curl --fail --location --retry 5 --output runc.amd64 "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.amd64"
-          curl --fail --location --retry 5 --output runc.sha256sum "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.sha256sum"
-          grep ' runc.amd64$' runc.sha256sum | sha256sum --check
-          sudo install --mode=0755 runc.amd64 /usr/local/sbin/runc
+          assets="$RUNNER_TEMP/oci-runtime-release"
+          sudo tar --extract --gzip --file "$assets/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" --directory /usr/local
+          sudo install --mode=0755 "$assets/runc.amd64" /usr/local/sbin/runc
           sudo modprobe overlay
           grep -qw overlay /proc/filesystems
           sudo install --directory --mode=0700 /var/lib/wefty-containerd /run/wefty-containerd /var/lib/wefty/oci
