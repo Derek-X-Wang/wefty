@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -392,6 +394,7 @@ func TestGuardianWithdrawsATakeoverWithinTheBoundWhenInspectionsAreSlow(t *testi
 		serviceListenerInspector, serviceOwnershipRecheckInterval, serviceListenerInspectTimeout = priorInspector, priorInterval, priorTimeout
 	})
 
+	reasons := recordReadinessReasons(t)
 	address := releasedServiceAddress(t)
 	guardian := runInProcessServiceGuardian(t, "listen-reuseport", address, 30*time.Second)
 	guardian.expectReadiness(t, true)
@@ -404,16 +407,20 @@ func TestGuardianWithdrawsATakeoverWithinTheBoundWhenInspectionsAreSlow(t *testi
 	foreign := listenReusePort(t, address)
 	defer foreign.Close()
 	taken := time.Now()
-	guardian.expectReadiness(t, false)
+	status := guardian.next(t)
 	elapsed := time.Since(taken)
+	if status.Type != guardianMessageReadiness || status.Ready == nil || *status.Ready {
+		t.Fatalf("status = %#v, want readiness false\n%s", status, reasons(taken))
+	}
 	t.Logf("takeover withdrawn after %s", elapsed)
 	if bound := interval + timeout + probeCycle; elapsed > bound+scheduling {
-		t.Fatalf("takeover withdrawn after %s, want within %s", elapsed, bound)
+		t.Fatalf("takeover withdrawn after %s, want within %s\n%s", elapsed, bound, reasons(taken))
 	}
 	// The slow inspections were on the path: the nominal bound (interval,
-	// probe cycle, a quick inspection) would be about 1.1 s here.
+	// probe cycle, a quick inspection) would be about 1.1 s here. An earlier
+	// withdrawal had another cause, which the reasons name (#1564).
 	if elapsed < interval+timeout/2 {
-		t.Fatalf("takeover withdrawn after %s; the slow inspections were not exercised", elapsed)
+		t.Fatalf("takeover withdrawn after %s; the slow inspections were not exercised\n%s", elapsed, reasons(taken))
 	}
 	guardian.stopWithin(t, 5*time.Second)
 }
@@ -469,6 +476,51 @@ type inProcessGuardian struct {
 	encoder  *json.Encoder
 }
 
+// recordReadinessReasons records why the in-process Guardian reports each
+// readiness change (#1564). The returned func lists them with their time
+// relative to since. A test that fails before it lists them, for example on
+// a status timeout, gets them in its log. Call it before
+// runInProcessServiceGuardian, so the Guardian has stopped before the seam
+// is restored.
+func recordReadinessReasons(t *testing.T) func(since time.Time) string {
+	t.Helper()
+	type change struct {
+		at     time.Time
+		ready  bool
+		reason string
+	}
+	var (
+		mu      sync.Mutex
+		changes []change
+		listed  bool
+	)
+	prior := guardianReadinessReason
+	guardianReadinessReason = func(ready bool, reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		changes = append(changes, change{at: time.Now(), ready: ready, reason: reason})
+	}
+	installed := time.Now()
+	list := func(since time.Time, from string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		listed = true
+		var lines strings.Builder
+		fmt.Fprintf(&lines, "readiness changes the Guardian reported (time relative to %s):", from)
+		for _, c := range changes {
+			fmt.Fprintf(&lines, "\n  %v ready=%t: %s", c.at.Sub(since), c.ready, c.reason)
+		}
+		return lines.String()
+	}
+	t.Cleanup(func() {
+		if t.Failed() && !listed {
+			t.Log(list(installed, "the start of the test"))
+		}
+		guardianReadinessReason = prior
+	})
+	return func(since time.Time) string { return list(since, "the takeover") }
+}
+
 // runInProcessServiceGuardian serves a Guardian in this process for a
 // helper payload in mode that owns address, and returns it after Started.
 func runInProcessServiceGuardian(t *testing.T, mode, address string, startupDeadline time.Duration) inProcessGuardian {
@@ -506,6 +558,11 @@ func runInProcessServiceGuardian(t *testing.T, mode, address string, startupDead
 		}
 	}()
 	t.Cleanup(func() {
+		// A test that failed early leaves a healthy Guardian, and the close
+		// alone does not end it while the status reader is blocked on the
+		// endpoint. Stop it, so the failure is reported (#1564). A Guardian
+		// that has already ended never reads this.
+		_ = encoder.Encode(guardianControlMessage{Type: guardianMessageStop})
 		_ = agentEndpoint.Close()
 		if err := <-done; err != nil {
 			t.Errorf("serveGuardian() error = %v", err)

@@ -59,6 +59,11 @@ var serviceOwnershipRecheckInterval = 10 * time.Second
 // tests, which replace it to inject inspection failures.
 var serviceListenerInspector = inspectServiceListeners
 
+// guardianReadinessReason is a no-op outside in-process tests, which replace
+// it to learn why the Guardian reports each readiness change (#1564). The
+// readiness message itself carries no reason.
+var guardianReadinessReason = func(ready bool, reason string) {}
+
 // serviceBackend is the loopback address the agent dials for a process
 // service.
 type serviceBackend struct {
