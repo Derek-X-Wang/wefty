@@ -2123,36 +2123,33 @@ func runComputerCLIWithIdentity[T any](t *testing.T, harness *acceptanceHarness,
 
 func runComputerCLIWithIdentityObserved[T any](t *testing.T, harness *acceptanceHarness, userID, deviceID string, observe func(computerCLIEvidence), arguments ...string) T {
 	t.Helper()
-	attempt := retryCommittedComputerMutation(t.Logf, arguments, func() computerCLIAttempt {
-		ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
-		defer cancel()
-		command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID, arguments...)...)
-		var stdout, stderr bytes.Buffer
-		command.Stdout = &stdout
-		command.Stderr = &stderr
-		err := command.Run()
-		if observe != nil {
-			exitCode := 0
-			if err != nil {
-				exitCode = -1
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					exitCode = exitErr.ExitCode()
-				}
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, weftyBinaryPath, computerCLIArguments(harness, userID, deviceID, arguments...)...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if observe != nil {
+		exitCode := 0
+		if err != nil {
+			exitCode = -1
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
 			}
-			observe(computerCLIEvidence{Arguments: append([]string(nil), arguments...), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode})
 		}
-		return computerCLIAttempt{stdout: stdout.String(), stderr: stderr.String(), err: err}
-	})
-	if attempt.err != nil {
-		t.Fatalf("run Computer CLI %v: %v\nstdout:\n%s\nstderr:\n%s", arguments, attempt.err, attempt.stdout, attempt.stderr)
+		observe(computerCLIEvidence{Arguments: append([]string(nil), arguments...), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode})
 	}
-	if attempt.stderr != "" {
-		t.Fatalf("run Computer CLI %v emitted unexpected stderr:\n%s", arguments, attempt.stderr)
+	if err != nil {
+		t.Fatalf("run Computer CLI %v: %v\nstdout:\n%s\nstderr:\n%s", arguments, err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("run Computer CLI %v emitted unexpected stderr:\n%s", arguments, stderr.String())
 	}
 	var result T
-	if err := json.Unmarshal([]byte(attempt.stdout), &result); err != nil {
-		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, attempt.stdout)
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode Computer CLI %v: %v\n%s", arguments, err, stdout.String())
 	}
 	return result
 }
