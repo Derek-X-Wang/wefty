@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -818,6 +819,59 @@ func TestTestedRuntimeVersionsMatchRealtimeWorkflowPins(t *testing.T) {
 		for _, pin := range []string{"CONTAINERD_VERSION: " + TestedContainerdVersion, "RUNC_VERSION: " + TestedRuncVersion} {
 			if !bytes.Contains(payload, []byte(pin)) {
 				t.Fatalf("tested runtime constant drifted from %s pin %q", workflow, pin)
+			}
+		}
+	}
+}
+
+// TestCIRuntimeReleaseChecksumsMatchTestedVersions keeps the in-repo SHA-256
+// pins that CI checks containerd and runc against (#1569) in step with the
+// tested versions. Each key names its version, so a version bump without a
+// new checksum fails here; the realtiming workflows' amd64 pins must equal
+// the shared values.
+func TestCIRuntimeReleaseChecksumsMatchTestedVersions(t *testing.T) {
+	versionsPayload, err := os.ReadFile(filepath.Join("..", "..", "scripts", "oci-tested-versions.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "WEFTY_OCI_CI_RELEASE_SHA256='"
+	var entries string
+	for _, line := range strings.Split(string(versionsPayload), "\n") {
+		if rest, ok := strings.CutPrefix(line, prefix); ok {
+			entries = strings.TrimSuffix(rest, "'")
+		}
+	}
+	pins := map[string]string{}
+	for _, entry := range strings.Fields(entries) {
+		key, sum, ok := strings.Cut(entry, "=")
+		if !ok || len(sum) != 64 || strings.Trim(sum, "0123456789abcdef") != "" {
+			t.Fatalf("malformed CI release SHA-256 entry %q", entry)
+		}
+		pins[key] = sum
+	}
+	var want []string
+	for _, arch := range []string{"amd64", "arm64"} {
+		want = append(want, "containerd-"+TestedContainerdVersion+"-linux-"+arch, "runc-"+TestedRuncVersion+"-linux-"+arch)
+	}
+	for _, key := range want {
+		if pins[key] == "" {
+			t.Fatalf("scripts/oci-tested-versions.env has no CI release SHA-256 for %s: a tested-version bump needs its checksum", key)
+		}
+	}
+	if len(pins) != len(want) {
+		t.Fatalf("CI release SHA-256 entries %v; want exactly %v (drop pins for versions no longer tested)", slices.Sorted(maps.Keys(pins)), want)
+	}
+	for _, workflow := range []string{"service-acceptance-realtiming.yml", "service-acceptance-realtiming-scheduled.yml"} {
+		payload, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", workflow))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pin := range []string{
+			"CONTAINERD_SHA256_LINUX_AMD64: " + pins["containerd-"+TestedContainerdVersion+"-linux-amd64"] + "\n",
+			"RUNC_SHA256_LINUX_AMD64: " + pins["runc-"+TestedRuncVersion+"-linux-amd64"] + "\n",
+		} {
+			if !bytes.Contains(payload, []byte(pin)) {
+				t.Fatalf("CI release SHA-256 drifted from %s: missing %q", workflow, strings.TrimSpace(pin))
 			}
 		}
 	}

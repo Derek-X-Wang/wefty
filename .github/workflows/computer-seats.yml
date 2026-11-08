@@ -153,36 +153,52 @@ jobs:
               npm install --ignore-scripts --no-audit --no-fund --save-exact playwright@1.56.1
               PLAYWRIGHT_BROWSERS_PATH=/kit/browsers ./node_modules/.bin/playwright install chromium
             '
-      - name: Read the pinned containerd and runc versions
+      - name: Read the pinned containerd and runc versions and SHA-256
         id: oci-runtime-pin
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           source scripts/oci-tested-versions.env
           containerd_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*containerd=\([^ ]*\).*/\1/p')"
           runc_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*runc=\([^ ]*\).*/\1/p')"
           test -n "$containerd_version" && test -n "$runc_version"
-          printf 'containerd=%s\nrunc=%s\n' "$containerd_version" "$runc_version" >> "$GITHUB_OUTPUT"
+          pinned_sha256() {
+            local entry
+            for entry in $WEFTY_OCI_CI_RELEASE_SHA256; do
+              if [ "${entry%%=*}" = "$1" ]; then printf '%s' "${entry#*=}"; return 0; fi
+            done
+            printf '::error::scripts/oci-tested-versions.env has no SHA-256 for %s\n' "$1" >&2
+            return 1
+          }
+          containerd_sha256="$(pinned_sha256 "containerd-$containerd_version-linux-$ARCH")"
+          runc_sha256="$(pinned_sha256 "runc-$runc_version-linux-$ARCH")"
+          printf 'containerd=%s\nrunc=%s\ncontainerd-sha256=%s\nrunc-sha256=%s\n' \
+            "$containerd_version" "$runc_version" "$containerd_sha256" "$runc_sha256" >> "$GITHUB_OUTPUT"
       # The release assets survive a short GitHub release-download outage
-      # (#1567). The fetch script checks them on every run, cached or not.
+      # (#1567). The fetch script checks them against the in-repo SHA-256 on
+      # every run, cached or not (#1569).
       - name: Restore the pinned containerd and runc release assets
         id: oci-runtime-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/oci-runtime-release
-          key: oci-runtime-release-v1-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-linux-${{ matrix.arch }}
+          key: oci-runtime-release-v2-linux-${{ matrix.arch }}-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-${{ steps.oci-runtime-pin.outputs.containerd-sha256 }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-${{ steps.oci-runtime-pin.outputs.runc-sha256 }}
       - name: Fetch and verify the pinned containerd and runc release assets
         env:
           ARCH: ${{ matrix.arch }}
           CONTAINERD_VERSION: ${{ steps.oci-runtime-pin.outputs.containerd }}
+          CONTAINERD_SHA256: ${{ steps.oci-runtime-pin.outputs.containerd-sha256 }}
           RUNC_VERSION: ${{ steps.oci-runtime-pin.outputs.runc }}
+          RUNC_SHA256: ${{ steps.oci-runtime-pin.outputs.runc-sha256 }}
         timeout-minutes: 10
-        run: bash scripts/fetch-oci-runtime-release.sh "$ARCH" "$CONTAINERD_VERSION" "$RUNC_VERSION" "$RUNNER_TEMP/oci-runtime-release"
+        run: bash scripts/fetch-oci-runtime-release.sh "$ARCH" "$CONTAINERD_VERSION" "$CONTAINERD_SHA256" "$RUNC_VERSION" "$RUNC_SHA256" "$RUNNER_TEMP/oci-runtime-release"
       - name: Save the verified containerd and runc release assets
         if: steps.oci-runtime-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/oci-runtime-release
-          key: oci-runtime-release-v1-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-linux-${{ matrix.arch }}
+          key: oci-runtime-release-v2-linux-${{ matrix.arch }}-containerd-${{ steps.oci-runtime-pin.outputs.containerd }}-${{ steps.oci-runtime-pin.outputs.containerd-sha256 }}-runc-${{ steps.oci-runtime-pin.outputs.runc }}-${{ steps.oci-runtime-pin.outputs.runc-sha256 }}
       - name: Prepare the pinned Linux real-time runtime
         env:
           ARCH: ${{ matrix.arch }}
