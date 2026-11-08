@@ -449,7 +449,9 @@ func cancelExecRun(clients *apiClients, runID, storage string, cause error, stde
 	ctx, stop := context.WithTimeout(context.Background(), execCancelSettlementBudget)
 	defer stop()
 	var record contract.RunRecord
-	err := clients.l3.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, nil, &record, http.StatusOK)
+	// A run cancel that committed but whose post-change read expired is
+	// resent once (#1558): L3 and L1 answer a repeat with the cancelled run.
+	_, err := clients.l3.mutate(ctx, resendRunCancel(runID), http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, &record, http.StatusOK)
 	if err != nil {
 		if retained != "" {
 			fmt.Fprintf(stderr, "wefty: snapshot retained at %s\n", retained)
