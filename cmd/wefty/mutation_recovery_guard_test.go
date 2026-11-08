@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,72 +12,112 @@ import (
 	"testing"
 )
 
-// unrecoveredMutationAllowlist names each production function that sends an
-// L1 or L3 mutation without mutate (#1563). Every other mutation goes through
-// mutate, so a committed change whose post-change read expired (#1511) takes
-// its one bounded recovery step. L1 writes that answer only from
-// writeChangedJob and appliedResourceReadError, and none of the handlers
-// below reaches either; L3 passes it on only for a run cancel.
+// unrecoveredMutationAllowlist names each production call that sends an L1
+// or L3 mutation without mutate (#1563), keyed "file:function sender method
+// path" as written in the source. Every other mutation goes through mutate,
+// so a committed change whose post-change read expired (#1511) takes its one
+// bounded recovery step. L1 writes that answer only from writeChangedJob and
+// appliedResourceReadError, and none of the handlers below reaches either;
+// L3 passes it on only for a run cancel. Each key must match exactly one call,
+// so a new or changed call in an allowlisted function is reviewed again. The
+// guard covers the three apiClient senders that skip mutate; raw streaming
+// requests (Seat copy, exec capture upload, Seat sync) are outside it.
 var unrecoveredMutationAllowlist = map[string]struct{ route, reason string }{
-	"client.go:bootstrapAdmin": {"POST /v1/admin-bootstrap", "L1 bootstrapAdmin never sends mutation_applied"},
-	"client.go:mutateAdmin":    {"PUT|DELETE /v1/admin-policy/admins/{user_id}", "L1 addAdmin and removeAdmin never send mutation_applied"},
-	"client.go:mutateComputerGrant": {"PUT /v1/computers/{computer_id}/grants/{user_id}",
+	`client.go:bootstrapAdmin do http.MethodPost "/v1/admin-bootstrap"`: {"POST /v1/admin-bootstrap",
+		"L1 bootstrapAdmin never sends mutation_applied"},
+	"client.go:mutateAdmin do method path": {"PUT|DELETE /v1/admin-policy/admins/{user_id}",
+		"L1 addAdmin and removeAdmin never send mutation_applied"},
+	"client.go:mutateComputerGrant resendOnBareSnapshotExpiry http.MethodPut path": {"PUT /v1/computers/{computer_id}/grants/{user_id}",
 		"L1 mutateComputerGrant never sends mutation_applied; a bare snapshot expiry resends the same key"},
-	"client.go:setNodeClaims": {"POST /v1/nodes/{node_id}/claims", "L1 setNodeClaims never sends mutation_applied"},
-	"client.go:interruptRestartableAttempt": {"POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt",
+	"client.go:setNodeClaims do http.MethodPost path": {"POST /v1/nodes/{node_id}/claims",
+		"L1 setNodeClaims never sends mutation_applied"},
+	"client.go:interruptRestartableAttempt do http.MethodPost path": {"POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt",
 		"L1 interruptRestartableAttempt never sends mutation_applied"},
-	"client.go:drainNode": {"POST /v1/nodes/{node_id}/drain", "L1 operatorDrainNode never sends mutation_applied"},
-	"client.go:submitRun": {"POST /v1/runs (L3)",
+	`client.go:drainNode do http.MethodPost "/v1/nodes/" + url.PathEscape(nodeID) + "/drain"`: {"POST /v1/nodes/{node_id}/drain",
+		"L1 operatorDrainNode never sends mutation_applied"},
+	`client.go:submitRun doWithResponse http.MethodPost "/v1/runs"`: {"POST /v1/runs (L3)",
 		"L3 stores the keyed Run and dispatches it to L1 later, so no L1 post-change answer reaches this call"},
-	"client.go:rerun": {"POST /v1/runs/{run_id}/rerun (L3)",
+	"client.go:rerun doWithResponse http.MethodPost path": {"POST /v1/runs/{run_id}/rerun (L3)",
 		"L3 stores the keyed Run and dispatches it to L1 later, so no L1 post-change answer reaches this call"},
-	"client.go:pruneComputerBackup": {"POST /v1/computers/{computer_id}/backups/{backup_id}/prune",
+	"client.go:pruneComputerBackup doWithResponse http.MethodPost path": {"POST /v1/computers/{computer_id}/backups/{backup_id}/prune",
 		"L1 pruneComputerBackup never sends mutation_applied"},
-	"client.go:exportComputerBackup": {"POST /v1/computers/{computer_id}/backups/{backup_id}/export",
+	"client.go:exportComputerBackup doWithResponse http.MethodPost path": {"POST /v1/computers/{computer_id}/backups/{backup_id}/export",
 		"L1 exportComputerBackup never sends mutation_applied"},
-	"client.go:importComputerCustody": {"POST /v1/custody-exports/{export_id}/import",
+	"client.go:importComputerCustody doWithResponse http.MethodPost path": {"POST /v1/custody-exports/{export_id}/import",
 		"L1 importComputerCustody never sends mutation_applied"},
-	"client.go:mutateComputerSubmission": {"PUT /v1/computers/{computer_id}/submission",
+	"client.go:mutateComputerSubmission doWithResponse http.MethodPut path": {"PUT /v1/computers/{computer_id}/submission",
 		"L1 mutateComputerSubmission never sends mutation_applied"},
-	"cp.go:reportCopyOutcome": {"POST /v1/seats/{seat_id}/copy-outcome", "L1 reportSeatCopyOutcome never sends mutation_applied"},
-	"seat_logs_command.go:executeSeatLogs": {"POST /v1/seats/{seat_id}/logs/read",
+	`cp.go:reportCopyOutcome do http.MethodPost "/v1/seats/" + id + "/copy-outcome"`: {"POST /v1/seats/{seat_id}/copy-outcome",
+		"L1 reportSeatCopyOutcome never sends mutation_applied"},
+	`seat_logs_command.go:executeSeatLogs do http.MethodPost path + "/read"`: {"POST /v1/seats/{seat_id}/logs/read",
 		"L1 markSeatLogRead never sends mutation_applied"},
-	"seat_release_command.go:executeSeatRelease": {"POST /v1/seats/{seat_id}/release",
-		"L1 releaseSeat never sends mutation_applied; a bare snapshot expiry resends the release"},
-	"seat_request_command.go:executeSeatRequest": {"POST /v1/seat-requests", "L1 createSeatCall never sends mutation_applied"},
-	"seat_request_command.go:waitSeatCall":       {"POST /v1/seat-requests", "L1 createSeatCall never sends mutation_applied"},
-	"seat_window_command.go:executeSeat": {"POST /v1/seat-approval-windows/close",
+	`seat_release_command.go:executeSeatRelease resendOnBareSnapshotExpiry http.MethodPost "/v1/seats/" + id + "/release"`: {
+		"POST /v1/seats/{seat_id}/release", "L1 releaseSeat never sends mutation_applied; a bare snapshot expiry resends the release"},
+	`seat_request_command.go:executeSeatRequest do http.MethodPost "/v1/seat-requests"`: {"POST /v1/seat-requests",
+		"L1 createSeatCall never sends mutation_applied"},
+	`seat_request_command.go:waitSeatCall do http.MethodPost "/v1/seat-requests"`: {"POST /v1/seat-requests",
+		"L1 createSeatCall never sends mutation_applied"},
+	`seat_window_command.go:executeSeat do http.MethodPost "/v1/seat-approval-windows/close"`: {"POST /v1/seat-approval-windows/close",
 		"L1 closeSeatApprovalWindows never sends mutation_applied"},
 }
 
-// unrecoveredMutations lists, by "file:function", every call that sends a
-// non-GET request through the apiClient senders that skip mutate. The
-// senders' own bodies are the implementation, not call sites.
+// mutationSenders are the apiClient methods that send a request without
+// mutate's recovery step.
+var mutationSenders = map[string]bool{"do": true, "doWithResponse": true, "resendOnBareSnapshotExpiry": true}
+
+// mutationTransport is the implementation itself: these apiClient methods in
+// client.go call the senders with the caller's method by design.
+var mutationTransport = map[string]bool{"do": true, "doWithResponse": true, "resendOnBareSnapshotExpiry": true, "mutate": true}
+
+// unrecoveredMutations lists every non-GET call of a sender, keyed as the
+// allowlist is, and every sender taken as a method value, which the guard
+// cannot follow. Package-level function literals count under their variable.
 func unrecoveredMutations(fset *token.FileSet, files map[string]*ast.File) map[string][]token.Position {
-	senders := map[string]bool{"do": true, "doWithResponse": true, "resendOnBareSnapshotExpiry": true}
 	found := map[string][]token.Position{}
 	for name, file := range files {
 		for _, declaration := range file.Decls {
-			fn, ok := declaration.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || isAPIClientMethod(fn) {
-				continue
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				if declaration.Body != nil && !(name == "client.go" && isAPIClientMethod(declaration) && mutationTransport[declaration.Name.Name]) {
+					inspectMutations(fset, name+":"+declaration.Name.Name, declaration.Body, found)
+				}
+			case *ast.GenDecl:
+				for _, spec := range declaration.Specs {
+					if value, ok := spec.(*ast.ValueSpec); ok && len(value.Names) > 0 {
+						for _, expr := range value.Values {
+							inspectMutations(fset, name+":"+value.Names[0].Name, expr, found)
+						}
+					}
+				}
 			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok || len(call.Args) < 2 {
-					return true
-				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || !senders[selector.Sel.Name] || isMethodGet(call.Args[1]) {
-					return true
-				}
-				key := name + ":" + fn.Name.Name
-				found[key] = append(found[key], fset.Position(call.Pos()))
-				return true
-			})
 		}
 	}
 	return found
+}
+
+func inspectMutations(fset *token.FileSet, owner string, root ast.Node, found map[string][]token.Position) {
+	called := map[*ast.SelectorExpr]bool{}
+	ast.Inspect(root, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.CallExpr:
+			selector, ok := node.Fun.(*ast.SelectorExpr)
+			if !ok || !mutationSenders[selector.Sel.Name] {
+				return true
+			}
+			called[selector] = true
+			if len(node.Args) < 3 || isMethodGet(node.Args[1]) {
+				return true
+			}
+			key := owner + " " + selector.Sel.Name + " " + types.ExprString(node.Args[1]) + " " + types.ExprString(node.Args[2])
+			found[key] = append(found[key], fset.Position(node.Pos()))
+		case *ast.SelectorExpr:
+			if mutationSenders[node.Sel.Name] && !called[node] {
+				key := owner + " " + node.Sel.Name + " (method value)"
+				found[key] = append(found[key], fset.Position(node.Pos()))
+			}
+		}
+		return true
+	})
 }
 
 func isAPIClientMethod(fn *ast.FuncDecl) bool {
@@ -92,12 +133,8 @@ func isAPIClientMethod(fn *ast.FuncDecl) bool {
 }
 
 func isMethodGet(expr ast.Expr) bool {
-	selector, ok := expr.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	pkg, ok := selector.X.(*ast.Ident)
-	return ok && pkg.Name == "http" && selector.Sel.Name == "MethodGet"
+	text := types.ExprString(expr)
+	return text == "http.MethodGet" || text == `"GET"`
 }
 
 // TestEveryCLIMutationTakesTheCommittedReadRecoveryStep fails when a CLI
@@ -143,6 +180,8 @@ func TestEveryCLIMutationTakesTheCommittedReadRecoveryStep(t *testing.T) {
 		if _, ok := unrecoveredMutationAllowlist[key]; !ok {
 			t.Errorf("%s sends a mutation without mutate at %v: send it through mutate with its postChangeRecovery plan, "+
 				"or add it to unrecoveredMutationAllowlist with its route and why no recovery is needed", key, found[key])
+		} else if len(found[key]) != 1 {
+			t.Errorf("allowlist entry %s matches %d calls at %v; each entry covers exactly one call", key, len(found[key]), found[key])
 		}
 	}
 	for key, entry := range unrecoveredMutationAllowlist {
@@ -155,8 +194,8 @@ func TestEveryCLIMutationTakesTheCommittedReadRecoveryStep(t *testing.T) {
 	}
 }
 
-// The guard reports a new plain mutation, and passes mutate, a GET and the
-// senders' own bodies.
+// The guard reports each way a new mutation can skip mutate, and passes
+// mutate, a GET and the transport's own bodies.
 func TestUnrecoveredMutationsFindsAPlainMutation(t *testing.T) {
 	t.Parallel()
 
@@ -164,6 +203,10 @@ func TestUnrecoveredMutationsFindsAPlainMutation(t *testing.T) {
 
 func (c *apiClient) do(ctx context.Context, method, path string) error {
 	return c.doWithResponse(ctx, method, path)
+}
+
+func (c *apiClient) cancelThing(ctx context.Context) error {
+	return c.do(ctx, http.MethodPost, "/v1/things/cancel")
 }
 
 func (c *apiClients) newMutation(ctx context.Context) error {
@@ -175,27 +218,46 @@ func (c *apiClients) newVariableMethod(ctx context.Context, method string) error
 	return err
 }
 
+func (c *apiClients) newMethodValue(ctx context.Context) error {
+	send := c.l1.do
+	return send(ctx, http.MethodPost, "/v1/hidden")
+}
+
+var registeredCommand = func(ctx context.Context, c *apiClients) error {
+	return c.l1.do(ctx, http.MethodDelete, "/v1/registered")
+}
+
 func (c *apiClients) guarded(ctx context.Context) error {
 	_, err := c.l1.mutate(ctx, resendWithKey, http.MethodPost, "/v1/jobs")
 	return err
 }
 
 func (c *apiClients) read(ctx context.Context) error {
+	if err := c.l1.do(ctx, "GET", "/v1/jobs"); err != nil {
+		return err
+	}
 	return c.l1.do(ctx, http.MethodGet, "/v1/jobs")
 }
 `
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "new.go", source, 0)
+	file, err := parser.ParseFile(fset, "client.go", source, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := unrecoveredMutations(fset, map[string]*ast.File{"new.go": file})
+	found := unrecoveredMutations(fset, map[string]*ast.File{"client.go": file})
 	keys := make([]string, 0, len(found))
 	for key := range found {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	if got := strings.Join(keys, ","); got != "new.go:newMutation,new.go:newVariableMethod" {
-		t.Fatalf("unrecovered mutations = %s", got)
+	want := []string{
+		`client.go:cancelThing do http.MethodPost "/v1/things/cancel"`,
+		"client.go:newMethodValue do (method value)",
+		`client.go:newMutation do http.MethodPost "/v1/new"`,
+		`client.go:newVariableMethod doWithResponse method "/v1/other"`,
+		`client.go:registeredCommand do http.MethodDelete "/v1/registered"`,
+	}
+	if got := strings.Join(keys, "\n"); got != strings.Join(want, "\n") {
+		t.Fatalf("unrecovered mutations:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
 }
