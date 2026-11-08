@@ -158,8 +158,9 @@ so reload failure cannot undo the evidence. A failed attestation reload returns
 503 `unavailable`, `reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
 `export_id`, and `read_reason`; only snapshot availability failures are retryable.
 
-Keyed Computer Backup create, restore, clone, grow, restart, storage reset,
-reimage and Custody deletion attestation set `Mutation-Applied` and, for replay,
+Keyed Computer create, Backup create, restore, clone, grow, reconfiguration
+abort, restart, storage reset, reimage and Custody deletion attestation set
+`Mutation-Applied` and, for replay,
 `Idempotent-Replay: true` before any post-change read, including the
 owed-revocation read that restart, storage reset and reimage make before calling
 L3 (#1552). A first application reports
@@ -167,8 +168,12 @@ L3 (#1552). A first application reports
 A same-digest reimage no-op reports `Mutation-Applied: false`: it changes nothing
 and stores no key, so an identical resend hits the same no-op while the
 Computer still runs that digest.
-The CLI resends each of these mutations at most once after a retryable
-post-change failure. It keeps the first response's receipt and the resend's
+Desired-state and removal also set `Mutation-Applied` on success, true when the
+intent revision advanced, but only after their owed-revocation read: the CLI
+recovers them by reading the Computer back, not by a resend. The L1 client
+OpenAPI declares the header on every success response of these routes (#1554).
+The CLI resends each of the keyed mutations listed above at most once after a
+retryable post-change failure. It keeps the first response's receipt and the resend's
 operation selection. Resize `--wait` follows that selected grow revision even
 when a later intent has advanced. If the resend fails, exit 13 and the existing
 applied-change message remain unchanged.
