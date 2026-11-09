@@ -504,9 +504,27 @@ func (h *seatComputer) exec(user string, args ...string) string {
 	h.t.Helper()
 	out, err := h.command(user, args...).CombinedOutput()
 	if err != nil {
-		h.t.Fatalf("Seat command %q: %v: %s", args, err, out)
+		h.t.Fatalf("Seat command %q: %v: %s\n%s", args, err, out, h.failureDiagnostics())
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// failureDiagnostics is best effort. Exit 137 alone cannot tell a memory-limit
+// kill from a Seat stop (#1507). The cumulative cgroup OOM counters and the
+// Computer task state help tell them apart; the retained Computer log holds
+// any Seat stop answer.
+func (h *seatComputer) failureDiagnostics() string {
+	report := seatCgroupMemoryReport(h.cgroup)
+	if h.task == nil {
+		return report + "; Computer task: not started"
+	}
+	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ocihelper.ContainerdNamespace), 5*time.Second)
+	defer cancel()
+	status, err := h.task.Status(ctx)
+	if err != nil {
+		return fmt.Sprintf("%s; Computer task status unavailable (%v)", report, err)
+	}
+	return fmt.Sprintf("%s; Computer task: %s exit=%d", report, status.Status, status.ExitStatus)
 }
 func (h *seatComputer) tryExec(user string, args ...string) error {
 	return h.command(user, args...).Run()
