@@ -494,7 +494,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	assertFileContains(t, "../examples/computer/oracle.html", `data-wefty-input-oracle="v1"`, "events=0 bytes=0 hash=00000000")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", "XQueryPointer", "input-oracle.json", "os.replace")
 	assertFileContains(t, "../examples/computer/pointer-oracle.py", `os.environ["WEFTY_COMPUTER_VIEW_PORT"]`)
-	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "wev=", "mise-v2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
+	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "snapshot.debian.org/archive/debian/20260827T000000Z", "wayvnc=0.9.1-1", "sway=1.10.1-2", "wev=", "ARG MISE_VERSION=2026.8.14", "wefty-verify-licenses", "ldconfig -p", "/usr/local/lib/libneatvnc.so.0", "non-dpkg-components.tsv", "mise-MIT.txt", "wefty-Apache-2.0.txt", "rm -f \"/usr/lib/$multiarch/libneatvnc.so\"*")
 	assertFileNotContains(t, "../examples/computer-wayland/Dockerfile", "LD_LIBRARY_PATH", "ADD --chmod")
 	waylandDockerfile, err := os.ReadFile("../examples/computer-wayland/Dockerfile")
 	if err != nil {

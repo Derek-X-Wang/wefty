@@ -6,10 +6,23 @@ ARG DEBIAN_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a202449
 ARG SOURCE_DATE_EPOCH=0
 # apt retries a snapshot.debian.org 503 3 times by default (7 s of backoff);
 # 10 retries add about 3 minutes of backoff, plus request time (#1100).
+# The pinned mise release. scripts/fetch-mise-release.sh reads these lines.
+ARG MISE_VERSION=2026.8.14
+ARG MISE_SHA256_AMD64=7cd12d6002d5b3c83a89cad79023712faf2a36f9e8b2ee2061dac5135b3de0ed
+ARG MISE_SHA256_ARM64=bc2c447a7e498b0bed0a421cc2101b407fef09a3195670d35a4aa3f43cd868a1
+
+# Empty by default, so the build downloads mise itself. CI replaces this stage
+# with a cached copy (--build-context mise-release=DIR, DIR/mise) so that a
+# release-host outage does not fail the build (#1575). Either way, the build
+# checks the binary against the pinned SHA-256 above.
+FROM scratch AS mise-release
 
 FROM ${DEBIAN_IMAGE} AS neatvnc-build
 ARG SOURCE_DATE_EPOCH
 ARG TARGETARCH
+ARG MISE_VERSION
+ARG MISE_SHA256_AMD64
+ARG MISE_SHA256_ARM64
 ENV DEBIAN_FRONTEND=noninteractive
 RUN case "$TARGETARCH" in amd64) ninja_version=1.12.1-1 ;; arm64) ninja_version=1.12.1-1+b1 ;; *) exit 64 ;; esac \
     && printf '%s\n' \
@@ -40,14 +53,20 @@ RUN case "$TARGETARCH" in amd64) ninja_version=1.12.1-1 ;; arm64) ninja_version=
     && printf '%s  %s\n' \
       '46d689818d88e0d65387bf9182f1bd1015c4b28e0347696f0bec7c7d9c829194' \
       /tmp/neatvnc.tar.xz | sha256sum --check -
-RUN case "$TARGETARCH" in \
-      amd64) mise_arch=x64; mise_sha=7cd12d6002d5b3c83a89cad79023712faf2a36f9e8b2ee2061dac5135b3de0ed ;; \
-      arm64) mise_arch=arm64; mise_sha=bc2c447a7e498b0bed0a421cc2101b407fef09a3195670d35a4aa3f43cd868a1 ;; \
+RUN --mount=type=bind,from=mise-release,target=/tmp/mise-release \
+    case "$TARGETARCH" in \
+      amd64) mise_arch=x64; mise_sha="$MISE_SHA256_AMD64" ;; \
+      arm64) mise_arch=arm64; mise_sha="$MISE_SHA256_ARM64" ;; \
       *) exit 64 ;; \
     esac \
-    # The window rides out a short burst of 5xx answers from the release host (#1567).
-    && curl --fail --location --connect-timeout 20 --max-time 120 --retry 7 --retry-all-errors --retry-max-time 180 --output /tmp/mise \
-      "https://github.com/jdx/mise/releases/download/v2026.8.14/mise-v2026.8.14-linux-${mise_arch}" \
+    && if [ -f /tmp/mise-release/mise ]; then \
+      echo "using the supplied mise $MISE_VERSION; no download" \
+      && cp /tmp/mise-release/mise /tmp/mise; \
+    else \
+      # The window rides out a short burst of 5xx answers from the release host (#1567).
+      curl --fail --location --connect-timeout 20 --max-time 120 --retry 7 --retry-all-errors --retry-max-time 180 --output /tmp/mise \
+        "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${mise_arch}"; \
+    fi \
     && printf '%s  %s\n' "$mise_sha" /tmp/mise | sha256sum --check - \
     && install --mode=0755 /tmp/mise /opt/mise
 COPY examples/computer-wayland/patches/neatvnc-rfb-websocket-v1.patch /tmp/neatvnc.patch
