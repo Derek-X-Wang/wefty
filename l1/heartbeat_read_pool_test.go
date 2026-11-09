@@ -11,6 +11,7 @@ import (
 )
 
 func TestHeartbeatDeliversDirectivesWithReadSnapshotPoolHeld(t *testing.T) {
+	keepProductionReadBudget(t)
 	fixture := newRemovalStallHarness(t)
 	h := fixture.h
 	agent := h.client(fixture.agent)

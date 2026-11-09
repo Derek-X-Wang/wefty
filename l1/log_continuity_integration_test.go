@@ -47,7 +47,7 @@ func insertDetachedLogRows(t *testing.T, store *Store, jobID, attemptID string, 
 // next open, not skip it for good.
 func TestLogContinuitySeedRunsAgainAfterACrashBeforeItCommitted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crash-window.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestLogContinuitySeedRunsAgainAfterACrashBeforeItCommitted(t *testing.T) {
 		t.Fatal(errors.Join(err, closeErr))
 	}
 
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestEvictionByteBudgetNeverOvershoots(t *testing.T) {
 		want   int
 	}{{11, 1}, {12, 2}, {13, 2}, {17, 2}, {18, 3}} {
 		t.Run(fmt.Sprint(test.budget), func(t *testing.T) {
-			store, err := OpenStore(filepath.Join(t.TempDir(), "budget.sqlite"), StoreOptions{})
+			store, err := openTestStore(t, filepath.Join(t.TempDir(), "budget.sqlite"), StoreOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}

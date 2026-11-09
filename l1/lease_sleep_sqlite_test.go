@@ -30,7 +30,7 @@ func TestLeaseSleepSQLiteMigrationStartsAnchorWithoutCredit(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.advance(0, 5*time.Minute)
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}

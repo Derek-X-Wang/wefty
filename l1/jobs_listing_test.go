@@ -404,7 +404,7 @@ func TestJobsListingCursorBindsFiltersAndLegacyServiceCursor(t *testing.T) {
 
 func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "listing.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func seedJobListingRows(t *testing.T, store *Store, count int) {
 func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 	for _, handle := range []string{"main", "settlement"} {
 		t.Run(handle, func(t *testing.T) {
-			store, err := OpenStore(filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
+			store, err := openTestStore(t, filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -582,7 +582,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 }
 
 func TestJobsListingPlanUsesCreationIndex(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "listing.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

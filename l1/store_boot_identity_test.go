@@ -15,7 +15,7 @@ func TestStoreSystemClockBootIdentity(t *testing.T) {
 	// system clock's strict reader with the test identity cannot pass.
 	boot, hostErr := hostboot.Identity()
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{Clock: systemClock{}})
+	store, err := openTestStore(t, path, StoreOptions{Clock: systemClock{}})
 	if store != nil {
 		t.Cleanup(func() { store.Close() })
 	}

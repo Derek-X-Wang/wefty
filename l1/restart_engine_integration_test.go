@@ -831,7 +831,7 @@ func assertAttemptState(t *testing.T, h *integrationHarness, attemptID string, w
 func newProcessStabilityStore(t *testing.T) (*Store, *fakeClock, Node, Job) {
 	t.Helper()
 	clock := &fakeClock{now: time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "authority.sqlite"), StoreOptions{
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "authority.sqlite"), StoreOptions{
 		Clock: clock, Jitter: func(delay time.Duration) time.Duration { return delay },
 	})
 	if err != nil {

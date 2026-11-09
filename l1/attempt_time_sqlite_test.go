@@ -42,7 +42,7 @@ func TestAttemptLeaseSQLiteMigrationPreservesLegacyAuthority(t *testing.T) {
 	}
 	// Reopening must migrate an actual unstamped Attempt, without making its
 	// old wall lease into a new boot lease or changing its deletion rules.
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestAttemptLeaseSQLiteMigrationPreservesLegacyAuthority(t *testing.T) {
 	if err = f.store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}

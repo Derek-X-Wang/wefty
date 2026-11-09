@@ -91,7 +91,7 @@ func TestOnFailurePublicLifecycle(t *testing.T) {
 			if err := h.store.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &databasePath); err != nil {
 				t.Fatal(err)
 			}
-			reopened, err := OpenStore(databasePath, StoreOptions{Clock: h.clock})
+			reopened, err := openTestStore(t, databasePath, StoreOptions{Clock: h.clock})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -389,7 +389,7 @@ func TestStoreAddsPolicyStopToExistingServiceJobs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-policy-stop.sqlite")
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
 	options := StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second, Jitter: func(d time.Duration) time.Duration { return d }}
-	store, err := OpenStore(path, options)
+	store, err := openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestStoreAddsPolicyStopToExistingServiceJobs(t *testing.T) {
 		t.Fatal(errors.Join(err, closeErr))
 	}
 
-	store, err = OpenStore(path, options)
+	store, err = openTestStore(t, path, options)
 	if err != nil {
 		t.Fatalf("open pre-policy-stop database: %v", err)
 	}

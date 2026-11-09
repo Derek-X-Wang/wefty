@@ -273,6 +273,7 @@ func TestSubmissionCommittedStatusUsesFactsInHand(t *testing.T) {
 }
 
 func TestComputerAgentBackupAcknowledgementIndependentOfOperatorPool(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 2)
 	h.stopServer()
 	_, _, err := h.store.BeginComputerBackup(t.Context(), computer.ComputerID, ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "review-ack", AllowPowerOff: true})

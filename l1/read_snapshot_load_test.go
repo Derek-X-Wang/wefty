@@ -155,6 +155,7 @@ var cutoffBoundedLoadViews = map[string]bool{"nodes": true}
 const cutoffBoundedSlack = 20 * time.Millisecond
 
 func TestReadSnapshotSustainedLoad(t *testing.T) {
+	keepProductionReadBudget(t)
 	if readLoadRaceEnabled {
 		t.Skip("race instrumentation changes SQLite hold/checkpoint timing; run the non-race load gate for timing evidence")
 	}

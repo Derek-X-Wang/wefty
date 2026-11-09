@@ -490,7 +490,7 @@ func TestControlPlaneRestartRecoversQueuedAndRunningJobs(t *testing.T) {
 	defer client.CloseIdleConnections()
 	defer agent.CloseIdleConnections()
 
-	store, err := OpenStore(databasePath, StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
+	store, err := openTestStore(t, databasePath, StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +507,7 @@ func TestControlPlaneRestartRecoversQueuedAndRunningJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err = OpenStore(databasePath, StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
+	store, err = openTestStore(t, databasePath, StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

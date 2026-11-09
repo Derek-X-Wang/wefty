@@ -12,7 +12,7 @@ import (
 
 func TestAdminPersonDeviceMigrationPreservesLegacyRosterAndAudit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestAdminPersonDeviceMigrationPreservesLegacyRosterAndAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		store, err = OpenStore(path, StoreOptions{})
+		store, err = openTestStore(t, path, StoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

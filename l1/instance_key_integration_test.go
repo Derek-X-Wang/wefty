@@ -95,12 +95,12 @@ func TestInstanceKeyConcurrentCreation(t *testing.T) {
 	for _, sameDispatch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("same-dispatch-%t", sameDispatch), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "l1.sqlite")
-			first, err := OpenStore(path, StoreOptions{})
+			first, err := openTestStore(t, path, StoreOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer first.Close()
-			second, err := OpenStore(path, StoreOptions{})
+			second, err := openTestStore(t, path, StoreOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -174,7 +174,7 @@ func TestInstanceKeyConcurrentCreation(t *testing.T) {
 
 func TestInstanceKeyUpgradeAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestInstanceKeyUpgradeAndReopen(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	upgraded, err := OpenStore(path, StoreOptions{})
+	upgraded, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestInstanceKeyUpgradeAndReopen(t *testing.T) {
 	if err := upgraded.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(path, StoreOptions{})
+	reopened, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestInstanceKeyServiceKeepsReservationInEveryState(t *testing.T) {
 	// Focused store regression: intermediate removal and failed states are not
 	// all controllable through HTTP without an agent or a finalizer racing them.
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

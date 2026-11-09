@@ -33,7 +33,7 @@ func assertNoJobLogJSONLTable(t *testing.T, store *Store) {
 // it and its rows on open without disturbing the jobs or their export.
 func TestJobLogJSONLTableIsRetired(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jsonl.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestJobLogJSONLTableIsRetired(t *testing.T) {
 		t.Fatal(errors.Join(err, closeErr))
 	}
 
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func usedPages(t *testing.T, store *Store) int64 {
 // halves. A new database has nothing to migrate and never runs it.
 func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +378,7 @@ func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +622,7 @@ func TestEndedAttemptCredentialsArePruned(t *testing.T) {
 
 // The backlog an upgraded database carries is pruned in bounded passes.
 func TestEndedAttemptCredentialPruningIsBounded(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "credentials.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "credentials.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

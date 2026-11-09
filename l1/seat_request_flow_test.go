@@ -52,7 +52,7 @@ func TestSeatRequestFlowSharedRolloverRoomAndDedicatedCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestSeatRequestLosingRoomCreatesNoComputer(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestSeatRequestFailedNewComputerUsesVerifiedRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +361,7 @@ func TestSeatRequestRuntimeFailureNewRemovalAndExistingLatch(t *testing.T) {
 					t.Fatal(err)
 				}
 				var err error
-				f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
+				f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -509,7 +509,7 @@ func testSeatOnceLiveHistory(t *testing.T, prune bool) {
 				t.Fatal(err)
 			}
 			var err error
-			f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
+			f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 			if err != nil {
 				t.Fatal(err)
 			}

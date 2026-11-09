@@ -188,7 +188,7 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				t.Fatal(err)
 			}
 			var err error
-			f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, ComputerTakeoverAuditRetentionAge: time.Hour, LeaseDuration: time.Hour})
+			f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, ComputerTakeoverAuditRetentionAge: time.Hour, LeaseDuration: time.Hour})
 			if err != nil {
 				t.Fatal(err)
 			}

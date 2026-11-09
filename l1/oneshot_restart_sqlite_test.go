@@ -13,7 +13,7 @@ import (
 
 func TestOneshotRestartSQLiteOldSchemaReopenAndMigrationReplay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestOneshotRestartSQLiteOldSchemaReopenAndMigrationReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		store, err = OpenStore(path, StoreOptions{})
+		store, err = openTestStore(t, path, StoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +91,7 @@ func TestOneshotRestartSQLiteNonterminalSecretsAndTerminalScrub(t *testing.T) {
 func TestOneshotRestartSQLiteRecoverySurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recover.sqlite")
 	clock := &fakeClock{now: time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(path, StoreOptions{Clock: clock, Jitter: func(d time.Duration) time.Duration { return d }})
+	store, err := openTestStore(t, path, StoreOptions{Clock: clock, Jitter: func(d time.Duration) time.Duration { return d }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestOneshotRestartSQLiteRecoverySurvivesReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{Clock: clock, Jitter: func(time.Duration) time.Duration { t.Fatal("reopen redrew jitter"); return 0 }})
+	store, err = openTestStore(t, path, StoreOptions{Clock: clock, Jitter: func(time.Duration) time.Duration { t.Fatal("reopen redrew jitter"); return 0 }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestOneshotRestartSQLiteInterruptionRequestSurvivesReopen(t *testing.T) {
 	if err := f.h.store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(path, StoreOptions{Clock: f.h.clock})
+	reopened, err := openTestStore(t, path, StoreOptions{Clock: f.h.clock})
 	if err != nil {
 		t.Fatal(err)
 	}

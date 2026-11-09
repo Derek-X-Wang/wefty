@@ -291,7 +291,7 @@ func TestNodeStaleRevisionHTTP(t *testing.T) {
 func TestNodeConditionPersistsAcrossRecoveryAndReopen(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 10, 7, 10, 0, 0, 0, time.UTC)}
 	path := filepath.Join(t.TempDir(), "nodes.sqlite")
-	store, err := OpenStore(path, StoreOptions{Clock: clock})
+	store, err := openTestStore(t, path, StoreOptions{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestNodeConditionPersistsAcrossRecoveryAndReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{Clock: clock})
+	store, err = openTestStore(t, path, StoreOptions{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}

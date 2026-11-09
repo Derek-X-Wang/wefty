@@ -421,7 +421,7 @@ func TestNeverStartAcknowledgementSurvivesReopen(t *testing.T) {
 			if err := h.store.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); err != nil {
 				t.Fatal(err)
 			}
-			reopened, err := OpenStore(path, StoreOptions{Clock: h.clock})
+			reopened, err := openTestStore(t, path, StoreOptions{Clock: h.clock})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -680,7 +680,7 @@ func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
 			if err := h.store.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); err != nil {
 				t.Fatal(err)
 			}
-			upgraded, err := OpenStore(path, StoreOptions{Clock: h.clock})
+			upgraded, err := openTestStore(t, path, StoreOptions{Clock: h.clock})
 			if err != nil {
 				t.Fatalf("open legacy database: %v", err)
 			}

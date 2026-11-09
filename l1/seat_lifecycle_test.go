@@ -22,7 +22,7 @@ func newSeatLifecycleFixture(t *testing.T) *seatLifecycleFixture {
 	t.Helper()
 	f := &seatLifecycleFixture{path: filepath.Join(t.TempDir(), "l1.sqlite"), clock: &fakeClock{now: time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)}}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func (f *seatLifecycleFixture) reopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

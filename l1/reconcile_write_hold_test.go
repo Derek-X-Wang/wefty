@@ -41,7 +41,7 @@ func openRetentionSweepStore(t *testing.T, options StoreOptions) (*Store, *fakeC
 	t.Helper()
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
 	options.Clock = clock
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), options)
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), options)
 	if err != nil {
 		t.Fatal(err)
 	}

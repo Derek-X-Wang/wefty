@@ -124,6 +124,7 @@ func TestAdminAddHasExplicitDeviceParameter(t *testing.T) {
 }
 
 func TestAuthenticatedPersonSnapshotUnavailablePrecedesObservation(t *testing.T) {
+	keepProductionReadBudget(t)
 	f := &identityAnswerFabric{identity: fabric.Identity{FabricID: "issuer", UserID: "unobserved-person", DeviceID: "person-device"}}
 	s := newIdentityAnswerServer(t, f)
 	var held []*sql.Conn

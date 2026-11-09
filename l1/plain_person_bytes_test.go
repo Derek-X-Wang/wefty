@@ -27,7 +27,7 @@ func (*plainPersonAnswerFabric) PersonIdentityTrust() fabric.PersonIdentityTrust
 // Only the random bootstrap nonce is represented by a fixed request label.
 func TestPlainAdminAndWhoAmIBytes(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -25,7 +25,7 @@ func newAttemptClockFixture(t *testing.T, classes ...string) *attemptClockFixtur
 	f := &attemptClockFixture{clock: &seatBootTestClock{fakeClock: wall, boot: "l1-boot-a", elapsed: time.Hour}, path: filepath.Join(t.TempDir(), "l1.sqlite")}
 	f.options = StoreOptions{Clock: f.clock, LeaseDuration: time.Minute, NodeStaleAfter: 12 * time.Hour, NodeDeadAfter: 24 * time.Hour}
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestAttemptLeaseSameBootRestartKeepsDeadline(t *testing.T) {
 	f.clock.Advance(2 * time.Hour)
 	f.clock.elapsed += 59 * time.Second
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestAttemptLeaseNewBootFallsBackToWall(t *testing.T) {
 			f.clock.boot = "l1-boot-b"
 			f.clock.elapsed = 8 * time.Hour
 			var err error
-			f.store, err = OpenStore(f.path, f.options)
+			f.store, err = openTestStore(t, f.path, f.options)
 			if err != nil {
 				t.Fatal(err)
 			}

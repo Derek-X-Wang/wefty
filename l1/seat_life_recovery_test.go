@@ -16,7 +16,7 @@ func reopenSeatLife(t *testing.T, f *seatLifecycleFixture, options StoreOptions)
 	}
 	options.LeaseDuration = time.Hour
 	var err error
-	f.store, err = OpenStore(f.path, options)
+	f.store, err = openTestStore(t, f.path, options)
 	if err != nil {
 		t.Fatal(err)
 	}

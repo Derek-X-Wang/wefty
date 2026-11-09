@@ -34,7 +34,7 @@ func newSleepLeaseFixture(t *testing.T, beforeClaim ...func(*attemptClockFixture
 	f := &attemptClockFixture{clock: base, path: filepath.Join(t.TempDir(), "l1.sqlite")}
 	f.options = StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second, NodeStaleAfter: 45 * time.Second, NodeDeadAfter: 90 * time.Second}
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestLeaseSleepOnceAcrossRollbackAndReopen(t *testing.T) {
 					t.Fatal(err)
 				}
 				var err error
-				f.store, err = OpenStore(f.path, f.options)
+				f.store, err = openTestStore(t, f.path, f.options)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -232,7 +232,7 @@ func TestLeaseSleepWallStepAndNewBoot(t *testing.T) {
 		c.elapsed = 10 * time.Minute
 		c.awake = time.Minute
 		var err error
-		f.store, err = OpenStore(f.path, f.options)
+		f.store, err = openTestStore(t, f.path, f.options)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -281,7 +281,7 @@ func TestLeaseSleepBoundSeatSurvives(t *testing.T) {
 	base := &seatBootTestClock{fakeClock: f.clock, boot: "seat-sleep-boot", elapsed: time.Hour}
 	c := &sleepTestClock{seatBootTestClock: base, awake: time.Hour}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: c, LeaseDuration: 30 * time.Second})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: c, LeaseDuration: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestLeaseSleepNoDoubleCreditAfterTightening(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +806,7 @@ func existingAttemptWithLooseSleepInit(t *testing.T, remaining time.Duration) (*
 	}
 	source := &sequencedSleepClock{base: c, repeatWidth: 31 * time.Second, beforeBoot: true}
 	f.options.Clock = source
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +897,7 @@ func TestLeaseSleepIntervalAdvanceAndReopenKeepWidth(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}

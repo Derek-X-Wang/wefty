@@ -34,7 +34,7 @@ func (*identityAnswerFabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
 
 func newIdentityAnswerServer(t *testing.T, f *identityAnswerFabric) *Server {
 	t.Helper()
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

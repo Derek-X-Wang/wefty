@@ -58,6 +58,7 @@ func TestColdStartIdleComputerIsStartingNotUnschedulable(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer store.Close()
+			store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 			network := plain.NewNetwork()
 			sf := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 			policy := l1.DefaultNodePolicy(contract.StableNodeTagPrefix + "cold")

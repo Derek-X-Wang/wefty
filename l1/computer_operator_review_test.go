@@ -148,7 +148,7 @@ func TestComputerBackupOperatorQueryPlansExcludeHistory(t *testing.T) {
 
 func TestComputerBackupOperatorIndexesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestComputerBackupOperatorIndexesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		store, err = OpenStore(path, StoreOptions{})
+		store, err = openTestStore(t, path, StoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

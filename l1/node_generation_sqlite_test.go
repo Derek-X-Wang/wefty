@@ -13,7 +13,7 @@ import (
 
 func TestNodeGenerationSQLiteOldSchemaReopenAndMigrationReplay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestNodeGenerationSQLiteOldSchemaReopenAndMigrationReplay(t *testing.T) {
 	}
 	var previous NodeGenerationInventory
 	for i := 0; i < 3; i++ {
-		store, err = OpenStore(path, StoreOptions{})
+		store, err = openTestStore(t, path, StoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,7 +75,7 @@ func TestNodeGenerationSQLitePromotionAndRetiringAuthoritySurviveReopen(t *testi
 	if err := f.h.store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenStore(path, StoreOptions{Clock: f.h.clock})
+	store, err := openTestStore(t, path, StoreOptions{Clock: f.h.clock})
 	if err != nil {
 		t.Fatal(err)
 	}

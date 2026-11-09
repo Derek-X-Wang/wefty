@@ -102,7 +102,7 @@ func TestAttemptLeaseBootIdentityCachedAtOpen(t *testing.T) {
 	clock := &identityFailureClock{seatBootTestClock: f.clock}
 	f.options.Clock = clock
 	var err error
-	f.store, err = OpenStore(f.path, f.options)
+	f.store, err = openTestStore(t, f.path, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestAttemptLeaseBootIdentityCachedAtOpen(t *testing.T) {
 
 func TestAttemptLeaseBootIdentityFailureRefusesOpen(t *testing.T) {
 	clock := &identityFailureClock{seatBootTestClock: &seatBootTestClock{fakeClock: &fakeClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}, boot: "boot", elapsed: time.Hour}, failIdentity: true}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock})
 	if store != nil {
 		store.Close()
 	}

@@ -337,7 +337,7 @@ func TestFailedServiceKeepsItsSpecUntilRemoval(t *testing.T) {
 func TestSweepBackfillsTerminalOneShotsFromBeforeTheScrub(t *testing.T) {
 	path := t.TempDir() + "/legacy.sqlite"
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(path, StoreOptions{Clock: clock})
+	store, err := openTestStore(t, path, StoreOptions{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +375,7 @@ func TestSweepBackfillsTerminalOneShotsFromBeforeTheScrub(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	migrated, err := OpenStore(path, StoreOptions{Clock: clock})
+	migrated, err := openTestStore(t, path, StoreOptions{Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}

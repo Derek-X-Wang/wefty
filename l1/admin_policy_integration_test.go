@@ -408,7 +408,7 @@ func TestLocalAdminResetReopensBootstrapAndIsAudited(t *testing.T) {
 func TestBootstrapChallengeCannotRedeemFromClonedDatabase(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "source.sqlite")
-	source, err := OpenStore(sourcePath, StoreOptions{})
+	source, err := openTestStore(t, sourcePath, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestBootstrapChallengeCannotRedeemFromClonedDatabase(t *testing.T) {
 	if err := os.WriteFile(clonePath, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	clone, err := OpenStore(clonePath, StoreOptions{})
+	clone, err := openTestStore(t, clonePath, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
