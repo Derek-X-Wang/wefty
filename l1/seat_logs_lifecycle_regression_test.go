@@ -31,12 +31,12 @@ func TestSeatLogMissingHistoryCannotBlockNodeRegistration(t *testing.T) {
 			if err := registerSeatLogBoot(t, f, "next-boot"); err != nil {
 				t.Fatalf("missing history blocked node registration: %v", err)
 			}
-			result, err := f.store.GetSeatRequest(t.Context(), id)
+			result, err := testReads(f.store).GetSeatRequest(t.Context(), id)
 			if err != nil || result.State != SeatRefused {
 				t.Fatalf("lost approval not refused: %+v %v", result, err)
 			}
 			if withCall {
-				if page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil || len(page.Events) == 0 {
+				if page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil || len(page.Events) == 0 {
 					t.Fatalf("recovered log lost caller: %+v %v", page, err)
 				}
 			}
@@ -72,12 +72,12 @@ func TestSeatLogActiveNeverLiveSurvivesRetentionSweep(t *testing.T) {
 			if swept.PrunedSeatLogs != 0 {
 				t.Errorf("active request log pruned: %+v", swept)
 			}
-			if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+			if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
 				t.Errorf("active history unavailable: %v", err)
 			}
 			switch action {
 			case "wait":
-				result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+				result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 				if err != nil || result.State != SeatRefused {
 					t.Fatalf("old pending wait cannot refuse: %+v %v", result, err)
 				}
@@ -119,7 +119,7 @@ func TestSeatLogMissingApprovalHistoryCanStartOrAnswer(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+			if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
 				t.Fatalf("recovered log lost original caller: %v", err)
 			}
 		})
@@ -176,19 +176,19 @@ func TestSeatLogOutcomeCannotConsumeEarlierOwnerNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+		result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 		if err != nil || result.UnreadEvents != 2 {
 			t.Fatalf("outcome consumed earlier owner note: %+v %v", result, err)
 		}
 	}
-	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+	page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := f.store.MarkSeatLogRead(t.Context(), "cli", id, "", page.NextCursor); err != nil {
 		t.Fatal(err)
 	}
-	result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+	result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || result.UnreadEvents != 0 {
 		t.Fatalf("explicit read did not consume note: %+v %v", result, err)
 	}

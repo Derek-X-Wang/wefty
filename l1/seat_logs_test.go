@@ -54,7 +54,7 @@ func TestSeatLogLifecycleAndReadCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.request(t, 1, true)
-	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+	page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestSeatLogLifecycleAndReadCursor(t *testing.T) {
 	if err := f.store.MarkSeatLogRead(t.Context(), "cli", id, "", page.NextCursor); err != nil {
 		t.Fatal(err)
 	}
-	result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+	result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || result.UnreadEvents != 0 {
 		t.Fatalf("read: %+v %v", result, err)
 	}
@@ -72,11 +72,11 @@ func TestSeatLogLifecycleAndReadCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err = f.store.GetSeatCall(t.Context(), "cli", id)
+	result, err = testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || result.UnreadEvents != 0 {
 		t.Fatalf("reported refusal must acknowledge its outcome: %+v %v", result, err)
 	}
-	page, err = f.store.GetSeatLogs(t.Context(), "cli", id, "", page.NextCursor, 100)
+	page, err = testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", page.NextCursor, 100)
 	if err != nil || !page.Ended || len(page.Events) != 1 || page.Reason != "denied by the owner" {
 		t.Fatalf("end: %+v %v", page, err)
 	}
@@ -101,7 +101,7 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 		t.Fatalf("claim: %+v %v", claim, err)
 	}
 	auth := ComputerSeatAttemptRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, FencingToken: claim.Lease.FencingToken}
-	list, err := h.store.GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
+	list, err := testReads(h.store).GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 	if _, err := h.store.ReportComputerSeatObservations(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, report); err != nil {
 		t.Fatal(err)
 	}
-	value, err := h.store.GetSeatCall(t.Context(), "cli", id)
+	value, err := testReads(h.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || value.Credential == "" {
 		t.Fatalf("live credential: %+v %v", value, err)
 	}
@@ -151,7 +151,7 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 	if _, err := h.store.CreateSeatCall(t.Context(), "cli", SeatCallInput{SeatID: otherID, NodeID: node.NodeID, Harness: "test", Folder: "/workspace", Form: "any", Network: "none"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.GetSeatLogs(t.Context(), "cli", otherID, value.Credential, "", 100); errorCode(err) != contract.ErrorForbidden {
+	if _, err := testReads(h.store).GetSeatLogs(t.Context(), "cli", otherID, value.Credential, "", 100); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("Seat credential borrowed caller authority to read another Seat: %v", err)
 	}
 	if status, body := send(http.MethodGet, "/v1/seats/"+otherID+"/logs"); status != 403 {
@@ -164,16 +164,16 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 		}
 	}
 	// A log poll does not write activity or unread state.
-	before, err := h.store.GetSeatCall(t.Context(), "cli", id)
+	before, err := testReads(h.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if _, err := h.store.GetSeatLogs(t.Context(), "", id, value.Credential, "", 100); err != nil {
+		if _, err := testReads(h.store).GetSeatLogs(t.Context(), "", id, value.Credential, "", 100); err != nil {
 			t.Fatal(err)
 		}
 	}
-	after, err := h.store.GetSeatCall(t.Context(), "cli", id)
+	after, err := testReads(h.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || before.UnreadEvents != after.UnreadEvents {
 		t.Fatalf("poll changed unread: %+v %+v %v", before, after, err)
 	}
@@ -209,14 +209,14 @@ func TestSeatLogWriterAuditReplayAndRetentionCursor(t *testing.T) {
 	if err := f.store.AppendSeatEvent(t.Context(), event); errorCode(err) != contract.ErrorIdempotencyConflict {
 		t.Fatalf("conflicting replay: %v", err)
 	}
-	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+	page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 	if err != nil || len(page.Events) != 3 || page.Events[2].Note != "Tests are ready" || page.Events[2].Audit.SessionID != "takeover-1" {
 		t.Fatalf("shared audit log: %+v %v", page, err)
 	}
 	if _, err := f.store.EndSeatRequest(t.Context(), "fabric-computer-node", id, SeatEndRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Reason: "denied by the owner", Refused: true}); err != nil {
 		t.Fatal(err)
 	}
-	page, err = f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+	page, err = testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestSeatLogRetentionSweepDoesNotReseedOnRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.reopen(t)
-	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+	if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("expired log revived: %v", err)
 	}
 }
