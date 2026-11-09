@@ -10,7 +10,8 @@ Concurrent projections in the same request share the read set.
 Snapshots use a dedicated file pool opened with `mode=ro`, with `query_only`
 set at connection creation. Disabling the pragma cannot enable writes.
 Its twelve open and idle connections are the admission cap. Writers and agent-protocol
-reads remain on the main pool; the secret WAL checkpoint keeps its own handle.
+reads remain on the main pool, except the known drift recorded below; the
+secret WAL checkpoint keeps its own handle.
 Checkout waits at most 200 ms. Admission order is random under overload; no
 FIFO fairness is promised. Admission expiry returns HTTP 503, code
 `unavailable`, `retryable=true`, and `details.reason=read_snapshot_admission_expired`.
@@ -63,10 +64,27 @@ success, the response is HTTP 503, `unavailable`, with
 `job_id`. The commit stands. `details.read_reason` identifies the underlying
 error code (for example `unauthorized` for a dead credential or `internal` for
 a projection fault), or the snapshot expiry/admission reason. `retryable` is
-true only for snapshot availability errors. Retry a read to observe the
-resource; creation and restart retries must retain their original replay key.
-The marker means the mutation succeeded (including idempotent success); it
-does not promise that a replay applied a new change.
+true only for snapshot availability errors. A client observes the resource by
+reading the Job again; a resend of creation or restart must keep its original
+replay key. The marker means the mutation succeeded (including idempotent
+success); it does not promise that a replay applied a new change.
+
+The CLI takes one recovery step for each L1 Job mutation after a retryable
+post-change failure:
+
+- `wefty services create` and `wefty services restart` resend the identical
+  request once, with its dispatch key or idempotency key; L1 answers the
+  replay with the committed Job. A restart that carries an upgrade request
+  (the upgrade drain) reads the service back instead, because that restart
+  can answer a no-op without recording its key.
+- `wefty services start`, `stop`, `remove` and `forget`, and `wefty cancel`
+  of a Job, carry no key. The CLI does not resend them; it reads the Job back
+  with `GET /v1/jobs/{job_id}`, using the ordinary bounded retries of a GET
+  read (at most three quiet retries of a retryable answer).
+
+If that step also fails, the command exits 13 with L1's answer and adds that
+the change was applied, with a hint to read it again. The CLI never retries a
+transport failure, and the caller's cancellation ends the command.
 
 Snapshot admission/hold and post-change unavailable reasons are `read_snapshot_admission_expired`,
 `read_snapshot_expired`, and `read_snapshot_post_change_failed`, published in
@@ -90,14 +108,52 @@ shape: connection checkout gets its own 200 ms admission budget and the
 read-only transaction then holds its connection under the same 200 ms hard
 limit, both with typed `unavailable` expiry (`read_snapshot_admission_expired`,
 `read_snapshot_expired`, retryable) and the door's test-only override. The door
-is reachable only from reviewed agent and L3 protocol read owners; the guard
-asserts the exact site set of `withAgentReadSnapshot`, the `writeAgentComputer`
-wrapper, the three `Prove*` methods, `owedComputerRevocation` with the exact
-`revokeAfterAuthorityLoss` caller, and their reviewed HTTP callers, set equality, with
-a fixture test covering the bypass shapes. The list is hand-kept rather than
+is reachable only from reviewed agent and L3 protocol read owners. The guard
+(`agentProtocolReadSites` in `l1/read_boundary_test.go`) asserts, by set
+equality, the exact sites that reference `withAgentReadSnapshot`, the
+`writeAgentComputer` wrapper, the three `Prove*` methods or
+`owedComputerRevocation`:
+
+- the three `Prove*` methods and their `Server.prove*` HTTP callers;
+- `writeAgentComputer` and the seven Computer acknowledgement handlers
+  (Backup, storage reset, storage grow, reimage preflight, storage retirement,
+  storage copy and restore retirement);
+- `owedComputerRevocation` with the exact `revokeAfterAuthorityLoss` caller;
+- the node-only Seat reads: `AuthorizeSeatCopy` and `RecordSeatCopy` (Seat
+  copy authority and receipts), `PollSeatCalls`, `AdvanceSeatCall` and
+  `cleanupSeatCallComputer` (Seat request preflight, selection and cleanup),
+  `GetSeatRequestForNode` (the node's Seat request read) and
+  `GetComputerSeatListForAttempt` (an Attempt's Seat list).
+  `GetSeatRequestForNode` serves `POST /v1/agent/seat-requests/{seat_id}/read`;
+  the node agent has no production caller of that route today.
+
+A fixture test covers the bypass shapes. The list is hand-kept rather than
 derived from route registration, and the rule tracks references, not
 invocations: a listed site that stored the method value for another caller
 would pass, so such a change needs review.
+
+Known drift: some agent and L3 protocol reads still use the operator snapshot
+door, so operator read load can delay them. Each returns the door's usual
+retryable `unavailable` expiry, and its caller retries today:
+
+- The Seat Run poll: `ControlSeatRun` with phase `poll` reads through
+  `pollSeatRun` and `SeatCommandsToCancel`. The node agent repeats a failed
+  poll after one second.
+- The follow-up reads in `PollSeatCalls`. Its candidate scan uses the agent
+  door, but each candidate then reads its Seat request (`GetSeatRequest`) through
+  the operator door. The preflight of a still-requested Seat also reads the
+  room snapshot (`GetComputerRoomSnapshot`), and a starting Seat reads its
+  Computer (`GetComputer`), through the same door. `PollSeatCalls` logs a failed
+  candidate and leaves it out of that answer; the node agent polls again after
+  one second.
+- The L3 `run-target` read, `ResolveSeatRun`
+  (`GET /v1/seats/{seat_id}/run-target`), after its write-door
+  `SeatCallHappened` check. `wefty exec` into a Seat resubmits its Run with
+  the same key when L3 answers 503, up to four attempts in its normal
+  submission loop.
+
+Whether these reads move to the agent door is an open product decision. This
+contract records only the current behavior.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` inventories production
 SQL pool and connection expressions, including aliases, and rejects embedded
