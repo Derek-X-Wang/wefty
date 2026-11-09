@@ -163,6 +163,15 @@ func (m *computerCgroupMemory) write(name, value string) error {
 func (m *computerCgroupMemory) writeLimit(n int64) error {
 	return m.write("memory.max", strconv.FormatInt(n, 10))
 }
+
+func (m *computerCgroupMemory) setHighMax() error {
+	writeErr := m.write("memory.high", "max")
+	value, err := m.read("memory.high")
+	if err != nil || strings.TrimSpace(string(value)) != "max" {
+		return errors.Join(errors.New("Computer memory.high readback is not max after a resize"), writeErr, err)
+	}
+	return nil
+}
 func (m *computerCgroupMemory) freezerIO() computerMemoryFreezerIO {
 	return computerMemoryFreezerIO{
 		readRequested: func() (bool, error) {

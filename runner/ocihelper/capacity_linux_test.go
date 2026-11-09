@@ -302,6 +302,7 @@ func TestComputerCgroupMemoryPolicyRequiresExactReadback(t *testing.T) {
 	write("memory.max", "1073741824")
 	write("memory.oom.group", "1")
 	write("memory.swap.max", "0")
+	write("memory.high", "939524096")
 	max, group, swap, err := verifyComputerCgroupMemoryPolicy(root, cgroupID, 1<<30)
 	if err != nil || max != 1<<30 || !group || swap != 0 {
 		t.Fatalf("exact policy = %d/%t/%d err=%v", max, group, swap, err)
@@ -310,6 +311,8 @@ func TestComputerCgroupMemoryPolicyRequiresExactReadback(t *testing.T) {
 		{name: "memory.max", value: "1073741823"},
 		{name: "memory.oom.group", value: "0"},
 		{name: "memory.swap.max", value: "1"},
+		{name: "memory.high", value: "max"},
+		{name: "memory.high", value: "1073741824"},
 	} {
 		write(mutation.name, mutation.value)
 		if _, _, _, err := verifyComputerCgroupMemoryPolicy(root, cgroupID, 1<<30); err == nil {
@@ -318,6 +321,13 @@ func TestComputerCgroupMemoryPolicyRequiresExactReadback(t *testing.T) {
 		write("memory.max", "1073741824")
 		write("memory.oom.group", "1")
 		write("memory.swap.max", "0")
+		write("memory.high", "939524096")
+	}
+	if err := os.Remove(filepath.Join(cgroup, "memory.high")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := verifyComputerCgroupMemoryPolicy(root, cgroupID, 1<<30); err == nil {
+		t.Fatal("missing memory.high passed")
 	}
 }
 
@@ -326,7 +336,7 @@ func TestComputerProfileRequestsWholeCgroupOOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resources.Unified["memory.oom.group"] != "1" || resources.Memory == nil || resources.Memory.Limit == nil || resources.Memory.Swap == nil {
+	if resources.Unified["memory.oom.group"] != "1" || resources.Unified["memory.high"] != "939524096" || resources.Memory == nil || resources.Memory.Limit == nil || resources.Memory.Swap == nil {
 		t.Fatalf("Computer memory resources = %+v", resources)
 	}
 	ordinary, err := isolationResources(WorkloadLimits{MemoryBytes: 1 << 30}, false)

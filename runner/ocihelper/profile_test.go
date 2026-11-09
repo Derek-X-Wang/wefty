@@ -1312,3 +1312,27 @@ func TestComputerStatusCannotBeShadowedByOperatorMount(t *testing.T) {
 		t.Fatalf("writable operator mount accepted: %v", err)
 	}
 }
+
+// A 1 GiB Computer keeps 128 MiB of reclaim room; a small cap keeps 7/8 of
+// itself. memory.high is rounded down to the kernel page, as the kernel stores
+// it, stays at least one page and never exceeds the cap.
+func TestComputerMemoryHighKeepsReclaimRoomBelowTheCap(t *testing.T) {
+	const kib, mib = 1 << 10, 1 << 20
+	for _, tc := range []struct{ max, page, high int64 }{
+		{max: 1 << 30, page: 4 * kib, high: 1<<30 - 128*mib},
+		{max: 4 << 30, page: 4 * kib, high: 4<<30 - 128*mib},
+		{max: 1<<30 + 4*kib, page: 4 * kib, high: 1<<30 + 4*kib - 128*mib},
+		{max: 256 * mib, page: 4 * kib, high: 224 * mib},
+		{max: 64 * mib, page: 4 * kib, high: 56 * mib},
+		{max: 64*mib + 4*kib, page: 4 * kib, high: 56 * mib},
+		{max: 256*mib + 64*kib, page: 64 * kib, high: 224 * mib},
+		{max: 1 << 30, page: 64 * kib, high: 1<<30 - 128*mib},
+		{max: 4 * kib, page: 4 * kib, high: 4 * kib},
+		{max: 64 * kib, page: 64 * kib, high: 64 * kib},
+	} {
+		got := computerMemoryHighBytesForPage(tc.max, tc.page)
+		if got != tc.high || got <= 0 || got > tc.max || got%tc.page != 0 {
+			t.Errorf("computerMemoryHighBytesForPage(%d, %d)=%d want %d", tc.max, tc.page, got, tc.high)
+		}
+	}
+}

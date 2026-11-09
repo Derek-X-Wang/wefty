@@ -95,7 +95,11 @@ func verifyComputerCgroupMemoryPolicy(cgroupRoot, cgroupID string, memoryBytes i
 	if err != nil {
 		return 0, false, 0, err
 	}
-	if memoryMax != memoryBytes || oomGroup != 1 || swapMax != 0 {
+	memoryHigh, err := readInt("memory.high")
+	if err != nil {
+		return 0, false, 0, err
+	}
+	if memoryMax != memoryBytes || oomGroup != 1 || swapMax != 0 || memoryHigh != computerMemoryHighBytes(memoryBytes) {
 		return memoryMax, oomGroup == 1, swapMax, errors.New("Computer cgroup memory policy readback did not match the requested cap")
 	}
 	return memoryMax, true, swapMax, nil

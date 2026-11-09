@@ -18,6 +18,10 @@ type fakeComputerMemory struct {
 	writes                         []int64
 	frozen, failWrite, badReadback bool
 	reserved                       *int64
+	// highMax is memory.high=max; events records memory.high and memory.max
+	// writes in order.
+	highMax, failHigh bool
+	events            []string
 }
 
 func (f *fakeComputerMemory) readLimit() (int64, error) {
@@ -36,6 +40,7 @@ func (f *fakeComputerMemory) writeLimit(n int64) error {
 		return errors.New("reservation below limit")
 	}
 	f.writes = append(f.writes, n)
+	f.events = append(f.events, fmt.Sprintf("max=%d", n))
 	if f.failWrite {
 		return errors.New("write failed")
 	}
@@ -46,6 +51,14 @@ func (f *fakeComputerMemory) writeLimit(n int64) error {
 	if f.applyWriteError {
 		return errors.New("write applied then returned an error")
 	}
+	return nil
+}
+func (f *fakeComputerMemory) setHighMax() error {
+	f.events = append(f.events, "high=max")
+	if f.failHigh {
+		return errors.New("memory.high write failed")
+	}
+	f.highMax = true
 	return nil
 }
 func (f *fakeComputerMemory) freezerIO() computerMemoryFreezerIO {
@@ -432,5 +445,52 @@ func TestComputerMemoryReworkFailedGrowReconcileKeepsCleanup(t *testing.T) {
 	r, err := call(1 << 30)
 	if err != nil || r.MemoryLimitBytes != 1<<30 {
 		t.Fatalf("reconciling failed grow consumed unrelated cleanup: %+v %v", r, err)
+	}
+}
+
+// A resize clears the create-time memory.high margin with memory.high=max:
+// before memory.max on a grow, after a confirmed memory.max on a shrink, and
+// never on a held, refused or unchanged call (#1507).
+func TestComputerMemoryResizeClearsMemoryHigh(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	call := func(n int64) (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: n, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	if _, err := call(1 << 30); err != nil || f.highMax || len(f.events) != 0 {
+		t.Fatalf("unchanged limit touched memory.high: events=%v err=%v", f.events, err)
+	}
+	if _, err := call(4 << 30); err == nil || f.highMax || len(f.events) != 0 {
+		t.Fatalf("refused grow touched memory.high: events=%v err=%v", f.events, err)
+	}
+	if _, err := call(2 << 30); err != nil || !f.highMax || fmt.Sprint(f.events) != fmt.Sprint([]string{"high=max", fmt.Sprintf("max=%d", 2<<30)}) {
+		t.Fatalf("grow order: events=%v err=%v", f.events, err)
+	}
+	if _, err := s.apply([]ComputerSeat{{1, "seat1", 7102, 7103}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.apply(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.observe(t.Context(), s.generation, func(name string) ([]byte, error) {
+		if name == "applied.json" {
+			return []byte(fmt.Sprintf(`{"version":1,"generation":%d,"wanted_places":[],"cleanup_complete":true}`, s.generation)), nil
+		}
+		return []byte(fmt.Sprintf(`{"version":1,"generation":%d,"place":1,"state":"removed","reason":"","cleanup_complete":true}`, s.generation)), nil
+	}, nil, func(ComputerSeat) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	f.events, f.highMax = nil, false
+	f.usage = 1<<30 - 8<<20 // Inside the 16 MiB frozen allowance: held.
+	if r, err := call(1 << 30); err != nil || r.Reason != "memory_in_use" || f.highMax || len(f.events) != 0 {
+		t.Fatalf("held shrink touched memory.high: %+v events=%v err=%v", r, f.events, err)
+	}
+	f.usage, f.failHigh = 128<<20, true
+	if r, err := call(1 << 30); err == nil || f.limit != 1<<30 || *reserved != 1<<30 || r.MemoryLimitBytes != 1<<30 ||
+		fmt.Sprint(f.events) != fmt.Sprint([]string{fmt.Sprintf("max=%d", 1<<30), "high=max"}) {
+		t.Fatalf("shrink order or reservation after a failed memory.high write: %+v events=%v reserved=%d err=%v", r, f.events, *reserved, err)
+	}
+	f.events, f.failHigh = nil, true
+	if _, err := call(2 << 30); err == nil || f.limit != 1<<30 || *reserved != 1<<30 || fmt.Sprint(f.events) != "[high=max]" {
+		t.Fatalf("grow wrote memory.max after memory.high failed: events=%v reserved=%d err=%v", f.events, *reserved, err)
 	}
 }
