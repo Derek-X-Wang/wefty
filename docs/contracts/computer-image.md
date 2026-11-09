@@ -467,9 +467,13 @@ the status target or a descendant. The image reports
 instead of attempting writes through the read-only root filesystem.
 
 The helper sets the Computer's whole-cgroup OOM policy and verifies the live
-cgroup before `Started`: `memory.max` equals the declared cap,
-`memory.oom.group=1`, and `memory.swap.max=0`. The successful profile receipt
-contains those read-back values. The separate atomic admission receipt records
+cgroup before `Started`: `memory.max` equals the declared cap, `memory.high`
+keeps `min(128 MiB, cap/8)` of reclaim room below it (rounded down to the kernel
+page, at least one page; a mitigation for fast page-cache writers, not an OOM
+guarantee), `memory.oom.group=1`, and `memory.swap.max=0`. A later live resize
+sets `memory.high=max`. The successful profile receipt
+contains the `memory.max`, `memory.oom.group` and `memory.swap.max` read-back
+values; a `memory.high` mismatch fails closed before `Started`. The separate atomic admission receipt records
 setup-configured capacity, declared memory/disk arithmetic, plus timestamped
 `MemTotal`, `MemAvailable`, and disk-root filesystem-free observations;
 `MemAvailable` and temp ceilings remain advisory facts and never reject
@@ -1084,7 +1088,8 @@ Failures repair root-owned evidence permissions before artifact upload.
 `TestDefaultComputerSeatsAtProductionTimings` calls the real
 `ocihelper.BuildRuntimeSpec`, uses its returned bytes unchanged, and compares
 them with containerd's stored spec. The **1 GiB** live cgroup must report the
-same `memory.max`, `memory.swap.max=0` and `memory.oom.group=1`. The lane owns
+same `memory.max`, `memory.high` 128 MiB below it, `memory.swap.max=0` and
+`memory.oom.group=1`. The lane owns
 IM-1, IM-2 and IM-6, plus secondary IM-4 display/file and IM-5 cleanup/memory
 proof. The helper IM-5 fixture splits 128 MiB of shared-memory charge between
 a top-level file and a nested file inside a root-owned sticky scratch folder.

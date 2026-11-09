@@ -197,8 +197,15 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 	}
 	check := func(r SetComputerMemoryLimitResponse, want int64) {
 		t.Helper()
-		_, _, _, err := verifyComputerCgroupMemoryPolicy("/sys/fs/cgroup", id, want)
-		must(err)
+		// A resized Computer keeps oom.group=1 and swap.max=0, and has no
+		// memory.high margin (#1507).
+		for file, value := range map[string]string{"memory.high": "max", "memory.oom.group": "1", "memory.swap.max": "0"} {
+			b, err := os.ReadFile(filepath.Join(cgroup, file))
+			must(err)
+			if strings.TrimSpace(string(b)) != value {
+				t.Fatalf("resized Computer %s=%q want %q", file, b, value)
+			}
+		}
 		if r.MemoryLimitBytes != want || r.ReservedMemoryBytes != want || readLimit() != want || engine.capacityReservations[authority.JobID].memoryBytes != want {
 			t.Fatalf("limit/reservation mismatch: %+v actual=%d", r, readLimit())
 		}

@@ -452,7 +452,7 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 	if h.cgroup == "" {
 		t.Fatal("cgroup v2 is required")
 	}
-	for file, want := range map[string]string{"memory.max": "1073741824", "memory.swap.max": "0", "memory.oom.group": "1"} {
+	for file, want := range map[string]string{"memory.max": "1073741824", "memory.high": "939524096", "memory.swap.max": "0", "memory.oom.group": "1"} {
 		value, err := os.ReadFile(filepath.Join(h.cgroup, file))
 		seatMust(t, err)
 		if strings.TrimSpace(string(value)) != want {

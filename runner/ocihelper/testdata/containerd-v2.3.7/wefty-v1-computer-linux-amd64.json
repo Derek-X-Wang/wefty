@@ -155,6 +155,7 @@
         "swap": 536870912
       },
       "unified": {
+        "memory.high": "469762048",
         "memory.oom.group": "1"
       }
     },

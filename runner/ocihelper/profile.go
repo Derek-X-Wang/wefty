@@ -683,6 +683,25 @@ func isolationDevices() []specs.LinuxDevice {
 	}
 }
 
+// computerMemoryHighMarginBytes is the reclaim room a Computer keeps below its
+// memory.max. Above memory.high the kernel reclaims and slows the allocating
+// task, so a fast page-cache writer waits for writeback instead of the whole
+// Computer being OOM-killed at memory.max (#1507).
+const computerMemoryHighMarginBytes int64 = 128 << 20
+
+// computerMemoryHighBytes is memory.max minus min(128 MiB, memory.max/8),
+// rounded down to the kernel page size, which is how the kernel stores it.
+func computerMemoryHighBytes(memoryMax int64) int64 {
+	return computerMemoryHighBytesForPage(memoryMax, int64(os.Getpagesize()))
+}
+
+// computerMemoryHighBytesForPage keeps at least one page and never exceeds
+// memoryMax, so a small cap keeps most of its room.
+func computerMemoryHighBytesForPage(memoryMax, page int64) int64 {
+	high := (memoryMax - min(computerMemoryHighMarginBytes, memoryMax/8)) / page * page
+	return min(memoryMax, max(page, high))
+}
+
 // CgroupResources is the linux.resources block BuildRuntimeSpec writes for a
 // workload with these limits. It exists so the live Linux lane derives the
 // memory.max and cpu.max it reads back from a running container out of the
@@ -708,6 +727,9 @@ func isolationResources(limits WorkloadLimits, computer bool) (*specs.LinuxResou
 	}
 	if computer {
 		resources.Unified = map[string]string{"memory.oom.group": "1"}
+		if limits.MemoryBytes > 0 {
+			resources.Unified["memory.high"] = strconv.FormatInt(computerMemoryHighBytes(limits.MemoryBytes), 10)
+		}
 	}
 	if limits.CPUMillicores > 0 {
 		quotaPerMillicore := int64(defaultCPUPeriodMicroseconds / 1000)

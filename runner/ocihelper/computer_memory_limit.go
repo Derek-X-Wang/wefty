@@ -36,6 +36,9 @@ type computerMemoryRuntime interface {
 	readLimit() (int64, error)
 	readUsage() (int64, error)
 	writeLimit(int64) error
+	// setHighMax writes memory.high=max and reads it back. "max" can never be
+	// below use, so the write never asks the kernel to reclaim (#1507).
+	setHighMax() error
 	recoverFreeze(context.Context) (bool, error)
 	shrink(context.Context, int64) (computerMemoryShrinkResult, error)
 	freezerRequests() int
@@ -161,6 +164,11 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 				consumeCleanup()
 			}
 		} else {
+			// A resized Computer has no memory.high margin (#1507). Clear it
+			// before the grow so memory.high never throttles below the new cap.
+			if err = runtime.setHighMax(); err != nil {
+				return response, err
+			}
 			*reserved = target
 			writeErr := runtime.writeLimit(target)
 			var readErr error
@@ -188,6 +196,13 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 		*reserved = actual
 		response.MemoryLimitBytes = actual
 		response.ReservedMemoryBytes = actual
+		// A confirmed shrink clears memory.high after memory.max; a held shrink
+		// keeps the margin. If this fails, the previous memory.high remains.
+		if target < old && response.HeldMemoryBytes == 0 {
+			if err = runtime.setHighMax(); err != nil {
+				return response, err
+			}
+		}
 	}
 	// This can contact containerd only after shrink has completed thaw.
 	if err = validate(); err != nil {
