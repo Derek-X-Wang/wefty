@@ -38,6 +38,7 @@ env:
     scripts/test-computer-wayland-furniture.sh
     scripts/measure-computer-image.sh
     scripts/assemble-oci-index.sh
+    scripts/fetch-mise-release.sh
     cmd/wefty-computer-conformance
     internal/computerconformance
     internal/rfbclient
@@ -332,6 +333,32 @@ jobs:
           ARCH: ${{ matrix.arch }}
           PROBE_PACKAGE: ${{ matrix.variant == 'wayland' && 'pool/main/w/wayvnc/wayvnc_0.9.1-1' || 'pool/main/x/xorg-server/xvfb_21.1.7-3%2bdeb12u12' }}
         run: bash scripts/debian-snapshot-cache.sh start "${PROBE_PACKAGE}_${ARCH}.deb"
+      # Cache the verified mise binary so a release-host outage does not fail the Wayland build (#1575).
+      - name: Read the pinned mise release
+        id: mise-pin
+        if: matrix.variant == 'wayland'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash scripts/fetch-mise-release.sh pin "$ARCH"
+      - name: Restore the verified mise binary
+        id: mise-cache
+        if: matrix.variant == 'wayland'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/mise-release
+          key: mise-release-v1-linux-${{ matrix.arch }}-${{ steps.mise-pin.outputs.version }}-${{ steps.mise-pin.outputs.sha256 }}
+      - name: Fetch and verify the pinned mise binary
+        if: matrix.variant == 'wayland'
+        env:
+          ARCH: ${{ matrix.arch }}
+        timeout-minutes: 10
+        run: bash scripts/fetch-mise-release.sh fetch "$ARCH" "$RUNNER_TEMP/mise-release"
+      - name: Save the verified mise binary
+        if: matrix.variant == 'wayland' && steps.mise-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/mise-release
+          key: mise-release-v1-linux-${{ matrix.arch }}-${{ steps.mise-pin.outputs.version }}-${{ steps.mise-pin.outputs.sha256 }}
       - name: Build the reference desktop into its execution shape
         env:
           PLATFORM: linux/${{ matrix.arch }}
@@ -342,13 +369,16 @@ jobs:
         run: |
           set -euo pipefail
           registry_reference="localhost:5000/${LOCAL_NAME}:${CANDIDATE_SHA}-${ARCH}"
-          target=()
-          case "$VARIANT" in xfce) target=(--target single-seat) ;; esac
-          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
+          variant_flags=()
+          case "$VARIANT" in
+            xfce) variant_flags=(--target single-seat) ;;
+            wayland) variant_flags=(--build-context "mise-release=$RUNNER_TEMP/mise-release") ;;
+          esac
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${variant_flags[@]}" \
             --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
-          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${variant_flags[@]}" \
             --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
