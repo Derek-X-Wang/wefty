@@ -22,7 +22,7 @@ func prepareSeatLogLive(t *testing.T, f *seatLifecycleFixture, id string) {
 		t.Fatalf("claim: %+v %v", claim, err)
 	}
 	auth := ComputerSeatAttemptRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, FencingToken: claim.Lease.FencingToken}
-	list, err := f.store.GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
+	list, err := testReads(f.store).GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,19 +73,19 @@ func TestSeatLogOutcomeReplyAcknowledgesItsHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 			for range 2 {
-				result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+				result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 				if err != nil || result.UnreadEvents != 1 {
 					t.Fatalf("outcome=%s reply must report only later events: %+v %v", outcome, result, err)
 				}
 			}
-			page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+			page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err := f.store.MarkSeatLogRead(t.Context(), "cli", id, "", page.NextCursor); err != nil {
 				t.Fatal(err)
 			}
-			result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+			result, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 			if err != nil || result.UnreadEvents != 0 {
 				t.Fatalf("log read did not clear hint: %+v %v", result, err)
 			}
@@ -107,10 +107,10 @@ func TestSeatLogRetainedIdentityCannotChangeCaller(t *testing.T) {
 	if _, err := f.store.CreateSeatCall(t.Context(), "other-cli", input); errorCode(err) != contract.ErrorDispatchKeyConflict {
 		t.Fatalf("retained Seat log was handed to a new caller: %v", err)
 	}
-	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+	if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
 		t.Fatalf("original reader lost its retained log: %v", err)
 	}
-	if _, err := f.store.GetSeatLogs(t.Context(), "other-cli", id, "", "", 100); errorCode(err) != contract.ErrorForbidden {
+	if _, err := testReads(f.store).GetSeatLogs(t.Context(), "other-cli", id, "", "", 100); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("replacement caller can read the log: %v", err)
 	}
 }
@@ -143,7 +143,7 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 	if result.PrunedSeatLogs != 0 {
 		t.Fatalf("unresolved request lost its log before refusal: %+v", result)
 	}
-	outcome, err := f.store.GetSeatCall(t.Context(), "cli", id)
+	outcome, err := testReads(f.store).GetSeatCall(t.Context(), "cli", id)
 	if err != nil || outcome.State != SeatRefused {
 		t.Fatalf("old pending request cannot refuse: %+v %v", outcome, err)
 	}
@@ -153,7 +153,7 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 	if err != nil || result.PrunedSeatLogs != 0 {
 		t.Fatalf("late refusal lost its log at once: %+v %v", result, err)
 	}
-	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+	if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
 		t.Fatalf("late refusal log unreadable: %v", err)
 	}
 	f.clock.Advance(DefaultComputerTakeoverAuditRetentionAge)
@@ -172,7 +172,7 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 	if counters["pruned_seat_logs"] != float64(1) {
 		t.Fatalf("unresolved log not counted as pruned: %s", data)
 	}
-	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+	if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("refused log survived the retention from its end: %v", err)
 	}
 	if err := f.store.AppendSeatEvent(t.Context(), SeatLogEvent{SeatID: id, EventID: "late", Kind: SeatEventControlTaken}); errorCode(err) != contract.ErrorNotFound {
@@ -209,7 +209,7 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				// exact boundary.
 				readable := func(when string) {
 					t.Helper()
-					if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+					if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
 						t.Fatalf("%s: late refusal lost its log: %v", when, err)
 					}
 					if result, err := f.store.Reconcile(t.Context()); err != nil || result.PrunedSeatLogs != 0 {
@@ -220,7 +220,7 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				f.clock.Advance(time.Hour - time.Nanosecond)
 				readable("just before the end plus retention")
 				f.clock.Advance(time.Nanosecond)
-				if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+				if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
 					t.Fatalf("log outlived the retention from its end: %v", err)
 				}
 				if result, err := f.store.Reconcile(t.Context()); err != nil || result.PrunedSeatLogs != 1 {
@@ -228,14 +228,14 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				}
 				return
 			}
-			page, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100)
+			page, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100)
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.clock.Advance(time.Hour)
 			switch operation {
 			case "read":
-				if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+				if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
 					t.Fatalf("read ignored configured retention: %v", err)
 				}
 			case "acknowledge":
@@ -253,7 +253,7 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				if counts["pruned_seat_logs"] != float64(1) {
 					t.Fatalf("configured retention did not prune/count log: %s", data)
 				}
-				if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+				if _, err := testReads(f.store).GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
 					t.Fatalf("sweep retained log: %v", err)
 				}
 			}
