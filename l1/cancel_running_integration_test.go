@@ -188,7 +188,7 @@ func TestCancelSettlementDeadlineReopenAndEvidence(t *testing.T) {
 	if err := h.store.db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &path); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenStore(path, StoreOptions{Clock: h.clock, LeaseDuration: time.Hour})
+	reopened, err := openTestStore(t, path, StoreOptions{Clock: h.clock, LeaseDuration: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

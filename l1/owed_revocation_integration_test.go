@@ -773,7 +773,7 @@ func TestOwedRevocationWriteBudgetAdmitsOnlyAFullLockWait(t *testing.T) {
 // starve L1's reconcile loop, which stops the server.
 func TestSettlementWritesNeverChangeTheMainPoolsLockWait(t *testing.T) {
 	ctx := t.Context()
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{
 		Clock: &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}})
 	if err != nil {
 		t.Fatal(err)
@@ -920,7 +920,7 @@ func TestADeadHostsOwedRevocationsAreSettledAsMoot(t *testing.T) {
 // keeps its rows, indexes and immutability triggers.
 func TestOwedRevocationSettlementMigrationAdmitsHostDead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,7 +943,7 @@ ALTER TABLE computer_owed_revocations_legacy RENAME TO computer_owed_revocations
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

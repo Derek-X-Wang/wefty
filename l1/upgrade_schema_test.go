@@ -49,7 +49,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	options := StoreOptions{Clock: ClockFunc(func() time.Time {
 		return time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	})}
-	store, err := OpenStore(path, options)
+	store, err := openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	// Model the prior build's table shape. Reopening must append the new
 	// column to existing tables in the same order as a fresh store.
-	store, err = OpenStore(path, options)
+	store, err = openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, options)
+	store, err = openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}

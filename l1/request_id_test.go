@@ -14,7 +14,7 @@ import (
 )
 
 func TestL1ErrorRequestIDBodyHeaderAndLog(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "control.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "control.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

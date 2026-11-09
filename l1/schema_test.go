@@ -22,7 +22,7 @@ func TestCustodyExportSQLAndOpenAPIStatusEnumsStayBound(t *testing.T) {
 	if !strings.Contains(string(openAPI), want) {
 		t.Fatalf("OpenAPI Custody export status enum does not contain %s", want)
 	}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "status-enum.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "status-enum.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestLogTruncationBoundSQLAndOpenAPIEnumsStayBound(t *testing.T) {
 	if !strings.Contains(string(openAPI), want) {
 		t.Fatalf("OpenAPI LogTruncation bound_kind enum does not contain %s", want)
 	}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "truncation-enum.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "truncation-enum.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestLogTruncationBoundSQLAndOpenAPIEnumsStayBound(t *testing.T) {
 }
 
 func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "schema.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "schema.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestStoreDeclaresCompleteServiceSchema(t *testing.T) {
 
 func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-reset.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 	if err != nil || closeErr != nil {
 		t.Fatal(errors.Join(err, closeErr))
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestStoreMigratesPreResetComputerConstraints(t *testing.T) {
 
 func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-copy-provenance.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T
 	if err != nil || closeErr != nil {
 		t.Fatal(errors.Join(err, closeErr))
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestStoreMigratesStorageProvenanceWithoutDroppingFutureColumns(t *testing.T
 
 func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "exported-custody.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testi
 	if err != nil || closeErr != nil {
 		t.Fatal(errors.Join(err, closeErr))
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestStoreMigratesExportedCustodyStatusWithoutDroppingFutureColumns(t *testi
 
 func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "parallel-ladder.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +530,7 @@ func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T)
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -554,7 +554,7 @@ func TestStoreReconcilesParallelReimageAndRestoreConstraintLadders(t *testing.T)
 }
 
 func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "late-window.sqlite"), StoreOptions{LateEvidenceWindow: 6 * time.Hour})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "late-window.sqlite"), StoreOptions{LateEvidenceWindow: 6 * time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +565,7 @@ func TestStoreConfiguresLateEvidenceWindowIndependently(t *testing.T) {
 }
 
 func TestStoreConfiguresBoundedAdminBootstrapTTL(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "admin-bootstrap.sqlite"), StoreOptions{
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "admin-bootstrap.sqlite"), StoreOptions{
 		AdminBootstrapTTL: 2 * time.Minute,
 	})
 	if err != nil {
@@ -577,7 +577,7 @@ func TestStoreConfiguresBoundedAdminBootstrapTTL(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if store, err := OpenStore(filepath.Join(t.TempDir(), "invalid-admin-bootstrap.sqlite"), StoreOptions{
+	if store, err := openTestStore(t, filepath.Join(t.TempDir(), "invalid-admin-bootstrap.sqlite"), StoreOptions{
 		AdminBootstrapTTL: -time.Second,
 	}); err == nil {
 		store.Close()
@@ -587,7 +587,7 @@ func TestStoreConfiguresBoundedAdminBootstrapTTL(t *testing.T) {
 
 func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
-		store, err := OpenStore(filepath.Join(t.TempDir(), "service-retention-default.sqlite"), StoreOptions{})
+		store, err := openTestStore(t, filepath.Join(t.TempDir(), "service-retention-default.sqlite"), StoreOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -605,7 +605,7 @@ func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 	})
 
 	t.Run("configured", func(t *testing.T) {
-		store, err := OpenStore(filepath.Join(t.TempDir(), "service-retention-configured.sqlite"), StoreOptions{
+		store, err := openTestStore(t, filepath.Join(t.TempDir(), "service-retention-configured.sqlite"), StoreOptions{
 			ServiceLogRetentionBytes: 1234,
 			ServiceLogRetentionAge:   36 * time.Hour,
 			OneshotLogRetentionBytes: 99,
@@ -635,7 +635,7 @@ func TestStoreConfiguresBoundedServiceLogRetention(t *testing.T) {
 		{name: "negative total bytes", options: StoreOptions{LogRetentionTotalBytes: -1}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := OpenStore(filepath.Join(t.TempDir(), "invalid-service-retention.sqlite"), test.options)
+			store, err := openTestStore(t, filepath.Join(t.TempDir(), "invalid-service-retention.sqlite"), test.options)
 			if store != nil {
 				store.Close()
 			}

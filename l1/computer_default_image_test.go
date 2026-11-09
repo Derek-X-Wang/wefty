@@ -10,7 +10,7 @@ import (
 
 func TestComputerDefaultImageChangesOnlyNewOnDemandComputers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{ComputerDefaultImage: "ghcr.io/example/desktop:v1@sha256:" + strings.Repeat("a", 64)})
+	store, err := openTestStore(t, path, StoreOptions{ComputerDefaultImage: "ghcr.io/example/desktop:v1@sha256:" + strings.Repeat("a", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestComputerDefaultImageChangesOnlyNewOnDemandComputers(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Like the Backup-cap default, the setting changes on an L1 restart.
-	store, err = OpenStore(path, StoreOptions{ComputerDefaultImage: "ghcr.io/example/desktop:v2@sha256:" + strings.Repeat("b", 64)})
+	store, err = openTestStore(t, path, StoreOptions{ComputerDefaultImage: "ghcr.io/example/desktop:v2@sha256:" + strings.Repeat("b", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestComputerDefaultImageChangesOnlyNewOnDemandComputers(t *testing.T) {
 
 func TestComputerDefaultImageComparesNormalizedPins(t *testing.T) {
 	pin := "sha256:" + strings.Repeat("a", 64)
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{ComputerDefaultImage: "docker.io/library/alpine@" + pin})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{ComputerDefaultImage: "docker.io/library/alpine@" + pin})
 	if err != nil {
 		t.Fatal(err)
 	}

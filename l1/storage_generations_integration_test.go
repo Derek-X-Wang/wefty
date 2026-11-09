@@ -131,7 +131,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 	if err := h.store.db.QueryRowContext(context.Background(), "PRAGMA database_list").Scan(&databaseSequence, &databaseName, &databasePath); err != nil {
 		t.Fatal(err)
 	}
-	resumedStore, err := OpenStore(databasePath, StoreOptions{Clock: h.clock, LeaseDuration: 3 * time.Second})
+	resumedStore, err := openTestStore(t, databasePath, StoreOptions{Clock: h.clock, LeaseDuration: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 	if err != nil || verifiedOnly.StorageGeneration != 1 || verifiedOnly.ReconfigurationPhase != ComputerReconfigurationResetting {
 		t.Fatalf("verification prematurely published Storage: %#v err=%v", verifiedOnly, err)
 	}
-	publicationResume, err := OpenStore(databasePath, StoreOptions{Clock: h.clock, LeaseDuration: 3 * time.Second})
+	publicationResume, err := openTestStore(t, databasePath, StoreOptions{Clock: h.clock, LeaseDuration: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -291,7 +291,7 @@ func (*selfAssertedPersonAnswerFabric) PersonIdentityTrust() fabric.PersonIdenti
 
 func TestSelfAssertedAdminIgnoresDeviceBinding(t *testing.T) {
 	f := &identityAnswerFabric{identity: fabric.Identity{FabricID: "plain-fixture", UserID: "owner", DeviceID: "first-device"}}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

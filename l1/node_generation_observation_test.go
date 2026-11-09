@@ -428,7 +428,7 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 func generationObservationStoreFixture(t *testing.T) *generationFixture {
 	t.Helper()
 	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

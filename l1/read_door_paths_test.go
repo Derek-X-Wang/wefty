@@ -33,6 +33,7 @@ func occupyOperatorPool(t *testing.T, store *Store) {
 }
 
 func TestProtocolProofsIndependentOfOperatorPool(t *testing.T) {
+	keepProductionReadBudget(t)
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 2 * time.Second}, map[string]NodePolicy{
 		"computer-node": DefaultNodePolicy(contract.StableNodeTagPrefix + "computer-node"),
 	})
@@ -100,6 +101,7 @@ func TestProtocolProofsIndependentOfOperatorPool(t *testing.T) {
 }
 
 func TestCustodyAttestationReloadFailureMarksApplied(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
 	h.stopServer()
 	exported, _ := beginCustodyExport(t, h, node, computer, backup, "applied-attestation")
@@ -121,6 +123,7 @@ func TestCustodyAttestationReloadFailureMarksApplied(t *testing.T) {
 }
 
 func TestReimageReplaySnapshotExpiryRemainsRetryable(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, _, computer := backupHarness(t, 2, nil)
 	h.stopServer()
 	var seq int
@@ -203,6 +206,7 @@ func TestCustodyImportAcknowledgementUsesOneWrite(t *testing.T) {
 }
 
 func TestAuthorityLossReadUsesClosedProtocolSnapshot(t *testing.T) {
+	keepProductionReadBudget(t)
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
 	h.stopServer()
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "authority-read", Spec: computerCapabilityJobSpec("computer:authority-read"), Actor: "operator"})
@@ -235,6 +239,7 @@ func TestAuthorityLossReadUsesClosedProtocolSnapshot(t *testing.T) {
 
 // Exercise the real agent HTTP route while every operator snapshot slot is held.
 func TestComputerCompletionIndependentOfOperatorPool(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, _, node, agent := computerCompletionHarness(t)
 	ledger := newOutageLedger(h)
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "completion-admission", Spec: computerCapabilityJobSpec("computer:completion-admission"), Actor: "operator"})

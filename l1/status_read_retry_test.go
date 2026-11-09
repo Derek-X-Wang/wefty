@@ -157,6 +157,7 @@ func TestTestHTTPReadRetryPolicy(t *testing.T) {
 }
 
 func TestTestReadHandlerRecoversFromRealSnapshotExpiry(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, _, computer := backupHarness(t, 2, nil)
 	h.stopServer()
 	original := h.store.clock
@@ -179,6 +180,7 @@ func TestTestReadHandlerRecoversFromRealSnapshotExpiry(t *testing.T) {
 }
 
 func TestTestHTTPReadRecoversFromRealSnapshotExpiry(t *testing.T) {
+	keepProductionReadBudget(t)
 	h, _, computer := backupHarness(t, 2, nil)
 	h.stopServer()
 	original := h.store.clock

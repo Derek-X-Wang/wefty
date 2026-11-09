@@ -7,7 +7,7 @@ import (
 
 func TestNodeListingDropsRecordedStateIndexesOnReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func TestNodeListingDropsRecordedStateIndexesOnReopen(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

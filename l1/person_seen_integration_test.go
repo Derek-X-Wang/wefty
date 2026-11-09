@@ -66,6 +66,7 @@ func TestKnownPersonViewAnswersWithWriteLockHeld(t *testing.T) {
 // Once the snapshot pool is fully busy, the observation must still be recorded
 // durably before the answer: the unavailability fallback is load-bearing.
 func TestPersonObservationFallsBackWhenSnapshotBusy(t *testing.T) {
+	keepProductionReadBudget(t)
 	h := newIntegrationHarness(t, nil)
 	var held []*sql.Conn
 	for i := 0; i < readSnapshotLimit; i++ {
@@ -260,6 +261,7 @@ func TestFirstPersonViewRecordsThenGrantSucceeds(t *testing.T) {
 // the caller as the contract's retryable 503 with its read_snapshot_* reason,
 // never as a scrubbed 500.
 func TestAdminPolicyViewReportsBusyReadPoolAsUnavailable(t *testing.T) {
+	keepProductionReadBudget(t)
 	h := newIntegrationHarness(t, nil)
 	for i := 0; i < readSnapshotLimit; i++ {
 		conn, err := h.store.readDB.Conn(context.Background())

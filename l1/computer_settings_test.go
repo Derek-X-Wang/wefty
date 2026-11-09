@@ -11,7 +11,7 @@ import (
 
 func TestOwnerComputerSettingsSurviveRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestOwnerComputerSettingsSurviveRestart(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestSeatRequestComputerSettingsReachTheNodeClaim(t *testing.T) {
 
 func TestPreSeatComputerUpgradeKeepsOwnerSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestPreSeatComputerUpgradeKeepsOwnerSettings(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

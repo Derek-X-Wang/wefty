@@ -430,7 +430,7 @@ func TestRetentionBacklogIsEvictedInBoundedPasses(t *testing.T) {
 // job-generic table and gets exact usage counters on first open.
 func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-52.sqlite")
-	store, err := OpenStore(path, StoreOptions{Clock: &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}})
+	store, err := openTestStore(t, path, StoreOptions{Clock: &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +489,7 @@ func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 		t.Fatal(errors.Join(err, closeErr))
 	}
 
-	store, err = OpenStore(path, StoreOptions{})
+	store, err = openTestStore(t, path, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +548,7 @@ func TestStoreUpgradesServiceLogTruncationsAndSeedsUsage(t *testing.T) {
 // a cap that was lowered across a restart, finding it through the usage
 // index rather than by walking every one-shot ever run.
 func TestOneshotLogByteRetentionSweepAppliesALoweredCap(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "lowered.sqlite"), StoreOptions{
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "lowered.sqlite"), StoreOptions{
 		Clock:                    &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)},
 		OneshotLogRetentionBytes: 10,
 	})

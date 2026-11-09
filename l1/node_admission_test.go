@@ -22,7 +22,7 @@ import (
 // production setting can turn plain, peer-asserted tags into admission authority.
 func newNodeAdmissionServer(t *testing.T, config ServerConfig) (*Server, *identityAnswerFabric) {
 	t.Helper()
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{
 		Clock: &fakeClock{now: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)},
 	})
 	if err != nil {
@@ -472,7 +472,7 @@ func TestAutomaticNodeAdmissionUsesCanonicalPinnedTags(t *testing.T) {
 func TestAutomaticNodeAdmissionMigrationAndPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
 	options := StoreOptions{Clock: &fakeClock{now: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}}
-	store, err := OpenStore(path, options)
+	store, err := openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,7 @@ func TestAutomaticNodeAdmissionMigrationAndPersistence(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, options)
+	store, err = openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +524,7 @@ func TestAutomaticNodeAdmissionMigrationAndPersistence(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = OpenStore(path, options)
+	store, err = openTestStore(t, path, options)
 	if err != nil {
 		t.Fatal(err)
 	}

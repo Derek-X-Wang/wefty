@@ -136,6 +136,7 @@ func TestJobListingReviewSharedCollectionLimit(t *testing.T) {
 }
 
 func TestJobReadReviewPostChangeFailureReason(t *testing.T) {
+	keepProductionReadBudget(t)
 	for _, failure := range []string{"credential", "internal", "snapshot"} {
 		t.Run(failure, func(t *testing.T) {
 			h, client, agent, node := credentialHarness(t)

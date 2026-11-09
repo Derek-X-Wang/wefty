@@ -293,7 +293,7 @@ func TestSeatRunClusterDeadlineSettingReachesResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, SeatCommandMaxRuntime: 2 * time.Hour})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: time.Hour, SeatCommandMaxRuntime: 2 * time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func reopenSeatRunOnNewL1Boot(t *testing.T, f *seatLifecycleFixture) *seatBootTe
 	}
 	clock := &seatBootTestClock{fakeClock: f.clock, boot: "new-l1-host-boot", elapsed: 10 * time.Minute}
 	var err error
-	f.store, err = OpenStore(f.path, StoreOptions{Clock: clock, LeaseDuration: time.Hour})
+	f.store, err = openTestStore(t, f.path, StoreOptions{Clock: clock, LeaseDuration: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

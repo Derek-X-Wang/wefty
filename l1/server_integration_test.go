@@ -42,7 +42,7 @@ func testServeTreatsInitialReconcileCancellationArtifactAsShutdown(t *testing.T,
 	t.Helper()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func testServeTreatsInitialReconcileCancellationArtifactAsShutdown(t *testing.T,
 func TestServeReportsReconcileFailureRacingShutdown(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestServeReportsReconcileFailureRacingShutdown(t *testing.T) {
 func TestServeContinuesAfterCanceledReconcileErrorUnderLiveContext(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func newIntegrationHarnessWithReconcileInterval(
 	if options.LeaseDuration <= 0 {
 		options.LeaseDuration = 30 * time.Second
 	}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), options)
+	store, err := openTestStore(t, filepath.Join(t.TempDir(), "l1.sqlite"), options)
 	if err != nil {
 		t.Fatal(err)
 	}
