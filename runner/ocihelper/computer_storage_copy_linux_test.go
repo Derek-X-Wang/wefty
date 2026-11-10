@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -922,5 +923,68 @@ func TestAllocationENOSPCJoinedWithACloseFailureStaysAnEngineFailure(t *testing.
 				t.Fatalf("%s discarded the destination in doubt: %v", arm.name, err)
 			}
 		})
+	}
+}
+
+func captureHelperLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buffer bytes.Buffer
+	previousOutput, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetFlags(previousFlags)
+	})
+	return &buffer
+}
+
+// The wire carries only the method and a closed reason for an engine failure,
+// so the helper log is the only record of why a copy failed (#1128). A typed
+// refusal that becomes an absence receipt is not a failure and is not logged.
+func TestComputerStorageCopyLogsTheEngineFailureItDropsFromTheWire(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+		computerBackupAllocate: func(string, int64) error { return errors.Join(unix.ENOSPC, unix.EIO) },
+		storageCopyFinalize:    fakeCloneFinalize(t)}
+	logged := captureHelperLog(t)
+	if _, err := engine.CopyComputerStorage(t.Context(), request); err == nil || !errors.Is(err, unix.EIO) {
+		t.Fatalf("copy err = %v, want an engine failure", err)
+	}
+	want := fmt.Sprintf("OCI helper Computer Storage copy failed operation=clone computer_id=%q storage_generation=%d cause=",
+		request.Destination.ComputerID, request.Destination.StorageGeneration)
+	if line := logged.String(); strings.Count(line, "\n") != 1 || !strings.HasPrefix(line, want) ||
+		!strings.Contains(line, unix.EIO.Error()) {
+		t.Fatalf("helper log = %q, want one line starting %q naming the I/O error", line, want)
+	}
+
+	refusalRoot, refusalSystem, refusalSource := publishedStorageCopySource(t)
+	refusal := storageCopyTestRequest(refusalSource, "clone", refusalSource.Receipt.AllocatedSize)
+	refusingEngine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: refusalRoot}, diskSystem: refusalSystem,
+		computerBackupAllocate: func(string, int64) error { return unix.ENOSPC },
+		storageCopyFinalize:    fakeCloneFinalize(t)}
+	logged.Reset()
+	response, err := refusingEngine.CopyComputerStorage(t.Context(), refusal)
+	if err != nil || response.Receipt.Kind != "computer_storage_copy_failed_absent" {
+		t.Fatalf("capacity refusal = %+v err=%v", response.Receipt, err)
+	}
+	if logged.Len() != 0 {
+		t.Fatalf("a typed refusal was logged as a copy failure: %q", logged.String())
+	}
+}
+
+func TestComputerStorageCopyFailureLogHidesTranslatedCustodyPaths(t *testing.T) {
+	engine := &ContainerdEngine{config: NativeEngineConfig{HostMountRoot: "/Users/operator/mounts",
+		GuestMountRoot: "/var/tmp/wefty-operator-mounts", AllowedMountRoots: []string{"/var/tmp/wefty-operator-mounts"}}}
+	external := "/Users/operator/mounts/private-project/custody-1/"
+	err := fmt.Errorf("Custody path %q is invalid: open /var/tmp/wefty-operator-mounts/private-project/custody-1/custody.json: EIO; root %s",
+		external, "/var/tmp/wefty-operator-mounts")
+	got := storageCopyFailureCause(err, engine.operatorPaths(external))
+	if want := `Custody path "<custody-path>" is invalid: open <custody-path>/custody.json: EIO; root <operator-mount-root>`; got != want {
+		t.Fatalf("cause = %q\nwant    %q", got, want)
+	}
+	if paths := (&ContainerdEngine{}).operatorPaths(""); len(paths) != 0 {
+		t.Fatalf("no Custody path and no roots produced %+v", paths)
 	}
 }
