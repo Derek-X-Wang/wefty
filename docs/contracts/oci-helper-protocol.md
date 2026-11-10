@@ -2180,7 +2180,8 @@ for all outstanding replies before acknowledging its open, unread stream fence.
 
 Ordinary callers cannot submit arbitrary heartbeat renewal lists. The agent
 queues one attempt renewal only on the successful L1 renewal path, only when
-the returned directive is empty, and only after helper `Run` has admitted that
+the returned directive is empty or `cancel` (a canceled attempt keeps its
+deadman in step while its forced stop runs, #1444), and only after helper `Run` has admitted that
 exact tuple and its full Started evidence has reached L1. A
 pre-admission renewal is retained as an absolute expiry and the latest one is
 queued after authoritative `Started`; its remaining lifetime is calculated

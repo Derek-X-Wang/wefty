@@ -1868,6 +1868,12 @@ outcome; a later completion records the actual process result but makes the
 job `failed`/`canceled`, even for a TERM-handler exit zero. Lease loss or
 reconciliation at the deadline settles a silent node as `failed`/`canceled`
 with an attempt `lost`, never a manufactured result or termination confirmation.
+Renewal during that window extends the lease by the normal duration, capped at
+the settlement deadline. The node keeps renewing through the forced stop and
+local finalization, then delivers the completion through its existing live or
+recovery route. A forced stop that outlasts one lease therefore keeps an
+authoritative completion when delivery lands before lease expiry and the
+settlement deadline; otherwise the existing late-evidence rules apply (#1444).
 One-shot secret scrubbing uses the same terminal trigger as ordinary completion.
 
 Claim, process and OCI `/started` acknowledgement, legacy start promotion by renewal or
