@@ -169,8 +169,8 @@ jobs:
       matrix:
         include:
           - {os: macos-15, image: xfce}
-          - {os: ubuntu-latest, image: xfce}
-          - {os: ubuntu-latest, image: wayland}
+          - {os: ubuntu-24.04, image: xfce}
+          - {os: ubuntu-24.04, image: wayland}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 100
     env:
@@ -638,13 +638,13 @@ jobs:
         if: needs.resolve-published-artifact.outputs.available == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: service-acceptance-realtiming-ubuntu-latest-xfce-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          name: service-acceptance-realtiming-ubuntu-24.04-xfce-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/linux-computer-receipt-xfce
       - name: Download the Linux Wayland matrix receipt
         if: needs.resolve-published-artifact.outputs.available == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: service-acceptance-realtiming-ubuntu-latest-wayland-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
+          name: service-acceptance-realtiming-ubuntu-24.04-wayland-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/linux-computer-receipt-wayland
       - name: Download the machine Fabric identity receipt
         if: needs.fabric-machine-identity.result == 'success'
