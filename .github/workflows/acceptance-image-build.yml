@@ -323,7 +323,7 @@ jobs:
             network=host
       # Cache immutable snapshot files for apt and source builds; keep both empty-cache image solves unchanged.
       - name: Restore Debian snapshot files
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/debian-snapshot-cache
           key: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -343,7 +343,7 @@ jobs:
       - name: Restore the verified mise binary
         id: mise-cache
         if: matrix.variant == 'wayland'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/mise-release
           key: mise-release-v1-linux-${{ matrix.arch }}-${{ steps.mise-pin.outputs.version }}-${{ steps.mise-pin.outputs.sha256 }}
@@ -355,7 +355,7 @@ jobs:
         run: bash scripts/fetch-mise-release.sh fetch "$ARCH" "$RUNNER_TEMP/mise-release"
       - name: Save the verified mise binary
         if: matrix.variant == 'wayland' && steps.mise-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/mise-release
           key: mise-release-v1-linux-${{ matrix.arch }}-${{ steps.mise-pin.outputs.version }}-${{ steps.mise-pin.outputs.sha256 }}
@@ -462,7 +462,7 @@ jobs:
         run: bash scripts/debian-snapshot-cache.sh stop
       - name: Save filled Debian snapshot files even after a failed build
         if: always() && steps.debian-cache-summary.outputs.stored != '' && steps.debian-cache-summary.outputs.stored != '0'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/debian-snapshot-cache
           key: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-${{ github.run_id }}-${{ github.run_attempt }}
