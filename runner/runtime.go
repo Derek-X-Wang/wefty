@@ -925,6 +925,15 @@ const (
 	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
 )
 
+// Reasons on a computer_storage_preparation_interrupted outcome. runtime_loss:
+// the helper session was lost mid-copy, and an import stays retryable.
+// engine_failure: the live session refused the copy, and the import or clone
+// ends (#1581).
+const (
+	ComputerStoragePreparationReasonRuntimeLoss   = "runtime_loss"
+	ComputerStoragePreparationReasonEngineFailure = "engine_failure"
+)
+
 // ComputerStoragePreparationOutcome is helper-authored evidence that a
 // detached destination cannot currently be prepared. Unlike an ordinary copy
 // error, these closed outcomes are safe for the agent to persist at L1.

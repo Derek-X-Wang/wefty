@@ -22,7 +22,7 @@ import (
 // refusal as loss let a Backup of a never-started clone tear the session down
 // on every redispatch (#558).
 func TestPerResourceRefusalsAreNotRuntimeLoss(t *testing.T) {
-	scoped := []Method{MethodDeleteVolume, MethodDeleteBackup, MethodCreateBackup}
+	scoped := []Method{MethodDeleteVolume, MethodDeleteBackup, MethodCreateBackup, MethodCopyStorage}
 	for _, operation := range scoped {
 		refusal := &RPCError{
 			Code: CodeEngineFailure, Message: "OCI engine operation failed",

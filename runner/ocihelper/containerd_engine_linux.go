@@ -2369,6 +2369,26 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 		}
 		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
 	}
+	// An import or clone that the live helper session refused (#1581) leaves
+	// its staged image and copy record, with no attachment manifest: no
+	// startup sweep follows a refusal the session answered. Removal runs the
+	// recovery step that sweep would run, under this call's generation flock,
+	// then reads the root again. Before `manifest_written` that is the exact
+	// rollback to a lock-only root; from there on it is the local publication
+	// the prepared-witness path below reads.
+	if recovered, recoveryErr := engine.recoverUnpublishedComputerStorageCopyForRemoval(ctx, root, name, request); recoveryErr != nil {
+		return InventoryRemovalResponse{}, recoveryErr
+	} else if recovered {
+		if absent, residueErr := computerDiskRemovalResidueAbsent(root, name); residueErr != nil {
+			return InventoryRemovalResponse{}, residueErr
+		} else if absent {
+			attempt, attemptErr := absentComputerStorageRemovalAttempt(request, storage)
+			if attemptErr != nil {
+				return InventoryRemovalResponse{}, attemptErr
+			}
+			return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+		}
+	}
 	manifest, present, manifestErr := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
 	if manifestErr != nil || !present {
 		return InventoryRemovalResponse{}, errors.Join(manifestErr, errors.New("legacy Computer removal has no readable disk manifest"))

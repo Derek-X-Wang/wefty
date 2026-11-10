@@ -863,9 +863,6 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 		if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
 			return Computer{}, protocolError(contract.ErrorInvalidRequest, "Custody import preparation outcome is mutually exclusive with copy receipts")
 		}
-		if row.Status != "reserved" {
-			return Computer{}, protocolError(contract.ErrorConflict, "Custody import is not awaiting preparation")
-		}
 		if err := validateStorageCopyPreparationOutcome(row, "Custody import", request.PreparationOutcome); err != nil {
 			return Computer{}, err
 		}
@@ -883,6 +880,13 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 			}
 			return readComputerAuthority(ctx, tx, destinationComputerID, now)
 		}
+		// The replay check precedes the status check because a terminal
+		// outcome leaves the operation `failed`: a node that never saw the
+		// acknowledgement land must be able to send the same one again and
+		// read the same answer.
+		if row.Status != "reserved" {
+			return Computer{}, protocolError(contract.ErrorConflict, "Custody import is not awaiting preparation")
+		}
 		if len(storedOutcomeJSON) != 0 {
 			var stored ComputerStoragePreparationOutcome
 			if err := json.Unmarshal(storedOutcomeJSON, &stored); err != nil {
@@ -897,6 +901,20 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 		outcomeJSON, err := json.Marshal(outcome)
 		if err != nil {
 			return Computer{}, internalError(err, "encode Custody import preparation outcome")
+		}
+		if terminalImportPreparationFailure(outcome) {
+			if err := latchComputerImportPreparationFailure(ctx, tx, row, request, outcomeJSON, bodyHash, now); err != nil {
+				return Computer{}, err
+			}
+			computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+			if err != nil {
+				return Computer{}, internalError(err, "read failed Custody import authority")
+			}
+			if err := tx.Commit(); err != nil {
+				return Computer{}, internalError(err, "commit failed Custody import preparation")
+			}
+			s.notifyComputerPolicyChanged()
+			return computer, nil
 		}
 		result, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET preparation_outcome_json=?,
 			preparation_acknowledgement_key=?, preparation_acknowledgement_hash=?

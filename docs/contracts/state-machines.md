@@ -762,8 +762,12 @@ it. The source Computer, its Storage, and its Backup are untouched. Quarantine
 stays reserved for a copy whose integrity is in doubt and is never how a clone
 reports that the disk was too small.
 
-A clone whose destination generation is quarantined, or whose helper session
-is lost while it copies, is terminal. Runtime loss proves a lost observation,
+A clone whose destination generation is quarantined, whose helper session
+is lost while it copies, or whose copy the live helper session refuses with a
+typed engine failure (#1581), is terminal. The two interruptions share
+`computer_storage_preparation_interrupted` and differ by reason
+(`runtime_loss` or `engine_failure`); the engine failure leaves the session and
+every other attempt on the Node running. Runtime loss proves a lost observation,
 not unrecoverable bytes: what it leaves behind depends on how far the copy had
 got. Before the destination manifest is written, helper recovery rolls the
 attempt back, deleting the staged image and the copy's own authority record

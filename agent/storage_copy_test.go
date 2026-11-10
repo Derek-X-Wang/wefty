@@ -222,3 +222,73 @@ func TestStorageCopyControllerRecordsImportRuntimeLossAsInterruptedPreparation(t
 		t.Fatalf("interrupted preparation acknowledgement = %#v", acknowledgement)
 	}
 }
+
+type countingStorageCopyCopier struct {
+	calls *int
+	errs  []error
+}
+
+func (copier countingStorageCopyCopier) CopyComputerStorage(context.Context, workloadrunner.ComputerStorageCopyRequest) (workloadrunner.ComputerStorageCopyReceipt, error) {
+	call := *copier.calls
+	*copier.calls++
+	if call < len(copier.errs) && copier.errs[call] != nil {
+		return workloadrunner.ComputerStorageCopyReceipt{}, copier.errs[call]
+	}
+	return workloadrunner.ComputerStorageCopyReceipt{Kind: "computer_storage_copy_verified", ReceiptID: "late-success", HelperGeneration: 13}, nil
+}
+
+// An engine_failure outcome ends the copy (#1581). When L1 does not accept its
+// acknowledgement, the next reconciliation sends the same acknowledgement
+// again and never calls the copy again: a second copy that succeeded would
+// complete a copy that has already failed for good.
+func TestStorageCopyControllerRetriesOnlyTheTerminalEngineFailureAcknowledgement(t *testing.T) {
+	recordedAt := time.Date(2026, 11, 10, 18, 30, 0, 0, time.UTC)
+	outcome := workloadrunner.ComputerStoragePreparationOutcome{
+		Code: workloadrunner.ComputerStoragePreparationInterrupted,
+		Storage: workloadrunner.ComputerStorage{ComputerID: "computer-clone", StorageID: "storage-clone",
+			StorageGeneration: 2, IntentRevision: 5, DiskBytes: 4 << 30},
+		HelperGeneration: 13, Operation: "computer_storage_copy",
+		Reason: workloadrunner.ComputerStoragePreparationReasonEngineFailure, RecordedAt: recordedAt,
+	}
+	var acknowledgements []l1.ComputerStorageCopyAcknowledgementRequest
+	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var acknowledgement l1.ComputerStorageCopyAcknowledgementRequest
+		if err := json.NewDecoder(request.Body).Decode(&acknowledgement); err != nil {
+			t.Errorf("decode acknowledgement: %v", err)
+		}
+		acknowledgements = append(acknowledgements, acknowledgement)
+		response.Header().Set("Content-Type", "application/json")
+		if len(acknowledgements) == 1 {
+			response.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = response.Write([]byte(`{"code":"internal","message":"L1 unavailable","retryable":true}`))
+			return
+		}
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	calls := 0
+	controller := newStorageCopyController(client, countingStorageCopyCopier{calls: &calls,
+		errs: []error{&workloadrunner.ComputerStoragePreparationError{Outcome: outcome}}}, nil,
+		"node-clone", "boot-clone", "root-clone", nil)
+	directive := l1.ComputerStorageCopyDirective{Operation: "clone", BoundNodeID: "node-clone", RootInstanceID: "root-clone",
+		DestinationComputerID: "computer-clone", DestinationStorageID: "storage-clone", DestinationGeneration: 2,
+		DestinationSize: 4 << 30, OperationRevision: 5}
+	if err := controller.process(t.Context(), directive); err == nil {
+		t.Fatal("first acknowledgement failure was not reported")
+	}
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatalf("retried acknowledgement: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("copier calls = %d, want 1: the terminal copy ran again", calls)
+	}
+	if len(acknowledgements) != 2 || acknowledgements[0].IdempotencyKey != acknowledgements[1].IdempotencyKey ||
+		acknowledgements[1].PreparationOutcome == nil ||
+		acknowledgements[1].PreparationOutcome.Reason != l1.ComputerStoragePreparationReasonEngineFailure ||
+		!acknowledgements[1].PreparationOutcome.RecordedAt.Equal(recordedAt) {
+		t.Fatalf("acknowledgements = %#v", acknowledgements)
+	}
+	// Once L1 has accepted it, the outcome is no longer held.
+	if len(controller.terminal) != 0 {
+		t.Fatalf("accepted terminal outcome is still held: %#v", controller.terminal)
+	}
+}

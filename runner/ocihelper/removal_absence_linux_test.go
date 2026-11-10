@@ -479,3 +479,89 @@ func TestResetPredecessorCreationWaitsForAbsentDeletion(t *testing.T) {
 		t.Fatalf("delayed predecessor attachment bypassed retirement: %v", err)
 	}
 }
+
+// An import or clone that the live helper session refused with an engine
+// failure is closed terminally at L1 while the session stays alive (#1581).
+// No startup sweep follows, so its root keeps the staged image and the copy
+// record and has no attachment manifest. Removal must still finish: it runs
+// the sweep's own recovery step under its generation flock, and only for a
+// copy record bound to the removal's own Storage, Node, root and Job.
+func TestRemovalRecoversACopyTheLiveSessionRefused(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		checkpoint computerStorageCopyPhase
+		absent     bool
+		foreign    bool
+	}{
+		{name: "before_manifest", checkpoint: computerStorageCopyCopied, absent: true},
+		{name: "after_manifest", checkpoint: computerStorageCopyManifestWritten},
+		// Attachment manifest written, receipt not yet persisted.
+		{name: "before_receipt", checkpoint: computerStorageCopyPublished},
+		{name: "foreign_authority", checkpoint: computerStorageCopyCopied, foreign: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				storageCopyFinalize: fakeCloneFinalize(t), capacityReservations: make(map[string]*capacityReservation),
+				attempts: make(map[string]*containerdAttempt)}
+			refused := errors.New("injected engine failure the live session answers")
+			engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+				if phase == test.checkpoint {
+					return refused
+				}
+				return nil
+			}
+			if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, refused) {
+				t.Fatalf("refused clone error = %v", err)
+			}
+			engine.storageCopyHook = nil
+			storage := request.Destination
+			name, _ := deterministicComputerDiskName(storage)
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			if _, err := os.Lstat(filepath.Join(diskRoot, "storage-copy.json")); err != nil {
+				t.Fatalf("refused clone left no copy record to recover: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(diskRoot, "attachment.json")); (err == nil) != (test.checkpoint == computerStorageCopyPublished) {
+				t.Fatalf("checkpoint %q attachment manifest presence = %v", test.checkpoint, err)
+			}
+			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: "removal-boot",
+				JobID: request.Authority.JobID, PriorJobID: request.Authority.JobID, RemovalGeneration: 2,
+				CleanupFence: "remove-refused-copy"}
+			inventoryRequest := InventoryRemovalRequest{Removal: removal,
+				RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}
+			if test.foreign {
+				inventoryRequest.Removal.JobID, inventoryRequest.Removal.PriorJobID = "other-job", "other-job"
+				if response, err := engine.InventoryRemoval(t.Context(), inventoryRequest); err == nil {
+					t.Fatalf("removal under foreign authority recovered the copy: %+v", response)
+				}
+				if _, err := os.Lstat(filepath.Join(diskRoot, "storage-copy.json")); err != nil {
+					t.Fatalf("foreign removal changed the copy record: %v", err)
+				}
+				return
+			}
+			inventory, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
+			if err != nil || len(inventory.Attempts) != 1 || !inventory.Attempts[0].StorageOnly ||
+				inventory.Attempts[0].StorageAbsent != test.absent {
+				t.Fatalf("refused-copy removal inventory = %+v err=%v", inventory, err)
+			}
+			if !test.absent {
+				// From manifest_written on, recovery is the helper's local
+				// publication, and removal reads its verified receipt.
+				if inventory.Attempts[0].StoragePreparation == nil {
+					t.Fatalf("published-recovery inventory has no preparation witness: %+v", inventory)
+				}
+				return
+			}
+			deleted, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+				Kind: ManagedVolumeComputerDisk, ComputerStorage: &storage, Removal: &removal,
+				StorageAbsent: true, QuarantineOnFailure: true, FailureAttempts: 3})
+			if err != nil || !deleted.Deleted || deleted.Quarantine != nil {
+				t.Fatalf("refused-copy removal = %+v err=%v", deleted, err)
+			}
+			if _, statErr := os.Lstat(diskRoot); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("refused-copy generation root survived removal: %v", statErr)
+			}
+		})
+	}
+}

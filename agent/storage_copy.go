@@ -25,6 +25,14 @@ type storageCopyController struct {
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
+	// terminal holds an engine_failure outcome until L1 accepts it (#1581).
+	// That outcome ends the copy, so a failed acknowledgement must be sent
+	// again as is, never by calling the copy again: a later success would
+	// complete a copy that has already failed for good. The same outcome keeps
+	// the same idempotency key and body. The map lives in memory; after an
+	// agent restart the next helper session sweeps the copy first, as after
+	// runtime loss.
+	terminal map[string]workloadrunner.ComputerStoragePreparationOutcome
 	wg       sync.WaitGroup
 }
 
@@ -35,7 +43,8 @@ func newStorageCopyController(client *Client, copier workloadrunner.ComputerStor
 	}
 	return &storageCopyController{client: client, copier: copier, backupper: backupper,
 		nodeID: nodeID, bootSessionID: bootSessionID, rootInstanceID: rootInstanceID,
-		logf: logf, inflight: make(map[string]struct{})}
+		logf: logf, inflight: make(map[string]struct{}),
+		terminal: make(map[string]workloadrunner.ComputerStoragePreparationOutcome)}
 }
 
 func (controller *storageCopyController) process(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {
@@ -50,6 +59,12 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			return errors.New("only restore has a published predecessor retirement phase")
 		}
 		return controller.retirePredecessor(ctx, directive)
+	}
+	controller.mu.Lock()
+	retained, terminal := controller.terminal[terminalCopyKey(directive)]
+	controller.mu.Unlock()
+	if terminal {
+		return controller.acknowledgeTerminalPreparation(ctx, directive, retained)
 	}
 	var oldBackupReceipt *l1.ComputerBackupCopyReceipt
 	if directive.KeepOldBackup {
@@ -105,12 +120,16 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 					StorageID: directive.DestinationStorageID, StorageGeneration: directive.DestinationGeneration,
 					IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize},
 				HelperGeneration: runtimeLoss.Generation.Generation, Operation: "computer_storage_copy",
-				Reason: "runtime_loss", RecordedAt: recordedAt,
+				Reason: workloadrunner.ComputerStoragePreparationReasonRuntimeLoss, RecordedAt: recordedAt,
 			}
 			return controller.acknowledgePreparation(ctx, directive, outcome)
 		}
 		var preparation *workloadrunner.ComputerStoragePreparationError
 		if acknowledges && errors.As(err, &preparation) {
+			if preparation.Outcome.Code == workloadrunner.ComputerStoragePreparationInterrupted &&
+				preparation.Outcome.Reason == workloadrunner.ComputerStoragePreparationReasonEngineFailure {
+				return controller.acknowledgeTerminalPreparation(ctx, directive, preparation.Outcome)
+			}
 			return controller.acknowledgePreparation(ctx, directive, preparation.Outcome)
 		}
 		return err
@@ -125,6 +144,27 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
 			Receipt: receipt, OldBackupReceipt: oldBackupReceipt})
 	return err
+}
+
+func terminalCopyKey(directive l1.ComputerStorageCopyDirective) string {
+	return fmt.Sprintf("%s/%d/%d", directive.DestinationComputerID, directive.OperationRevision, directive.DestinationGeneration)
+}
+
+// acknowledgeTerminalPreparation retains a terminal engine_failure outcome
+// and sends it to L1, dropping it only once L1 has accepted it.
+func (controller *storageCopyController) acknowledgeTerminalPreparation(ctx context.Context, directive l1.ComputerStorageCopyDirective,
+	outcome workloadrunner.ComputerStoragePreparationOutcome) error {
+	key := terminalCopyKey(directive)
+	controller.mu.Lock()
+	controller.terminal[key] = outcome
+	controller.mu.Unlock()
+	if err := controller.acknowledgePreparation(ctx, directive, outcome); err != nil {
+		return err
+	}
+	controller.mu.Lock()
+	delete(controller.terminal, key)
+	controller.mu.Unlock()
+	return nil
 }
 
 func (controller *storageCopyController) acknowledgePreparation(ctx context.Context, directive l1.ComputerStorageCopyDirective,
