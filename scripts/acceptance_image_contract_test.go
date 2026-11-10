@@ -419,7 +419,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		if name == "scheduled" {
 			workflowText = scheduledText
 		}
-		for _, required := range []string{"{os: ubuntu-latest, image: xfce}", "{os: ubuntu-latest, image: wayland}", "WEFTY_OCI_COMPUTER_VARIANT", "wayland_computer_release/amd64-runtime.json", "ubuntu-latest-xfce-", "ubuntu-latest-wayland-"} {
+		for _, required := range []string{"{os: ubuntu-24.04, image: xfce}", "{os: ubuntu-24.04, image: wayland}", "WEFTY_OCI_COMPUTER_VARIANT", "wayland_computer_release/amd64-runtime.json", "ubuntu-24.04-xfce-", "ubuntu-24.04-wayland-"} {
 			if !strings.Contains(workflowText, required) {
 				t.Fatalf("%s realtiming image dimension is missing %q", name, required)
 			}
