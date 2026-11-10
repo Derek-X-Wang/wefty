@@ -1252,6 +1252,17 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodCreateBackup {
 			return false
 		}
+		// A Computer Storage copy (import, clone or restore) is the same
+		// shape again: one destination generation, separately authorized,
+		// file-level mechanics that never touch the engine namespace. A typed
+		// failure answered on this session proves the session answered.
+		// Reading it as loss made one failed import or clone close the
+		// session and end every attempt on the Node (#1581). The adapter
+		// turns the failure of an import or clone into a terminal,
+		// exact-generation preparation outcome of its own.
+		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodCopyStorage {
+			return false
+		}
 		// The retained-handoff inventory is a read. It mutates nothing, holds
 		// no authority over any attempt, and a node whose accounting pass
 		// failed is still a node that can place work -- so reading its

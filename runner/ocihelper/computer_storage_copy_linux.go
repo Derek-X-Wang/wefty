@@ -549,6 +549,67 @@ func (engine *ContainerdEngine) reconcileDeferredComputerStorageCopy(ctx context
 	return engine.clearOperationalComputerRecoveryDeferral(root, name, "computer_storage_copy")
 }
 
+// recoverUnpublishedComputerStorageCopyForRemoval runs, for an authorized
+// removal, the recovery step the startup sweep runs on a copy that never
+// published (#1581). An import or clone that the live session refused with an
+// engine failure is closed terminally at L1 while the session stays alive, so
+// no sweep follows it, and its root keeps a staged image and a copy record but
+// no attachment manifest: a shape removal could not inventory, so the latched
+// Computer could not be removed until the helper restarted.
+//
+// The copy writes the attachment manifest before its receipt; a failure
+// between the two leaves both, and that never-attached shape is recovered too.
+//
+// The caller holds the generation flock. The copy record must name this exact
+// Storage, Node and managed root, and the Job the removal names or its prior
+// Job. A record the sweep already deferred, a published record, and a
+// destination still mounted or loop-attached are left to the paths that own
+// them. It reports whether recovery ran; a recovery error is returned and the
+// residue waits for the startup sweep.
+func (engine *ContainerdEngine) recoverUnpublishedComputerStorageCopyForRemoval(ctx context.Context, root, name string,
+	request InventoryRemovalRequest) (bool, error) {
+	manifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
+	if err != nil || !present || manifest.Phase == computerStorageCopyPublished || manifest.Recovery.Attempts > 0 {
+		return false, err
+	}
+	authority := manifest.Request.Authority
+	if !sameComputerStorageIdentity(manifest.Request.Destination, *request.ComputerStorage) ||
+		authority.NodeID != request.Removal.NodeID || authority.RootInstanceID != request.RootInstanceID ||
+		authority.JobID == "" || authority.JobID != request.Removal.JobID && authority.JobID != request.Removal.PriorJobID {
+		return false, errors.New("unpublished Computer Storage copy does not match removal authority")
+	}
+	// The copy writes the attachment manifest before it persists its receipt,
+	// so a copy refused in that interval has both. Only that exact shape is
+	// recovered: a `manifest_written` record beside the never-attached
+	// manifest the copy itself writes. Any other attachment history belongs
+	// to the paths that own it.
+	attachment, attachmentPresent, err := readComputerDiskManifest(filepath.Join(root, "attachment.json"))
+	if err != nil {
+		return false, err
+	}
+	if attachmentPresent && (manifest.Phase != computerStorageCopyManifestWritten ||
+		!sameComputerStorageIdentity(attachment.Storage, manifest.Request.Destination) || !attachment.Prepared ||
+		attachment.Attached != nil || attachment.Pending != nil || attachment.PreviousDetachment != nil ||
+		attachment.Retirement != nil || attachment.LoopDevice != "" || attachment.PreparationReceipt != nil) {
+		return false, nil
+	}
+	mountPath := filepath.Join(engine.config.RuntimeRoot, "computer-copy-mounts", name)
+	if _, mounted, err := engine.computerDiskSystem().mountedSource(mountPath); err != nil {
+		return false, err
+	} else if mounted {
+		return false, errors.New("unpublished Computer Storage copy remains mounted")
+	}
+	if loops, err := engine.computerDiskSystem().loopsForRoot(root); err != nil {
+		return false, err
+	} else if len(loops) != 0 {
+		return false, errors.New("unpublished Computer Storage copy remains loop-attached")
+	}
+	if _, err := engine.resumeComputerStorageCopy(ctx, root, name); err != nil {
+		return false, fmt.Errorf("recover unpublished Computer Storage copy for removal: %w", err)
+	}
+	return true, nil
+}
+
 // computerDiskRemovalResidueAbsent reports the generation-root shapes that
 // hold no bytes at all, which an authorized removal therefore deletes whole:
 // the exact refusal shape -- its own lock and its own durable tombstone -- and

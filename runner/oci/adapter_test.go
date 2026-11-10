@@ -68,11 +68,15 @@ func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.
 	}
 }
 
-func TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent(t *testing.T) {
-	// A clone owns a fresh destination generation exactly as an import does,
-	// so both carry the helper generation the agent needs to close the
-	// interruption at L1 instead of copying forever (#526). A restore keeps
-	// its predecessor's bytes and stays an ordinary engine failure.
+func TestComputerStorageCopyEngineFailureEndsOnlyThatCopy(t *testing.T) {
+	// A typed engine failure the live session answered for one copy is not
+	// runtime loss (#1581). Read as loss, it closed the helper session and
+	// ended every attempt on the Node. Now the session stays healthy. An
+	// import or a clone owns a fresh destination generation, so the failure
+	// reaches the agent as the terminal, exact-generation interrupted outcome
+	// with reason engine_failure, bound to the live helper generation. A
+	// restore keeps its predecessor's bytes and stays an ordinary engine
+	// failure.
 	for _, test := range []struct {
 		operation string
 		bound     bool
@@ -98,18 +102,31 @@ func TestComputerStorageCopyRuntimeLossCarriesHelperGenerationToAgent(t *testing
 			}
 			_, err = adapter.CopyComputerStorage(t.Context(), request)
 			var loss *workloadrunner.RuntimeLossError
-			var rpcError *ocihelper.RPCError
-			if !errors.As(err, &rpcError) || rpcError.Code != ocihelper.CodeEngineFailure ||
-				rpcError.EngineFailure == nil || rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage ||
-				rpcError.EngineFailure.Reason != ocihelper.EngineFailureOperationFailed {
-				t.Fatalf("%s engine failure = %v", test.operation, err)
+			if errors.As(err, &loss) {
+				t.Fatalf("%s engine failure read as runtime loss: %v", test.operation, err)
 			}
-			if errors.As(err, &loss) != test.bound {
-				t.Fatalf("%s runtime loss = %#v, want bound=%t", test.operation, loss, test.bound)
+			if healthErr := session.HealthError(); healthErr != nil {
+				t.Fatalf("%s engine failure closed the helper session: %v", test.operation, healthErr)
 			}
-			if test.bound && (loss.Generation.InstanceID != handshake.HelperInstanceID ||
-				loss.Generation.Generation != handshake.SessionGeneration) {
-				t.Fatalf("%s runtime loss generation = %#v", test.operation, loss.Generation)
+			var preparation *workloadrunner.ComputerStoragePreparationError
+			if errors.As(err, &preparation) != test.bound {
+				t.Fatalf("%s preparation outcome = %v, want bound=%t", test.operation, err, test.bound)
+			}
+			if !test.bound {
+				var rpcError *ocihelper.RPCError
+				if !errors.As(err, &rpcError) || rpcError.Code != ocihelper.CodeEngineFailure ||
+					rpcError.EngineFailure == nil || rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage {
+					t.Fatalf("%s engine failure = %v", test.operation, err)
+				}
+				return
+			}
+			outcome := preparation.Outcome
+			if outcome.Code != workloadrunner.ComputerStoragePreparationInterrupted ||
+				outcome.Reason != workloadrunner.ComputerStoragePreparationReasonEngineFailure ||
+				outcome.Operation != "computer_storage_copy" || outcome.Storage != request.Destination ||
+				outcome.HelperGeneration != handshake.SessionGeneration || outcome.HelperGeneration == 0 ||
+				outcome.SweepEpoch != "" || outcome.RecordedAt.IsZero() {
+				t.Fatalf("%s preparation outcome = %#v", test.operation, outcome)
 			}
 		})
 	}

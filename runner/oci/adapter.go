@@ -2523,6 +2523,24 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 			}
 		}
 		var rpcError *ocihelper.RPCError
+		// A typed engine failure the live session answered for this copy is
+		// not runtime loss (#1581): the session and every other attempt on
+		// the Node stay up. For an import or a clone it ends that one copy,
+		// as the exact-generation outcome bound to the live helper generation.
+		// There is no retry: the same call on the same session fails the same
+		// way. A restore keeps an ordinary error, because its predecessor
+		// still owns the bytes.
+		if (request.Operation == "import" || request.Operation == "clone") && errors.As(err, &rpcError) &&
+			rpcError.Code == ocihelper.CodeEngineFailure && rpcError.EngineFailure != nil &&
+			rpcError.EngineFailure.Operation == ocihelper.MethodCopyStorage {
+			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.ComputerStoragePreparationError{
+				Outcome: workloadrunner.ComputerStoragePreparationOutcome{
+					Code: workloadrunner.ComputerStoragePreparationInterrupted, Storage: request.Destination,
+					HelperGeneration: handshake.SessionGeneration, Operation: "computer_storage_copy",
+					Reason: workloadrunner.ComputerStoragePreparationReasonEngineFailure, RecordedAt: time.Now().UTC(),
+				},
+			}
+		}
 		if errors.As(err, &rpcError) && (rpcError.Code == ocihelper.CodeComputerStorageResumeDeferred || rpcError.Code == ocihelper.CodeComputerStorageQuarantined) {
 			outcome := workloadrunner.ComputerStoragePreparationOutcome{
 				Code: string(rpcError.Code), Storage: request.Destination, HelperGeneration: handshake.SessionGeneration,

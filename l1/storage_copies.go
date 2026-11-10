@@ -116,6 +116,16 @@ const (
 	ComputerStoragePreparationQuarantined    = "computer_storage_quarantined"
 )
 
+// The reasons an agent writes on a computer_storage_preparation_interrupted
+// observation it authors itself. runtime_loss: the helper session was lost
+// mid-copy. engine_failure: the live session answered the copy with a typed
+// engine failure (#1581). The reason is free text on the wire; L1 reads only
+// engine_failure, which makes an interrupted Custody import terminal.
+const (
+	ComputerStoragePreparationReasonRuntimeLoss   = "runtime_loss"
+	ComputerStoragePreparationReasonEngineFailure = "engine_failure"
+)
+
 // ComputerStoragePreparationOutcome carries a generation-bound helper recovery
 // result or an agent observation of typed helper runtime loss for one exact
 // never-attached destination generation.
@@ -1020,6 +1030,55 @@ func terminalClonePreparationFailure(code string) bool {
 	return code == ComputerStoragePreparationQuarantined || code == ComputerStoragePreparationInterrupted
 }
 
+// terminalImportPreparationFailure reports whether a preparation outcome ends a
+// Custody import. Only one does: a copy that the live helper session answered
+// with a typed engine failure (#1581). Runtime loss stays retryable for an
+// import, because the next session's startup sweep rolls the copy back or
+// completes it, and the next directive then finishes the work. An engine
+// failure on a live session has no such recovery: the same call on the same
+// session would fail again, and its acknowledgement would come back on every
+// sweep (the #526 shape). Deferral and quarantine stay recorded observations.
+func terminalImportPreparationFailure(outcome ComputerStoragePreparationOutcome) bool {
+	return outcome.Code == ComputerStoragePreparationInterrupted &&
+		outcome.Reason == ComputerStoragePreparationReasonEngineFailure
+}
+
+// latchComputerImportPreparationFailure closes a Custody import that a live
+// helper refused with an engine failure. It has the shape of a terminal clone:
+// the operation records `failed` with the typed outcome, the never-published
+// generation is retired, the destination Job latches the code, and the
+// destination leaves `importing` latched failed. It deletes nothing and keeps
+// the Computer identity. The helper may still hold bytes under that identity,
+// and only an absence receipt authorizes deleting them: ordinary removal of
+// the latched Computer proves absence through the removal inventory.
+func latchComputerImportPreparationFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	request ComputerStorageCopyAcknowledgementRequest, outcomeJSON []byte, bodyHash string, now time.Time) error {
+	computer, err := readComputerAuthority(ctx, tx, row.DestinationComputerID, now)
+	if err != nil {
+		return internalError(err, "read failed Custody import target")
+	}
+	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationImporting ||
+		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision {
+		return protocolError(contract.ErrorStaleIntentRevision, "Custody import no longer owns its preparation outcome")
+	}
+	outcome := *request.PreparationOutcome
+	latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureCode(outcome.Code),
+		Message: "Custody import preparation reported " + outcome.Code + " (" + outcome.Reason + ")",
+		NodeID:  row.BoundNodeID, RequestedBytes: row.DestinationSize})
+	if err != nil {
+		return internalError(err, "encode Custody import preparation failure")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		failure_code=?, preparation_outcome_json=?, preparation_acknowledgement_key=?,
+		preparation_acknowledgement_hash=?, completed_ns=?
+		WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
+		outcome.Code, outcomeJSON, request.IdempotencyKey, bodyHash, now.UnixNano(),
+		row.DestinationComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "record failed Custody import preparation")
+	}
+	return closeTerminalComputerCopy(ctx, tx, row, ComputerReconfigurationImporting, latchedFailure, now)
+}
+
 // latchComputerCloneCapacityFailure gives a refused clone the terminal
 // capacity latch a refused grow already has. The receipt's own requested and
 // observed bytes become the Job's typed `insufficient_disk` failure, the
@@ -1046,7 +1105,7 @@ func latchComputerCloneCapacityFailure(ctx context.Context, tx *sql.Tx, row comp
 		now.UnixNano(), now.UnixNano(), row.DestinationComputerID, row.OperationRevision); err != nil {
 		return internalError(err, "record refused Computer clone")
 	}
-	return closeTerminalComputerClone(ctx, tx, row, latchedFailure, now)
+	return closeTerminalComputerCopy(ctx, tx, row, ComputerReconfigurationCloning, latchedFailure, now)
 }
 
 // latchComputerClonePreparationFailure closes a clone whose destination can
@@ -1080,7 +1139,7 @@ func latchComputerClonePreparationFailure(ctx context.Context, tx *sql.Tx, row c
 		row.DestinationComputerID, row.OperationRevision); err != nil {
 		return internalError(err, "record unpreparable Computer clone")
 	}
-	return closeTerminalComputerClone(ctx, tx, row, latchedFailure, now)
+	return closeTerminalComputerCopy(ctx, tx, row, ComputerReconfigurationCloning, latchedFailure, now)
 }
 
 func requireCloningComputerCloneAuthority(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow, now time.Time) error {
@@ -1098,13 +1157,15 @@ func requireCloningComputerCloneAuthority(ctx context.Context, tx *sql.Tx, row c
 	return nil
 }
 
-// closeTerminalComputerClone retires the never-published destination
+// closeTerminalComputerCopy retires the never-published destination
 // generation and latches the destination failed with the caller's typed
-// failure. It is the shared tail of every terminal clone outcome, so a
-// capacity refusal and an unpreparable destination leave exactly the same
-// readable wreckage behind.
-func closeTerminalComputerClone(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
-	latchedFailure []byte, now time.Time) error {
+// failure. It is the shared tail of every terminal clone outcome and of a
+// Custody import that a live helper refused (#1581), so a capacity refusal and
+// an unpreparable destination leave exactly the same readable wreckage behind.
+// phase is the reconfiguration phase the destination leaves: `cloning` or
+// `importing`.
+func closeTerminalComputerCopy(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	phase ComputerReconfigurationPhase, latchedFailure []byte, now time.Time) error {
 	retired, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
 		WHERE computer_id=? AND storage_generation=? AND phase='staging' AND reset_revision=?`, now.UnixNano(),
 		row.DestinationComputerID, row.DestinationGeneration, row.OperationRevision)
@@ -1130,8 +1191,8 @@ func closeTerminalComputerClone(ctx context.Context, tx *sql.Tx, row computerSto
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
 		reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=?
-		AND reconfiguration_phase='cloning'`, row.OperationRevision, now.UnixNano(),
-		row.DestinationComputerID, row.OperationRevision)
+		AND reconfiguration_phase=?`, row.OperationRevision, now.UnixNano(),
+		row.DestinationComputerID, row.OperationRevision, phase)
 	if err != nil {
 		return internalError(err, "close refused Computer clone")
 	}

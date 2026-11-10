@@ -52,7 +52,13 @@ visible, while the first durable preparation outcome ends `--wait` immediately
 with distinct interrupted/failed, deferred, or quarantined wording and exit
 status instead of a generic wait deadline. Preparation acknowledgements carry
 their idempotency key and hash. L1 accepts an identical replay, rejects an older
-helper generation or timestamp, and keeps the copy directive retryable. A
+helper generation or timestamp, and keeps the copy directive retryable. The
+one exception is an interruption with reason `engine_failure`: the live helper
+session refused the copy, the same call would fail the same way, so L1 closes
+the import terminally, as it closes a clone. The operation records `failed`,
+the never-published generation is retired, and the destination leaves
+`importing` latched failed with its identity kept for ordinary removal; nothing
+on the Node is deleted (#1581). A
 later successful or terminal copy receipt clears the provisional evidence and
 success remains the only route to publication. The terminal import operation
 row is retained as immutable idempotency and provenance authority; deleting it
