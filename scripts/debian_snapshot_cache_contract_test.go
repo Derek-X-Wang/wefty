@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const snapshotCacheAction = "0057852bfaa89a56745cba8c7296529d2fc39830"
+const snapshotCacheAction = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
 
 const snapshotXvfbProbe = "pool/main/x/xorg-server/xvfb_21.1.7-3%2bdeb12u12"
 const snapshotWayvncProbe = "pool/main/w/wayvnc/wayvnc_0.9.1-1"
