@@ -19,14 +19,14 @@ require (
 	github.com/tailscale/hujson v0.0.0-20260727124030-b80ff77dac4f
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7
 	golang.org/x/net v0.62.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.47.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	howett.net/plist v1.0.1
-	modernc.org/sqlite v1.61.0
-	tailscale.com v1.104.4
+	modernc.org/sqlite v1.61.1
+	tailscale.com v1.104.5
 )
 
 require (
