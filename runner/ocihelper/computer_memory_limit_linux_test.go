@@ -127,7 +127,10 @@ func TestComputerCgroupMemorySetHighMarginReadsBackExactBytes(t *testing.T) {
 	}{
 		{name: "written", ok: true},
 		{name: "missing file", file: "-"},
-		{name: "kernel kept another value", file: "/"},
+		{name: "file is a directory", file: "/"},
+		// The write overwrites only the first 10 bytes, so the readback is a
+		// valid integer that is not the margin.
+		{name: "kernel kept another value", file: "99999999999"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -140,6 +143,11 @@ func TestComputerCgroupMemorySetHighMarginReadsBackExactBytes(t *testing.T) {
 			case "/":
 				// A directory accepts no write and reads back no integer.
 				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "-":
+			default:
+				if err := os.WriteFile(path, []byte(tc.file), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
