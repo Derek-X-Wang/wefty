@@ -20,6 +20,18 @@ the cluster rather than to the AI agent's session.
 
 Install by copying `skills/wefty/` to `~/.claude/skills/wefty/` (Claude Code) or `~/.agents/skills/wefty/` (Codex). `wefty setup` does this on a Mac it sets up.
 
+| To | Read |
+| --- | --- |
+| check the cluster can take work | [Start here](#start-here-is-the-cluster-ready) |
+| offload a check and collect its result | [Recipe: offload a check](#recipe-offload-a-check-and-collect-its-result), then [`exec`](#one-command-with-local-changes-wefty-exec) |
+| use a Seat, copy results out, release it | [Recipe: use a Seat](#recipe-use-a-seat-and-release-it), then [Seats](#request-a-computer-seat) |
+| repeat a Run; rerun versus Backup | [Recipe: rerun a Run](#recipe-rerun-a-run), then [retry safety](#retry-safety-and-deliberate-repeats) |
+| submit, wait, read results, exit codes | [The loop](#the-loop) |
+| run commands, drive the screen, copy files on a Seat | [Seat commands](#run-a-command-on-a-seat), [screen](#drive-a-seats-screen), [copy](#copy-files-to-or-from-a-seat) |
+| open a hosted service | [Opening a hosted service](#opening-a-hosted-service) |
+| write a workflow and report from it | [Writing](#writing-the-workflow), [Reporting](#reporting-from-a-workflow), [Judging results](#judging-results) |
+| issue to draft PR; branch gates | [Recipe: issue to PR](#recipe-an-issue-to-a-draft-pr), [Recipe: branch gates](#recipe-branch-gates) |
+
 ## Start here: is the cluster ready?
 
 ```sh
@@ -124,6 +136,53 @@ right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
 
+## Recipe: offload a check and collect its result
+
+```sh
+set -o pipefail
+wefty status                                # exit 12: stop and report the verdict
+RUN_ID=$(wefty exec --detach --json -- go test ./... | jq -er '.run_id')
+wefty wait "$RUN_ID" --timeout 30m          # 0 pass, 10 fail, 11 wait again
+wefty logs "$RUN_ID" --tail 50              # the command's output
+```
+
+The run outlives your session. `exec` returns no files: the result is the exit
+code and the log. When you need files back, use a Seat.
+
+## Recipe: use a Seat and release it
+
+```sh
+wefty seat request --network internet      # prints SEAT_ID, then waits for approval
+wefty exec --seat SEAT_ID --max-runtime 2h -- make test
+wefty cp SEAT_ID:work/out/report.html ./report.html
+wefty seat release SEAT_ID
+```
+
+If the request call is cut off, continue with `wefty seat wait SEAT_ID`.
+Run `exec --seat` from your checkout; the Seat's copy is at `work`. Copy results
+out before release: release deletes the Seat folder.
+
+## Recipe: rerun a Run
+
+```sh
+set -o pipefail
+NEW_ID=$(wefty --json rerun RUN_ID --again | jq -er '.run_id')
+wefty wait "$NEW_ID" --timeout 30m
+```
+
+A rerun is a new Run from the source Run's frozen inputs: program, params, tags
+and image digest. Without `--again`, the same request replays the first rerun.
+An exec snapshot is deleted when its run ends; rerun refuses an exec Run whose
+snapshot is deleted (exit 2), so run `wefty exec` again. A Seat Run is refused
+(exit 5); start a new Seat Run.
+
+**A rerun repeats work; a Backup keeps data.** A rerun repeats a Run's frozen
+program and inputs; it restores no Computer's Storage. A Computer Backup
+(`wefty services backup create COMPUTER ...`) copies one generation of a
+Computer's Storage, and `wefty services restore COMPUTER BACKUP ...` puts that
+Storage back on a stopped Computer and runs no work. Both need more flags; run
+either with no arguments to print its usage.
+
 ## The owner's host VM switch
 
 On a Mac, `wefty node oci off|on-demand|always-on` sets the host VM switch.
@@ -149,8 +208,6 @@ wefty seat request --network internet
 wefty seat request --network none
 wefty seat request --network internet --dedicated
 wefty seat request --network internet --window 8h
-wefty seat wait SEAT_ID
-wefty seat release SEAT_ID
 wefty seat --help
 ```
 
@@ -180,7 +237,6 @@ person, including input made by commands such as Playwright or `xdotool`.
 When the Seat is ready, use [Drive a Seat's screen](#drive-a-seats-screen)
 for screenshots and input.
 
-Release when done: `wefty seat release SEAT_ID`. Copy results out first.
 Release stops commands and programs, then deletes the Seat folder after cleanup.
 An idle Seat expires after 30 minutes; log following counts only at start.
 
@@ -577,12 +633,7 @@ wefty --json runs list --status running   # just what is in flight
 wefty logs <run_id> --follow              # live tail (poll-based)
 wefty logs <run_id> --all                 # a finished run's full retained log
 wefty logs <run_id> --tail 50             # the end of a run's log
-wefty rerun <run_id>                      # first call creates; identical retries replay
-wefty rerun <run_id> --again              # deliberately repeat the stored snapshot
 ```
-
-An exec snapshot is deleted when its run ends. Rerun refuses a deleted exec
-snapshot before creating a run (exit 2); run `wefty exec` again.
 
 Every command above accepts `--json`, and `--json` is what a script should use:
 the table forms are for people and their columns are not a contract.
