@@ -942,7 +942,7 @@ func captureHelperLog(t *testing.T) *bytes.Buffer {
 // The wire carries only the method and a closed reason for an engine failure,
 // so the helper log is the only record of why a copy failed (#1128). A typed
 // refusal that becomes an absence receipt is not a failure and is not logged.
-func TestComputerStorageCopyLogsTheEngineFailureItDropsFromTheWire(t *testing.T) {
+func TestComputerStorageCopyLogsTheEngineFailureTheWireDrops(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
 	request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
@@ -986,5 +986,49 @@ func TestComputerStorageCopyFailureLogHidesTranslatedCustodyPaths(t *testing.T) 
 	}
 	if paths := (&ContainerdEngine{}).operatorPaths(""); len(paths) != 0 {
 		t.Fatalf("no Custody path and no roots produced %+v", paths)
+	}
+}
+
+// Admission walks the operator's own directories, and its errors name their
+// components. A refused admission logs only that it failed, never the names.
+func TestComputerStorageCopyFailureLogOmitsCustodyAdmissionDetail(t *testing.T) {
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
+	exportRequest := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system,
+		storageCopyFinalize: importFinalize}
+	exported, err := engine.ExportComputerCustody(t.Context(), exportRequest)
+	if err != nil || exported.Receipt.Kind != "computer_custody_export_verified" {
+		t.Fatalf("Custody export fixture = %+v err=%v", exported.Receipt, err)
+	}
+	moved := filepath.Join(mountRoot, "private-project")
+	if err := os.Rename(externalRoot, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, externalRoot); err != nil {
+		t.Fatal(err)
+	}
+	request := storageCopyTestRequest(source, "import", source.Receipt.AllocatedSize)
+	request.Destination.ComputerID = "import-computer"
+	request.Destination.StorageID = "import-storage"
+	request.Destination.StorageGeneration = 1
+	request.ExportID = exportRequest.ExportID
+	request.ExternalPath = externalRoot
+	request.ManifestDigest = exported.Receipt.ManifestDigest
+	request.Authority.JobID = "import-job"
+	logged := captureHelperLog(t)
+	response, err := engine.CopyComputerStorage(t.Context(), request)
+	if err == nil || response.Receipt.Kind != "" {
+		t.Fatalf("symlinked Custody source = %+v err=%v, want an admission failure", response.Receipt, err)
+	}
+	line := logged.String()
+	if strings.Count(line, "\n") != 1 || !strings.Contains(line, "operation=import") ||
+		!strings.Contains(line, `cause="Custody import source admission failed`) {
+		t.Fatalf("helper log = %q, want one admission-failure line", line)
+	}
+	for _, private := range []string{mountRoot, filepath.Base(externalRoot), "private-project"} {
+		if strings.Contains(line, private) {
+			t.Fatalf("helper log = %q names operator path detail %q", line, private)
+		}
 	}
 }

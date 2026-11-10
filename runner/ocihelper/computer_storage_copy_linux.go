@@ -719,12 +719,33 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	// Registered first, so it runs last: a failure the deferred refusal below
 	// turns into an absence receipt is not logged, and the line is written
 	// after both copy mutexes are released.
+	var importAdmissionFailed bool
+	var importSourceName string
 	defer func() {
-		if returnedErr != nil {
-			log.Printf("OCI helper Computer Storage copy failed operation=%s computer_id=%q storage_generation=%d cause=%q",
-				request.Operation, request.Destination.ComputerID, request.Destination.StorageGeneration,
-				storageCopyFailureCause(returnedErr, engine.operatorPaths(request.ExternalPath)))
+		if returnedErr == nil {
+			return
 		}
+		var cause string
+		if importAdmissionFailed {
+			// Admission walks the operator's own directories, and its errors
+			// name their components and ancestors. That is an operator-input
+			// refusal, not the copy failure this line exists for, so only its
+			// closed code is logged.
+			cause = "Custody import source admission failed"
+			var mechanics *custodyExportMechanicsError
+			if errors.As(returnedErr, &mechanics) && mechanics.code != "" {
+				cause += " code=" + mechanics.code
+			}
+		} else {
+			paths := engine.operatorPaths(request.ExternalPath)
+			if importSourceName != "" {
+				paths = append(paths, operatorPath{importSourceName, "<custody-path>/" + filepath.Base(importSourceName)},
+					operatorPath{filepath.Dir(importSourceName), "<custody-path>"})
+			}
+			cause = storageCopyFailureCause(returnedErr, paths)
+		}
+		log.Printf("OCI helper Computer Storage copy failed operation=%s computer_id=%q storage_generation=%d cause=%q",
+			request.Operation, request.Destination.ComputerID, request.Destination.StorageGeneration, cause)
 	}()
 	engine.computerBackupMu.Lock()
 	defer engine.computerBackupMu.Unlock()
@@ -807,6 +828,10 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}()
 	if importSource {
 		sourceHandle, err = engine.validateImportCustodySource(request)
+		importAdmissionFailed = err != nil
+		if sourceHandle != nil {
+			importSourceName = sourceHandle.Name()
+		}
 	} else {
 		var copyName string
 		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
