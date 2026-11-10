@@ -3,6 +3,9 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"log"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -39,6 +42,14 @@ type computerMemoryRuntime interface {
 	// setHighMax writes memory.high=max and reads it back. "max" can never be
 	// below use, so the write never asks the kernel to reclaim (#1507).
 	setHighMax() error
+	// highFollowsLimit is true only when the helper proved at start that this
+	// kernel skips synchronous reclaim on an O_NONBLOCK memory.high write
+	// (Linux 6.16 and later, #1579).
+	highFollowsLimit() bool
+	// setHighMargin writes memory.high=computerMemoryHighBytes(limit) on a
+	// nonblocking descriptor and reads it back. Only highFollowsLimit kernels
+	// call it: on older kernels the write could reclaim synchronously.
+	setHighMargin(limit int64) error
 	recoverFreeze(context.Context) (bool, error)
 	shrink(context.Context, int64) (computerMemoryShrinkResult, error)
 	freezerRequests() int
@@ -164,10 +175,13 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 				consumeCleanup()
 			}
 		} else {
-			// A resized Computer has no memory.high margin (#1507). Clear it
-			// before the grow so memory.high never throttles below the new cap.
-			if err = runtime.setHighMax(); err != nil {
-				return response, err
+			// Where the margin cannot follow the resize, clear it before the grow
+			// so memory.high never throttles below the new cap (#1507). Where it
+			// can, the old margin stays until the confirmed limit replaces it.
+			if !runtime.highFollowsLimit() {
+				if err = runtime.setHighMax(); err != nil {
+					return response, err
+				}
 			}
 			*reserved = target
 			writeErr := runtime.writeLimit(target)
@@ -196,10 +210,12 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 		*reserved = actual
 		response.MemoryLimitBytes = actual
 		response.ReservedMemoryBytes = actual
-		// A confirmed shrink clears memory.high after memory.max; a held shrink
-		// keeps the margin. If this fails, the previous memory.high remains.
-		if target < old && response.HeldMemoryBytes == 0 {
-			if err = runtime.setHighMax(); err != nil {
+		// A confirmed resize moves memory.high after memory.max: to the margin
+		// below the confirmed limit where the kernel allows it, else to max. A
+		// held shrink keeps the margin. If this fails, the previous memory.high
+		// remains.
+		if (target < old && response.HeldMemoryBytes == 0) || (target > old && runtime.highFollowsLimit()) {
+			if err = followComputerMemoryHigh(runtime, actual); err != nil {
 				return response, err
 			}
 		}
@@ -210,4 +226,40 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 	}
 	response.ObservedAt = clock.Now().UTC().Round(0)
 	return response, nil
+}
+
+// followComputerMemoryHigh sets memory.high for a confirmed memory.max. A
+// margin that cannot be confirmed falls back to max, which never reclaims and
+// is what older kernels keep after every resize (#1579).
+func followComputerMemoryHigh(runtime computerMemoryRuntime, limit int64) error {
+	if !runtime.highFollowsLimit() {
+		return runtime.setHighMax()
+	}
+	marginErr := runtime.setHighMargin(limit)
+	if marginErr == nil {
+		return nil
+	}
+	if err := runtime.setHighMax(); err != nil {
+		return errors.Join(marginErr, err)
+	}
+	log.Printf("Computer memory.high margin was not confirmed after a resize; memory.high=max: %v", marginErr)
+	return nil
+}
+
+// memoryHighWriteSkipsReclaim reports whether a kernel release is Linux 6.16
+// or later, where a memory.high write on an O_NONBLOCK descriptor sets the
+// limit without synchronous reclaim (#1579). A release it cannot parse is
+// false, so the resize keeps memory.high=max.
+func memoryHighWriteSkipsReclaim(release string) bool {
+	majorText, rest, found := strings.Cut(release, ".")
+	minorText := rest
+	if end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' }); end >= 0 {
+		minorText = rest[:end]
+	}
+	major, majorErr := strconv.Atoi(majorText)
+	minor, minorErr := strconv.Atoi(minorText)
+	if !found || majorErr != nil || minorErr != nil || major < 0 || minor < 0 {
+		return false
+	}
+	return major > 6 || (major == 6 && minor >= 16)
 }

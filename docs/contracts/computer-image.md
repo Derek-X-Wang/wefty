@@ -476,8 +476,9 @@ The helper sets the Computer's whole-cgroup OOM policy and verifies the live
 cgroup before `Started`: `memory.max` equals the declared cap, `memory.high`
 keeps `min(128 MiB, cap/8)` of reclaim room below it (rounded down to the kernel
 page, at least one page; a mitigation for fast page-cache writers, not an OOM
-guarantee), `memory.oom.group=1`, and `memory.swap.max=0`. A later live resize
-sets `memory.high=max`. The successful profile receipt
+guarantee), `memory.oom.group=1`, and `memory.swap.max=0`. A later confirmed
+live resize moves the margin below the new limit on Linux 6.16 and later, and
+sets `memory.high=max` on older kernels (#1579). The successful profile receipt
 contains the `memory.max`, `memory.oom.group` and `memory.swap.max` read-back
 values; a `memory.high` mismatch fails closed before `Started`. The separate atomic admission receipt records
 setup-configured capacity, declared memory/disk arithmetic, plus timestamped

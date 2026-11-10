@@ -54,7 +54,7 @@ func (engine *ContainerdEngine) SetComputerMemoryLimit(ctx context.Context, requ
 	if err := validate(); err != nil {
 		return SetComputerMemoryLimitResponse{}, err
 	}
-	runtime, err := openComputerMemoryRuntime(engine.config.CgroupRoot, attempt.resources.CgroupID, snapshot, engine.config.Clock)
+	runtime, err := openComputerMemoryRuntime(engine.config.CgroupRoot, attempt.resources.CgroupID, snapshot, engine.config.Clock, engine.memoryHighFollowsLimit)
 	if err != nil {
 		return SetComputerMemoryLimitResponse{}, err
 	}
@@ -84,9 +84,10 @@ type computerCgroupMemory struct {
 	clock        Clock
 	freezeWrites int
 	cgroupID     string
+	followsLimit bool
 }
 
-func openComputerMemoryRuntime(root, id string, snapshot computerSeatAttemptSnapshot, clock Clock) (*computerCgroupMemory, error) {
+func openComputerMemoryRuntime(root, id string, snapshot computerSeatAttemptSnapshot, clock Clock, followsLimit bool) (*computerCgroupMemory, error) {
 	if root == "" {
 		root = "/sys/fs/cgroup"
 	}
@@ -127,7 +128,7 @@ func openComputerMemoryRuntime(root, id string, snapshot computerSeatAttemptSnap
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &computerCgroupMemory{directory: directory, clock: clock, cgroupID: id}, nil
+	return &computerCgroupMemory{directory: directory, clock: clock, cgroupID: id, followsLimit: followsLimit}, nil
 }
 func (m *computerCgroupMemory) read(name string) ([]byte, error) {
 	fd, err := unix.Openat(int(m.directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
@@ -169,6 +170,19 @@ func (m *computerCgroupMemory) setHighMax() error {
 	value, err := m.read("memory.high")
 	if err != nil || strings.TrimSpace(string(value)) != "max" {
 		return errors.Join(errors.New("Computer memory.high readback is not max after a resize"), writeErr, err)
+	}
+	return nil
+}
+func (m *computerCgroupMemory) highFollowsLimit() bool { return m.followsLimit }
+
+// write uses an O_NONBLOCK descriptor, so on a highFollowsLimit kernel a
+// margin below current use sets the limit without reclaiming in this call.
+func (m *computerCgroupMemory) setHighMargin(limit int64) error {
+	want := computerMemoryHighBytes(limit)
+	writeErr := m.write("memory.high", strconv.FormatInt(want, 10))
+	value, err := m.readInt("memory.high")
+	if err != nil || value != want {
+		return errors.Join(fmt.Errorf("Computer memory.high readback is not %d after a resize", want), writeErr, err)
 	}
 	return nil
 }
