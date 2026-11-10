@@ -5,6 +5,7 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,5 +114,51 @@ func TestComputerMemoryLimitChangesRealAdmissionReservation(t *testing.T) {
 	replacement := engine.capacityReservations["resident"]
 	if replacement.memoryBytes != 1<<30 || replacement.memoryOwner != "" || replacement.tmpfsCeilingBytes != profileReceipt(restart.Workload).ComputerTmpfsCeilingBytes {
 		t.Fatalf("replacement inherited grown reservation: %+v", replacement)
+	}
+}
+
+// setHighMargin writes the creation-time margin of the confirmed limit and
+// accepts only that exact readback (#1579). A plain directory stands in for
+// the cgroup: this proves the helper's write and readback, not kernel reclaim.
+func TestComputerCgroupMemorySetHighMarginReadsBackExactBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name, file string
+		ok         bool
+	}{
+		{name: "written", ok: true},
+		{name: "missing file", file: "-"},
+		{name: "kernel kept another value", file: "/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "memory.high")
+			switch tc.file {
+			case "":
+				if err := os.WriteFile(path, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "/":
+				// A directory accepts no write and reads back no integer.
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer directory.Close()
+			m := &computerCgroupMemory{directory: directory, followsLimit: true}
+			err = m.setHighMargin(2 << 30)
+			if tc.ok != (err == nil) {
+				t.Fatalf("setHighMargin: %v", err)
+			}
+			if tc.ok {
+				b, _ := os.ReadFile(path)
+				if want := fmt.Sprint(computerMemoryHighBytes(2 << 30)); string(b) != want {
+					t.Fatalf("memory.high=%q want %q", b, want)
+				}
+			}
+		})
 	}
 }

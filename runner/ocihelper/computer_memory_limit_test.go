@@ -547,8 +547,8 @@ func TestComputerMemoryResizeMovesMemoryHighWhereKernelAllows(t *testing.T) {
 	}
 	confirmCleanup()
 	f.events = nil
-	f.usage = 2<<30 - 8<<20 // Inside the 16 MiB frozen allowance: held.
-	if r, err := call(1 << 30); err != nil || r.Reason != "memory_in_use" || len(f.events) != 0 {
+	f.usage = 1<<30 - 8<<20 // Inside the 16 MiB frozen allowance: held after the freeze.
+	if r, err := call(1 << 30); err != nil || r.Reason != "memory_in_use" || r.FreezeRequests == 0 || len(f.events) != 0 {
 		t.Fatalf("held shrink touched memory.high: %+v events=%v err=%v", r, f.events, err)
 	}
 	f.usage = 128 << 20
