@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -715,6 +716,37 @@ func storageCopyFailureCode(operation string, err error) (string, int64) {
 }
 
 func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request CopyComputerStorageRequest) (response CopyComputerStorageResponse, returnedErr error) {
+	// Registered first, so it runs last: a failure the deferred refusal below
+	// turns into an absence receipt is not logged, and the line is written
+	// after both copy mutexes are released.
+	var importAdmissionFailed bool
+	var importSourceName string
+	defer func() {
+		if returnedErr == nil {
+			return
+		}
+		var cause string
+		if importAdmissionFailed {
+			// Admission walks the operator's own directories, and its errors
+			// name their components and ancestors. That is an operator-input
+			// refusal, not the copy failure this line exists for, so only its
+			// closed code is logged.
+			cause = "Custody import source admission failed"
+			var mechanics *custodyExportMechanicsError
+			if errors.As(returnedErr, &mechanics) && mechanics.code != "" {
+				cause += " code=" + mechanics.code
+			}
+		} else {
+			paths := engine.operatorPaths(request.ExternalPath)
+			if importSourceName != "" {
+				paths = append(paths, operatorPath{importSourceName, "<custody-path>/" + filepath.Base(importSourceName)},
+					operatorPath{filepath.Dir(importSourceName), "<custody-path>"})
+			}
+			cause = storageCopyFailureCause(returnedErr, paths)
+		}
+		log.Printf("OCI helper Computer Storage copy failed operation=%s computer_id=%q storage_generation=%d cause=%q",
+			request.Operation, request.Destination.ComputerID, request.Destination.StorageGeneration, cause)
+	}()
 	engine.computerBackupMu.Lock()
 	defer engine.computerBackupMu.Unlock()
 	engine.storageCopyMu.Lock()
@@ -796,6 +828,10 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 	}()
 	if importSource {
 		sourceHandle, err = engine.validateImportCustodySource(request)
+		importAdmissionFailed = err != nil
+		if sourceHandle != nil {
+			importSourceName = sourceHandle.Name()
+		}
 	} else {
 		var copyName string
 		copyName, err = deterministicComputerBackupCopyName(request.CopyID)
@@ -1079,4 +1115,28 @@ func (engine *ContainerdEngine) CopyComputerStorage(ctx context.Context, request
 		return CopyComputerStorageResponse{}, err
 	}
 	return CopyComputerStorageResponse{Receipt: receipt}, nil
+}
+
+// operatorPaths lists the host paths a copy failure's log line must hide: the
+// Custody path as the operator named it and as the helper resolved it, and
+// every configured operator mount root.
+func (engine *ContainerdEngine) operatorPaths(externalPath string) []operatorPath {
+	var paths []operatorPath
+	add := func(path, placeholder string) {
+		if path != "" {
+			paths = append(paths, operatorPath{path, placeholder}, operatorPath{filepath.Clean(path), placeholder})
+		}
+	}
+	add(externalPath, "<custody-path>")
+	if filepath.IsAbs(externalPath) {
+		if translated, err := engine.translateOperatorMountSource(filepath.Clean(externalPath)); err == nil {
+			add(translated, "<custody-path>")
+		}
+	}
+	add(engine.config.HostMountRoot, "<operator-mount-root>")
+	add(engine.config.GuestMountRoot, "<operator-mount-root>")
+	for _, root := range engine.config.AllowedMountRoots {
+		add(root, "<operator-mount-root>")
+	}
+	return paths
 }
