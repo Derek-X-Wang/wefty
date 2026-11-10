@@ -52,7 +52,7 @@ jobs:
           printf 'key=headscale-release-v1-%s-linux-amd64-%s\n' "$version" "$sha256" >> "$GITHUB_OUTPUT"
       - name: Restore the verified Headscale binary
         id: headscale-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/headscale-release
           key: ${{ steps.headscale-pin.outputs.key }}
@@ -71,7 +71,7 @@ jobs:
           fi
       - name: Save the verified Headscale binary
         if: always() && steps.headscale-verified.outputs.present == 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/headscale-release
           key: ${{ steps.headscale-pin.outputs.key }}

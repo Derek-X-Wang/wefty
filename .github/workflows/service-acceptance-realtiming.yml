@@ -268,7 +268,7 @@ jobs:
       - name: Restore the pinned containerd and runc release assets
         id: oci-runtime-cache
         if: runner.os == 'Linux'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/oci-runtime-release
           key: oci-runtime-release-v2-linux-amd64-containerd-${{ env.CONTAINERD_VERSION }}-${{ env.CONTAINERD_SHA256_LINUX_AMD64 }}-runc-${{ env.RUNC_VERSION }}-${{ env.RUNC_SHA256_LINUX_AMD64 }}
@@ -278,7 +278,7 @@ jobs:
         run: bash scripts/fetch-oci-runtime-release.sh amd64 "$CONTAINERD_VERSION" "$CONTAINERD_SHA256_LINUX_AMD64" "$RUNC_VERSION" "$RUNC_SHA256_LINUX_AMD64" "$RUNNER_TEMP/oci-runtime-release"
       - name: Save the verified containerd and runc release assets
         if: runner.os == 'Linux' && steps.oci-runtime-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/oci-runtime-release
           key: oci-runtime-release-v2-linux-amd64-containerd-${{ env.CONTAINERD_VERSION }}-${{ env.CONTAINERD_SHA256_LINUX_AMD64 }}-runc-${{ env.RUNC_VERSION }}-${{ env.RUNC_SHA256_LINUX_AMD64 }}
