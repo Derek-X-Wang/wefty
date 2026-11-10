@@ -153,7 +153,10 @@ func TestHelperComputerMemoryRM5(t *testing.T) {
 	authority := testAuthority()
 	authority.Class = "service"
 	attempt := &containerdAttempt{authority: authority, resources: ResourceIdentity{CgroupID: id}, task: task, networkNamespace: namespace, controlDirectory: control}
-	engine := &ContainerdEngine{config: NativeEngineConfig{Clock: systemClock{}, MemoryCapacityBytes: 3 << 30}, attempts: map[string]*containerdAttempt{authority.key(): attempt}, capacityReservations: map[string]*capacityReservation{authority.JobID: {memoryBytes: 1 << 30, tmpfsCeilingBytes: profileReceipt(WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}}).ComputerTmpfsCeilingBytes, attempts: map[string]struct{}{authority.key(): {}}}}}
+	// The lane kernel decides which memory.high path this proves (#1579).
+	follows := memoryHighWriteSkipsReclaim(strings.TrimSpace(string(release)))
+	t.Logf("kernel %s: memory.high follows a resize: %v", strings.TrimSpace(string(release)), follows)
+	engine := &ContainerdEngine{memoryHighFollowsLimit: follows, config: NativeEngineConfig{Clock: systemClock{}, MemoryCapacityBytes: 3 << 30}, attempts: map[string]*containerdAttempt{authority.key(): attempt}, capacityReservations: map[string]*capacityReservation{authority.JobID: {memoryBytes: 1 << 30, tmpfsCeilingBytes: profileReceipt(WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}}).ComputerTmpfsCeilingBytes, attempts: map[string]struct{}{authority.key(): {}}}}}
 
 	proveComputerMemoryRM5(t, ctx, engine, authority, task, id, address)
 }
@@ -197,9 +200,14 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 	}
 	check := func(r SetComputerMemoryLimitResponse, want int64) {
 		t.Helper()
-		// A resized Computer keeps oom.group=1 and swap.max=0, and has no
-		// memory.high margin (#1507).
-		for file, value := range map[string]string{"memory.high": "max", "memory.oom.group": "1", "memory.swap.max": "0"} {
+		// A resized Computer keeps oom.group=1 and swap.max=0. Its memory.high
+		// is the margin below the confirmed limit on a 6.16+ kernel, else max
+		// (#1507, #1579).
+		high := "max"
+		if engine.memoryHighFollowsLimit {
+			high = strconv.FormatInt(computerMemoryHighBytes(want), 10)
+		}
+		for file, value := range map[string]string{"memory.high": high, "memory.oom.group": "1", "memory.swap.max": "0"} {
 			b, err := os.ReadFile(filepath.Join(cgroup, file))
 			must(err)
 			if strings.TrimSpace(string(b)) != value {

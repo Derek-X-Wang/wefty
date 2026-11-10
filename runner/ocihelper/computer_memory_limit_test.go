@@ -22,6 +22,8 @@ type fakeComputerMemory struct {
 	// writes in order.
 	highMax, failHigh bool
 	events            []string
+	// follows is a 6.16+ kernel; failMargin fails its margin write (#1579).
+	follows, failMargin bool
 }
 
 func (f *fakeComputerMemory) readLimit() (int64, error) {
@@ -59,6 +61,15 @@ func (f *fakeComputerMemory) setHighMax() error {
 		return errors.New("memory.high write failed")
 	}
 	f.highMax = true
+	return nil
+}
+func (f *fakeComputerMemory) highFollowsLimit() bool { return f.follows }
+func (f *fakeComputerMemory) setHighMargin(limit int64) error {
+	f.events = append(f.events, fmt.Sprintf("high=%d", computerMemoryHighBytes(limit)))
+	if f.failMargin {
+		return errors.New("memory.high margin readback mismatch")
+	}
+	f.highMax = false
 	return nil
 }
 func (f *fakeComputerMemory) freezerIO() computerMemoryFreezerIO {
@@ -492,5 +503,103 @@ func TestComputerMemoryResizeClearsMemoryHigh(t *testing.T) {
 	f.events, f.failHigh = nil, true
 	if _, err := call(2 << 30); err == nil || f.limit != 1<<30 || *reserved != 1<<30 || fmt.Sprint(f.events) != "[high=max]" {
 		t.Fatalf("grow wrote memory.max after memory.high failed: events=%v reserved=%d err=%v", f.events, *reserved, err)
+	}
+}
+
+// On a kernel where O_NONBLOCK memory.high writes skip reclaim, a confirmed
+// resize moves memory.high to the margin below the confirmed memory.max, after
+// memory.max. A failed margin falls back to max (#1579).
+func TestComputerMemoryResizeMovesMemoryHighWhereKernelAllows(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	f.follows = true
+	call := func(n int64) (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: n, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	confirmCleanup := func() {
+		t.Helper()
+		if _, err := s.apply([]ComputerSeat{{1, "seat1", 7102, 7103}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.apply(nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.observe(t.Context(), s.generation, func(name string) ([]byte, error) {
+			if name == "applied.json" {
+				return []byte(fmt.Sprintf(`{"version":1,"generation":%d,"wanted_places":[],"cleanup_complete":true}`, s.generation)), nil
+			}
+			return []byte(fmt.Sprintf(`{"version":1,"generation":%d,"place":1,"state":"removed","reason":"","cleanup_complete":true}`, s.generation)), nil
+		}, nil, func(ComputerSeat) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := func(values ...string) string { return fmt.Sprint(values) }
+	maxEvent := func(n int64) string { return fmt.Sprintf("max=%d", n) }
+	highEvent := func(n int64) string { return fmt.Sprintf("high=%d", computerMemoryHighBytes(n)) }
+
+	if _, err := call(1 << 30); err != nil || len(f.events) != 0 {
+		t.Fatalf("unchanged limit touched memory.high: events=%v err=%v", f.events, err)
+	}
+	if _, err := call(4 << 30); err == nil || len(f.events) != 0 {
+		t.Fatalf("refused grow touched memory.high: events=%v err=%v", f.events, err)
+	}
+	if _, err := call(2 << 30); err != nil || fmt.Sprint(f.events) != events(maxEvent(2<<30), highEvent(2<<30)) {
+		t.Fatalf("grow order: events=%v err=%v", f.events, err)
+	}
+	confirmCleanup()
+	f.events = nil
+	f.usage = 2<<30 - 8<<20 // Inside the 16 MiB frozen allowance: held.
+	if r, err := call(1 << 30); err != nil || r.Reason != "memory_in_use" || len(f.events) != 0 {
+		t.Fatalf("held shrink touched memory.high: %+v events=%v err=%v", r, f.events, err)
+	}
+	f.usage = 128 << 20
+	if r, err := call(1 << 30); err != nil || r.MemoryLimitBytes != 1<<30 || fmt.Sprint(f.events) != events(maxEvent(1<<30), highEvent(1<<30)) {
+		t.Fatalf("shrink order: %+v events=%v err=%v", r, f.events, err)
+	}
+
+	// A grow the kernel refuses leaves the old margin alone.
+	f.events, f.failWrite = nil, true
+	var refusal *SeatOperationRefusalError
+	if _, err := call(2 << 30); !errors.As(err, &refusal) || refusal.Reason != SeatRefusalMemoryGrowFailed || fmt.Sprint(f.events) != events(maxEvent(2<<30)) {
+		t.Fatalf("refused grow: events=%v err=%v", f.events, err)
+	}
+	f.failWrite = false
+
+	// An unconfirmed margin falls back to max and the confirmed grow stands.
+	f.events, f.failMargin = nil, true
+	if r, err := call(2 << 30); err != nil || r.MemoryLimitBytes != 2<<30 || !f.highMax || fmt.Sprint(f.events) != events(maxEvent(2<<30), highEvent(2<<30), "high=max") {
+		t.Fatalf("margin fallback: %+v events=%v err=%v", r, f.events, err)
+	}
+	// If max also fails, the call fails with the new limit and room recorded.
+	confirmCleanup()
+	f.events, f.highMax, f.failHigh = nil, false, true
+	if r, err := call(1 << 30); err == nil || f.limit != 1<<30 || *reserved != 1<<30 || r.MemoryLimitBytes != 1<<30 ||
+		fmt.Sprint(f.events) != events(maxEvent(1<<30), highEvent(1<<30), "high=max") {
+		t.Fatalf("margin and max failure: %+v events=%v reserved=%d err=%v", r, f.events, *reserved, err)
+	}
+}
+
+// Only a parsed Linux release of 6.16 or later moves the margin on a resize;
+// anything else keeps memory.high=max (#1579).
+func TestMemoryHighWriteSkipsReclaimFromKernelRelease(t *testing.T) {
+	for release, want := range map[string]bool{
+		"6.16.0-rc1":       true,
+		"6.16":             true,
+		"6.17.2-arch1-1":   true,
+		"7.0.0-10-generic": true,
+		"10.1.0":           true,
+		"6.15.11-generic":  false,
+		"6.8.0-1017-azure": false,
+		"5.19.0":           false,
+		"6":                false,
+		"6.":               false,
+		"6.x":              false,
+		"unknown":          false,
+		"":                 false,
+		"-7.0":             false,
+		"6.-16":            false,
+	} {
+		if got := memoryHighWriteSkipsReclaim(release); got != want {
+			t.Errorf("memoryHighWriteSkipsReclaim(%q) = %v, want %v", release, got, want)
+		}
 	}
 }

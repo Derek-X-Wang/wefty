@@ -1088,8 +1088,9 @@ size and never below one page (896 MiB for a 1 GiB cap, 56 MiB for a 64 MiB
 cap). Above `memory.high` the kernel reclaims and slows the allocating task.
 This is a mitigation, not a guarantee: it gives a fast page-cache writer room
 to wait for writeback before `memory.max`, where the whole-Computer OOM kill
-still applies (#1507). The margin exists only at creation: any
-`SetComputerMemoryLimit` resize sets `memory.high=max`. After task creation and before `Start`, the helper reads
+still applies (#1507). A confirmed `SetComputerMemoryLimit` resize moves the
+margin below the new limit on Linux 6.16 and later, and sets `memory.high=max`
+on older kernels (#1579). After task creation and before `Start`, the helper reads
 back `memory.max`, `memory.high`, `memory.oom.group`, and `memory.swap.max`;
 only exact `<cap>`, `<high>`, `1`, and `0` may produce `Started`. Missing, malformed, or mismatched files fail closed as an
 OCI profile rejection rather than recording a successful receipt.
@@ -2757,19 +2758,41 @@ pause bound excludes this explicitly reported failure to thaw.
 
 The helper does not write a shrink below observed use. It writes `memory.max`
 nonblocking and reads it back; `memory.oom.group=1` and `memory.swap.max=0`
-remain unchanged. A resize clears the creation-time `memory.high` margin: it
-writes `memory.high=max` and reads it back, before `memory.max` on a grow and
-after the confirmed `memory.max` on a shrink. A held, unchanged, or
-precondition-refused call leaves `memory.high` alone; an attempted grow clears
-the margin even if the grow itself then fails. `max` can never be below use, so this write never
-asks the kernel to reclaim, on any kernel. Moving a finite `memory.high` on a
-running Computer could reclaim synchronously while the helper holds its
-capacity locks on kernels before 6.16, so the helper does not do it. If the
-write fails before a grow, the grow does not happen. If it fails after a
-confirmed shrink, the call fails with the new limit and reservation already
-recorded, and the previous `memory.high` remains. It still applies if it is
-below the new `memory.max` (for example 896 MiB after a 1 GiB to 960 MiB
-shrink); an unchanged retry does not clear it. The capacity mutex covers the transaction: grow reserves
+remain unchanged.
+
+How a resize treats `memory.high` depends on the kernel (#1507, #1579). The
+helper reads the kernel release once, at start. Only a release it parses as
+Linux 6.16 or later selects the margin path; any other or unknown release
+selects the `max` path. On 6.16 and later, a `memory.high` write on a
+nonblocking descriptor sets the limit without synchronous reclaim. On older
+kernels the same write can reclaim synchronously while the helper holds its
+Seat and capacity locks, so the helper never writes a finite `memory.high` on
+a running Computer there. Neither path writes `memory.high` inside the shrink
+freeze.
+
+- **Margin path (6.16 and later).** After the confirmed `memory.max` of a grow
+  or a shrink, the helper writes `memory.high` to the creation-time margin of
+  the confirmed limit, `<limit> - min(128 MiB, <limit>/8)` rounded down to the
+  kernel page, and reads it back. If use is above the new margin, the kernel
+  reclaims and slows the Computer's own allocations later, as it does above the
+  creation-time margin. If the margin readback fails, the helper writes
+  `memory.high=max`, reads it back and logs the failure; the resize succeeds
+  with the `max` path's result. A held, unchanged, or refused call, including a
+  grow the kernel does not apply, leaves `memory.high` alone.
+- **`max` path (older or unknown kernels).** The resize clears the margin: it
+  writes `memory.high=max` and reads it back, before `memory.max` on a grow and
+  after the confirmed `memory.max` on a shrink. A held, unchanged, or
+  precondition-refused call leaves `memory.high` alone; an attempted grow
+  clears the margin even if the grow itself then fails. `max` can never be
+  below use, so this write never asks the kernel to reclaim, on any kernel.
+
+On the `max` path, if the write fails before a grow, the grow does not happen.
+On both paths, if the last `memory.high=max` write fails after a confirmed
+resize, the call fails with the new limit and reservation already recorded.
+`memory.high` then keeps the last value the kernel accepted: the previous value,
+or on the margin path possibly the new margin. A previous margin still applies if it is below the new `memory.max` (for example
+896 MiB after a 1 GiB to 960 MiB shrink); an unchanged retry does not change
+it. The capacity mutex covers the transaction: grow reserves
 first, shrink releases only after exact readback and confirmed thaw. No
 successful shrink leaves an oversized reservation.
 

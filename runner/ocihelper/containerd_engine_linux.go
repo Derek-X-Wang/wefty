@@ -199,6 +199,7 @@ type ContainerdEngine struct {
 	capacityReservations        map[string]*capacityReservation
 	lastAdmission               *ResourceAdmissionReceipt
 	memoryFactsPath             string
+	memoryHighFollowsLimit      bool // kernel 6.16+: a resize moves the memory.high margin (#1579)
 	cgroupKill                  func(string) (cgroupKillResult, error)
 	cgroupPopulated             func(string) (bool, error)
 	cgroupRemove                func(string) error
@@ -363,6 +364,8 @@ func NewContainerdEngine(config NativeEngineConfig) (*ContainerdEngine, error) {
 		ports:    make(map[uint16]string), nextPort: config.AttemptPortMin,
 		capacityReservations: make(map[string]*capacityReservation),
 		memoryFactsPath:      "/proc/meminfo",
+		// Detected once, here: an unknown release keeps memory.high=max (#1579).
+		memoryHighFollowsLimit: memoryHighWriteSkipsReclaim(kernelRelease()),
 	}
 	engine.observeComputerIsolation = observeComputerNetworkIsolation
 	go engine.imageCacheLoop()
