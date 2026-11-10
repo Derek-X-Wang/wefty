@@ -1576,7 +1576,15 @@ authority beyond L1. The renewal is bound to the helper session generation
 that admitted the attempt; a replacement generation drops it with typed local
 evidence and closes the gate. Stop, restart, authority loss, and every
 terminal/reap path also close the gate and discard pending evidence, while
-`Run`'s initial deadman covers helper-side starting. Agent-helper
+`Run`'s initial deadman covers helper-side starting. A Cancel directive does
+not close the gate: the agent delivers it to the runtime once and keeps
+renewing the L1 lease, each successful renewal feeding the deadman as before,
+until the runtime has returned the attempt's final result or L1 refuses a
+renewal. The completion is then delivered through the existing routes. L1
+caps those renewals at the cancel settlement deadline. Successful renewals can
+therefore preserve a TERM-ignoring payload's authority through grace, KILL and
+helper release, within that fixed deadline and the existing authority limits,
+without a cancellation-specific agent timer (#1444). Agent-helper
 control EOF, a helper-clock heartbeat blackhole, or an
 expired per-attempt deadman therefore reaps runtime-owned state independently
 of the agent's own authority watchdog.

@@ -203,7 +203,9 @@ func (admission *attemptDeadmanAdmission) queue(lease l1.AttemptLease, expiresAt
 	if admission == nil {
 		return errors.New("OCI attempt deadman admission is not wired")
 	}
-	if lease.Directive != "" {
+	// A canceled attempt keeps its helper deadman in step with its renewed
+	// lease until the forced stop completes; Stop and Restart end renewal.
+	if lease.Directive != "" && lease.Directive != l1.AttemptDirectiveCancel {
 		return nil
 	}
 	admission.mu.Lock()
@@ -587,12 +589,31 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		deadmanAdmission = newAttemptDeadmanAdmission(lifecycle.dependencies.attemptDeadman, claim, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
 	}
 
+	// Renewal ends with the attempt, except when the attempt was canceled by
+	// a Cancel directive (from renewal or heartbeat): the payload is still
+	// being stopped, and its result is accepted only while the lease is held
+	// (#1444). Renewal then runs until the runtime returns the final result;
+	// each wait for renewalDone below stops it first, and delivery follows
+	// the existing routes. L1 bounds the phase at the cancel settlement
+	// deadline.
+	renewalContext, stopRenewal := context.WithCancel(context.WithoutCancel(attemptContext))
+	defer stopRenewal()
+	stopRenewalWithAttempt := context.AfterFunc(attemptContext, func() {
+		if !errors.Is(context.Cause(attemptContext), errAttemptDirectiveCancel) {
+			stopRenewal()
+		}
+	})
+	defer stopRenewalWithAttempt()
 	renewalErrors := make(chan destinationError, 1)
-	renewalDone := make(chan struct{})
+	renewalLoopDone := make(chan struct{})
 	go func() {
-		defer close(renewalDone)
-		lifecycle.renewalLoop(attemptContext, claim, authority, renewalErrors, watch, deadmanAdmission)
+		defer close(renewalLoopDone)
+		lifecycle.renewalLoop(renewalContext, claim, authority, renewalErrors, watch, deadmanAdmission)
 	}()
+	renewalDone := func() <-chan struct{} {
+		stopRenewal()
+		return renewalLoopDone
+	}
 
 	// The attempt-long context is uncancelable by execution shutdown so final
 	// output can still be flushed. Its timeout is deliberately not attached
@@ -667,7 +688,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			finalization.stop()
 		}
 		outcome := <-completed
-		<-renewalDone
+		<-renewalDone()
 		result := agentTerminatedResult(outcome.result)
 		outcome.result = result
 		if err := persistCompletion(&outcome, true); err != nil {
@@ -729,7 +750,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			cancelExecution()
 			cancelAttempt(failure.err)
 			outcome := <-completed
-			<-renewalDone
+			<-renewalDone()
 			result := agentTerminatedResult(outcome.result)
 			outcome.result = result
 			if err := persistCompletion(&outcome, true); err != nil {
@@ -773,7 +794,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// stay durable in the spool either way.
 		finalization.stop()
 		outcome := <-completed
-		<-renewalDone
+		<-renewalDone()
 		var attemptLost *ocihelper.AttemptLostError
 		if errors.As(failure.err, &attemptLost) {
 			// Queueing can observe the refusal before Watch does. Preserve that
@@ -790,7 +811,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cancelAttempt(err)
 		finalization.stop()
 		outcome := <-completed
-		<-renewalDone
+		<-renewalDone()
 		if durabilityErr := persistCompletion(&outcome, false); durabilityErr != nil {
 			return errorDestinationAttemptAuthority, errors.Join(fmt.Errorf("agent: authority watchdog: %w", err), fmt.Errorf("agent: persist durable completion: %w", durabilityErr))
 		}
@@ -807,7 +828,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
 		cancelAttempt(outcome.err)
-		<-renewalDone
+		<-renewalDone()
 		return errorDestinationAttemptAuthority, outcome.err
 	}
 	var routed *routedDestinationError
@@ -815,13 +836,13 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, outcome.err)
 		cancelAttempt(outcome.err)
-		<-renewalDone
+		<-renewalDone()
 		return routed.destination, outcome.err
 	}
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAuthorityDeadlineExceeded) {
 		reconcileCompletion = true
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
-		<-renewalDone
+		<-renewalDone()
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
 	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
@@ -833,12 +854,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case completionRouteHandoff:
 		reconcileCompletion = true
 		cancelAttempt(nil)
-		<-renewalDone
+		<-renewalDone()
 		return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
 	case completionRouteInline:
 		reconcileCompletion = true
 		cancelAttempt(nil)
-		<-renewalDone
+		<-renewalDone()
 		recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 		err := lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)
 		cancelRecovery()
@@ -905,7 +926,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	finishShutdownCompletion := func(completionFailure destinationError) (errorDestination, error) {
 		cause := context.Cause(ctx)
-		<-renewalDone
+		<-renewalDone()
 		var abandoned *completionDeliveryAbandoned
 		isAbandoned := errors.As(completionFailure.err, &abandoned)
 		switch completionRoute((outcome.logsPending || isAbandoned) && lifecycle.dependencies.outbox != nil,
@@ -948,7 +969,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case renewalFailure := <-renewalErrors:
 		cancelAttempt(renewalFailure.err)
 		completionFailure = retryCanceledDelivery(<-completionDone)
-		<-renewalDone
+		<-renewalDone()
 		if completionFailure.err != nil {
 			reconcileCompletion = true
 			if renewalFailure.err == errAttemptDirectiveCancel || renewalFailure.err == errAttemptDirectiveStop || renewalFailure.err == errAttemptDirectiveRestart {
@@ -969,7 +990,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, err)
 		cancelAttempt(err)
 		<-completionDone
-		<-renewalDone
+		<-renewalDone()
 		reconcileCompletion = true
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog while completing: %w", err)
 	case <-ctx.Done():
@@ -978,7 +999,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cancelAttempt(cause)
 		return finishShutdownCompletion(<-completionDone)
 	}
-	<-renewalDone
+	<-renewalDone()
 	completionFailure = retryCanceledDelivery(completionFailure)
 	if errors.Is(completionFailure.err, errOCIIntentDisabled) {
 		return errorDestinationUnclassified, nil
@@ -2590,6 +2611,7 @@ func runtimeManagedVolumesForSuccessfulCompletion(spec contract.JobSpec) []workl
 func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Claim, authority localAuthority, failures chan<- destinationError, watch attemptWatch, deadmanAdmission *attemptDeadmanAdmission) {
 	defer deadmanAdmission.terminate()
 	lease := claim.Lease
+	cancelDelivered := false
 	nextDelay := renewalDelay(authority.deadline.Sub(lifecycle.dependencies.clock.Now()), lifecycle.dependencies.renewalInterval)
 	for {
 		timer := lifecycle.dependencies.clock.NewTimer(nextDelay)
@@ -2665,10 +2687,15 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		if err := watch.Check(); err != nil {
 			return
 		}
-		if updated.Directive == l1.AttemptDirectiveCancel {
-			deadmanAdmission.terminate()
+		if updated.Directive == l1.AttemptDirectiveCancel && !cancelDelivered {
+			// Deliver Cancel once, then keep renewing (#1444). A payload that
+			// ignores TERM needs its grace, KILL and helper release before the
+			// result can complete. L1 caps every renewal at the cancel
+			// settlement deadline and refuses past it, so that deadline, not
+			// one lease, bounds the forced stop. The lifecycle ends this loop
+			// once the runtime has returned the attempt's final result.
+			cancelDelivered = true
 			returnWithDirective(failures, errAttemptDirectiveCancel)
-			return
 		}
 		if updated.Directive == l1.AttemptDirectiveStop {
 			deadmanAdmission.terminate()
