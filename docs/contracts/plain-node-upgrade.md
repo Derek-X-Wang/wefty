@@ -11,11 +11,27 @@ pre-history restore without continuing into the fleet. Successful plain
 restoration deletes the conversion record and reopens plain maintenance. Its
 old drain receipt must never be replayed against fleet authority.
 
-`wefty upgrade [--yes] [--drain-timeout DURATION]` upgrades the per-user plain-process installation made
+`wefty upgrade [--yes] [--drain-timeout DURATION] [--commit SHA]` upgrades the per-user plain-process installation made
 by `wefty setup` to the latest `main` commit from
-`https://github.com/Derek-X-Wang/wefty.git`. It refuses root, other platforms,
+`https://github.com/Derek-X-Wang/wefty.git`, or to the pinned `--commit`. It refuses root, other platforms,
 OCI installations, missing installation files, mismatched node identities and
 redirected source folders. It has no source, branch or build flags.
+
+`--commit SHA` pins the installed commit. SHA must be a full 40- or
+64-character lowercase hex commit; anything else is a usage error (exit 2)
+before any machine state is read. Upgrade still fetches `main` exactly as
+below. It then requires the fetched `main` to contain SHA: the commit is
+present in the owned clone and is an ancestor of, or equal to, the fetched
+`main`. Otherwise it refuses with exit **5** and JSON
+`error.code=upgrade_commit_not_on_main`, `retryable=false`, naming SHA and the
+fetched `main` commit, before export or build; installed files and services
+are unchanged. A contained SHA replaces the fetched `main` commit everywhere
+below: export, build version, version checks, the already-installed check, the
+receipt and the replacement node agent's expected commit. Interrupted-upgrade
+recovery that ends the command before preparation ignores the pin. The pin adds no
+downgrade check: an older contained SHA passes through the same state
+preflight and compatibility gates as any other build. Without `--commit`,
+behavior is unchanged.
 
 ## Preparation
 
@@ -301,7 +317,8 @@ the recovery command.
 ## Failed activation and authority
 
 An activation failure normally returns exit **1** and reports the failed stage and
-recovery result. These are existing exit codes; upgrade adds no exit code.
+recovery result. These are existing exit codes; upgrade adds no exit number.
+The `--commit` refusal reuses conflict exit 5 with its own error code.
 The pre-node intent/one-shot conflict retains exit **5** after rollback.
 Upgrade first unloads the run ledger and L1 to protect their databases, and
 confirms each is absent. It unloads the node agent only if its replacement stage

@@ -68,8 +68,11 @@ type upgradeHost struct {
 	promoteGeneration  func(context.Context, connprofile.Profile, l1.PromoteNodeGenerationRequest) (l1.NodeGenerationInventory, error)
 	generationControl  func(context.Context, agentinstall.Store, agentinstall.ControlRequest) (json.RawMessage, error)
 
-	writeDrain       func(context.Context, string, *upgradeDrainReceipt) error
-	remote           string
+	writeDrain func(context.Context, string, *upgradeDrainReceipt) error
+	remote     string
+	// pin is the operator's --commit: a full lowercase commit that the fetched
+	// main must contain. Empty means build the fetched main.
+	pin              string
 	build            func(context.Context, string, string, string, string) error
 	command          func(context.Context, string, []string, string, ...string) ([]byte, error)
 	observe          func(context.Context, connprofile.Profile) (l1.Node, error)
@@ -109,22 +112,27 @@ func executeUpgrade(ctx context.Context, options globalOptions, args []string, s
 	rolling := flags.Bool("rolling", false, "opt in to plain Mac rolling activation (temporary until attended acceptance)")
 	yes := flags.Bool("yes", false, "replace the node agent even when work is running; one-shot attempts end")
 	drainTimeout := flags.Duration("drain-timeout", upgradeDrainTimeout, "wait at most this long for one-shot attempts to finish")
+	pin := flags.String("commit", "", "install exactly this full commit; refuse unless the fetched main contains it")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty upgrade [--rolling] [--yes] [--drain-timeout DURATION]")
+		return usageError("usage: wefty upgrade [--rolling] [--yes] [--drain-timeout DURATION] [--commit SHA]")
 	}
 	if *drainTimeout < upgradeDrainMinimum {
 		return usageError("--drain-timeout must be at least 10s")
+	}
+	if *pin != "" && !fullCommit(*pin) {
+		return usageError("--commit must be a full 40- or 64-character lowercase hex commit")
 	}
 	host, err := realSetupHost()
 	if err != nil {
 		return err
 	}
-	if *rolling {
+	if *rolling || *pin != "" {
 		op := upgradeOperations(host)
-		op.requestRolling = true
+		op.requestRolling = *rolling
+		op.pin = *pin
 		host.upgrade = &op
 	}
 	return executeUpgradeWithHost(ctx, host, options, *yes, stdout, stderr, *drainTimeout)
@@ -903,6 +911,32 @@ func upgradeObservationError(ctx context.Context, host setupHost, cause error, f
 	return fmt.Errorf("cannot list running work; check L1; if L1 is down, run ~/.local/bin/wefty setup to start it: %w", cause)
 }
 
+// upgradePinError refuses a --commit that the fetched main does not contain.
+type upgradePinError struct{ Commit, Main string }
+
+func (e *upgradePinError) Error() string {
+	return fmt.Sprintf("commit %s is not on main (fetched main is %s)", e.Commit, e.Main)
+}
+
+func fullCommit(commit string) bool {
+	if len(commit) != 40 && len(commit) != 64 {
+		return false
+	}
+	for _, ch := range commit {
+		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// gitAnswerNo reports a Git exit status of 1: rev-parse --verify --quiet for a
+// missing commit and merge-base --is-ancestor for a non-ancestor answer this way.
+func gitAnswerNo(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == 1
+}
+
 func fetchUpgradeSource(ctx context.Context, operations upgradeHost, paths setupPaths, source, loginPATH string, warnings ...io.Writer) (string, error) {
 	git, err := findUpgradeTool(loginPATH, "git")
 	if err != nil {
@@ -956,13 +990,26 @@ func fetchUpgradeSource(ctx context.Context, operations upgradeHost, paths setup
 		return "", err
 	}
 	commit := strings.TrimSpace(string(output))
-	if len(commit) != 40 && len(commit) != 64 {
+	if !fullCommit(commit) {
 		return "", errors.New("source did not report a full commit")
 	}
-	for _, ch := range commit {
-		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
-			return "", errors.New("source reported an invalid commit")
+	if pin := operations.pin; pin != "" {
+		// The clone holds only main's history, so a pin it lacks, or one that
+		// a rewritten main no longer reaches, is not on main.
+		contained := false
+		if _, err := run("--git-dir="+clone, "rev-parse", "--verify", "--quiet", pin+"^{commit}"); err == nil {
+			_, err = run("--git-dir="+clone, "merge-base", "--is-ancestor", pin, commit)
+			if err != nil && !gitAnswerNo(err) {
+				return "", err
+			}
+			contained = err == nil
+		} else if !gitAnswerNo(err) {
+			return "", err
 		}
+		if !contained {
+			return "", &upgradePinError{Commit: pin, Main: commit}
+		}
+		commit = pin
 	}
 	archive, err := run("--git-dir="+clone, "archive", "--format=tar", commit)
 	if err != nil {
