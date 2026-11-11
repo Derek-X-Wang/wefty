@@ -65,6 +65,20 @@ func TestUpgradeCommitPinRefusesCommitNotOnMain(t *testing.T) {
 		"other-branch": func(t *testing.T, f *upgradeFixture) string {
 			return advanceUpgradeMain(t, f, "refs/heads/side", f.commit, "upgraded skill from a side branch\n")
 		},
+		// The clone fetches the tag object with main's history; the pin names
+		// the tag, not the commit it peels to.
+		"annotated-tag": func(t *testing.T, f *upgradeFixture) string {
+			command := exec.Command("git", "--git-dir="+f.operations.remote, "tag", "-a", "v0.1", "-m", "fixture tag", f.commit)
+			command.Env = append(os.Environ(), "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid")
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("tag: %v %s", err, output)
+			}
+			output, err := exec.Command("git", "--git-dir="+f.operations.remote, "rev-parse", "refs/tags/v0.1").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return strings.TrimSpace(string(output))
+		},
 		// The owned clone already holds the commit from an earlier fetch, but a
 		// rewritten main no longer reaches it.
 		"dropped-from-main": func(t *testing.T, f *upgradeFixture) string {
@@ -93,6 +107,13 @@ func TestUpgradeCommitPinRefusesCommitNotOnMain(t *testing.T) {
 				t.Fatalf("refusal built or changed the installation: %v", f.events)
 			}
 			assertNoUpgradeStage(t, f)
+			if name == "annotated-tag" {
+				paths, _ := resolveSetupPaths(f.home)
+				kind, err := exec.Command("git", "--git-dir="+filepath.Join(paths.data, upgradeSourceName), "cat-file", "-t", pin.Commit).Output()
+				if err != nil || strings.TrimSpace(string(kind)) != "tag" {
+					t.Fatalf("clone lacks the tag object, so the case is untested: %s %v", kind, err)
+				}
+			}
 			// main reports this decision directly: conflict exit and typed code.
 			report := decideCommandReport(err)
 			var stderr bytes.Buffer
@@ -119,5 +140,27 @@ func TestFleetUpgradeCommitPin(t *testing.T) {
 	report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 	if err != nil || report.Version != f.commit {
 		t.Fatalf("fleet pinned upgrade: %+v %v", report, err)
+	}
+}
+
+// The CLI records a pin without filling plain defaults, so a fleet role still
+// selects its own client-service callbacks and role build.
+func TestUpgradeFlagsLeaveOperationsUnset(t *testing.T) {
+	pin := strings.Repeat("a", 40)
+	host := withUpgradeFlags(setupHost{}, false, pin)
+	if host.upgrade == nil || host.upgrade.pin != pin || host.upgrade.requestRolling {
+		t.Fatalf("pin not recorded: %+v", host.upgrade)
+	}
+	value := reflect.ValueOf(*host.upgrade)
+	for i := range value.NumField() {
+		if field := value.Field(i); field.Kind() == reflect.Func && !field.IsNil() {
+			t.Errorf("pin-only flags filled operation %s", value.Type().Field(i).Name)
+		}
+	}
+	if host := withUpgradeFlags(setupHost{}, false, ""); host.upgrade != nil {
+		t.Fatal("no flags must leave the host unchanged")
+	}
+	if host := withUpgradeFlags(setupHost{}, true, pin); !host.upgrade.requestRolling || host.upgrade.pin != pin {
+		t.Fatalf("rolling with pin: %+v", host.upgrade)
 	}
 }

@@ -20,7 +20,7 @@ func TestUpgradeRealBinaryHelpAndUsage(t *testing.T) {
 			t.Fatalf("help opens machine state or misses a flag: %d %s %s", code, stdout, stderr)
 		}
 	}
-	for _, args := range [][]string{{"upgrade", "--from=/tmp"}, {"upgrade", "extra"}, {"upgrade", "--yes=nope"}, {"upgrade", "--drain-timeout=0"}, {"upgrade", "--drain-timeout=-1m"}, {"upgrade", "--drain-timeout=bad"}, {"upgrade", "--commit=abc1234"}, {"upgrade", "--commit=" + strings.Repeat("A", 40)}, {"upgrade", "--commit"}} {
+	for _, args := range [][]string{{"upgrade", "--from=/tmp"}, {"upgrade", "extra"}, {"upgrade", "--yes=nope"}, {"upgrade", "--drain-timeout=0"}, {"upgrade", "--drain-timeout=-1m"}, {"upgrade", "--drain-timeout=bad"}, {"upgrade", "--commit=abc1234"}, {"upgrade", "--commit=" + strings.Repeat("A", 40)}, {"upgrade", "--commit"}, {"upgrade", "--commit="}, {"upgrade", "--commit", ""}} {
 		code, _, stderr := runPolishBinary(t, binary, args...)
 		if code != exitUsage || len(stderr) == 0 {
 			t.Fatalf("usage exit: %v %d %s", args, code, stderr)

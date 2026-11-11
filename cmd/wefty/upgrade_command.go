@@ -122,20 +122,35 @@ func executeUpgrade(ctx context.Context, options globalOptions, args []string, s
 	if *drainTimeout < upgradeDrainMinimum {
 		return usageError("--drain-timeout must be at least 10s")
 	}
-	if *pin != "" && !fullCommit(*pin) {
+	pinned := false
+	flags.Visit(func(f *flag.Flag) { pinned = pinned || f.Name == "commit" })
+	if pinned && !fullCommit(*pin) {
 		return usageError("--commit must be a full 40- or 64-character lowercase hex commit")
 	}
 	host, err := realSetupHost()
 	if err != nil {
 		return err
 	}
-	if *rolling || *pin != "" {
+	return executeUpgradeWithHost(ctx, withUpgradeFlags(host, *rolling, *pin), options, *yes, stdout, stderr, *drainTimeout)
+}
+
+// withUpgradeFlags records the requested flags on the host. A pin alone leaves
+// every operation unset, so a fleet role still selects its own callbacks.
+func withUpgradeFlags(host setupHost, rolling bool, pin string) setupHost {
+	if rolling {
 		op := upgradeOperations(host)
-		op.requestRolling = *rolling
-		op.pin = *pin
+		op.requestRolling = true
 		host.upgrade = &op
 	}
-	return executeUpgradeWithHost(ctx, host, options, *yes, stdout, stderr, *drainTimeout)
+	if pin != "" {
+		if host.upgrade == nil {
+			host.upgrade = &upgradeHost{}
+		}
+		op := *host.upgrade
+		op.pin = pin
+		host.upgrade = &op
+	}
+	return host
 }
 
 func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalOptions, yes bool, stdout, stderr io.Writer, drainTimeout ...time.Duration) error {
@@ -996,14 +1011,16 @@ func fetchUpgradeSource(ctx context.Context, operations upgradeHost, paths setup
 	if pin := operations.pin; pin != "" {
 		// The clone holds only main's history, so a pin it lacks, or one that
 		// a rewritten main no longer reaches, is not on main.
+		// The pin must name the commit itself: an annotated tag object that
+		// peels to a contained commit is still refused.
 		contained := false
-		if _, err := run("--git-dir="+clone, "rev-parse", "--verify", "--quiet", pin+"^{commit}"); err == nil {
+		if resolved, err := run("--git-dir="+clone, "rev-parse", "--verify", "--quiet", pin+"^{commit}"); err == nil && strings.TrimSpace(string(resolved)) == pin {
 			_, err = run("--git-dir="+clone, "merge-base", "--is-ancestor", pin, commit)
 			if err != nil && !gitAnswerNo(err) {
 				return "", err
 			}
 			contained = err == nil
-		} else if !gitAnswerNo(err) {
+		} else if err != nil && !gitAnswerNo(err) {
 			return "", err
 		}
 		if !contained {

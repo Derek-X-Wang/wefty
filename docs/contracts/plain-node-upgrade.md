@@ -18,14 +18,17 @@ OCI installations, missing installation files, mismatched node identities and
 redirected source folders. It has no source, branch or build flags.
 
 `--commit SHA` pins the installed commit. SHA must be a full 40- or
-64-character lowercase hex commit; anything else is a usage error (exit 2)
-before any machine state is read. Upgrade still fetches `main` exactly as
-below. It then requires the fetched `main` to contain SHA: the commit is
-present in the owned clone and is an ancestor of, or equal to, the fetched
-`main`. Otherwise it refuses with exit **5** and JSON
-`error.code=upgrade_commit_not_on_main`, `retryable=false`, naming SHA and the
-fetched `main` commit, before export or build; installed files and services
-are unchanged. A contained SHA replaces the fetched `main` commit everywhere
+64-character lowercase hex commit; anything else, including an explicitly
+empty value, is a usage error (exit 2) before any machine state is read.
+Upgrade still fetches `main` exactly as below. It then requires the fetched
+`main` to contain SHA: SHA is itself a commit object in the owned clone (an
+annotated tag object that peels to a commit does not qualify) and is an
+ancestor of, or equal to, the fetched `main`. Otherwise it refuses with exit
+**5** and JSON `error.code=upgrade_commit_not_on_main`, `retryable=false`,
+naming SHA and the fetched `main` commit, before export or build. Like any
+fetch failure, the refusal leaves installed files and services unchanged by
+this preparation; interrupted-drain recovery that ran earlier in the same
+command, as for every upgrade, keeps its own effects. A contained SHA replaces the fetched `main` commit everywhere
 below: export, build version, version checks, the already-installed check, the
 receipt and the replacement node agent's expected commit. Interrupted-upgrade
 recovery that ends the command before preparation ignores the pin. The pin adds no
