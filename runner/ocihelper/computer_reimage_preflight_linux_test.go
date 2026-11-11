@@ -48,6 +48,26 @@ func TestReimageAcceptsVerifiedNeverAttachedResetSuccessor(t *testing.T) {
 	if _, ok := reimageDetachmentEvidence(manifest, request); ok {
 		t.Fatal("reset-successor preparation authorized a different prior Job")
 	}
+	request.Authority.OldJobID = preparation.JobID
+
+	// A reset past a retired generation an aborted restore left behind
+	// prepares current+2 (#1598); its successor is still reimage-eligible.
+	// A receipt whose successor is not newer than its predecessor never is.
+	for _, test := range []struct {
+		old, new int64
+		ok       bool
+	}{{old: 1, new: 3, ok: true}, {old: 3, new: 3}, {old: 4, new: 3}} {
+		skipped := manifest
+		skipped.Storage.StorageGeneration = test.new
+		skippedReceipt := receipt
+		skippedReceipt.OldGeneration, skippedReceipt.NewGeneration = test.old, test.new
+		skipped.PreparationReceipt = &skippedReceipt
+		skippedRequest := request
+		skippedRequest.Storage = skipped.Storage
+		if _, ok := reimageDetachmentEvidence(skipped, skippedRequest); ok != test.ok {
+			t.Fatalf("reset successor %d -> %d reimage evidence ok=%t, want %t", test.old, test.new, ok, test.ok)
+		}
+	}
 }
 
 func testComputerReimageRequest(storage ComputerStorageReference, prior AttemptAuthority) PreflightComputerReimageRequest {

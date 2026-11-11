@@ -316,6 +316,42 @@ func TestComputerStorageResetRequiresCurrentHelperGeneration(t *testing.T) {
 	}
 }
 
+// An aborted restore leaves a retired generation row at L1, so the next reset
+// reserves a generation past it: current+2, not current+1 (#1598). The helper
+// accepts any successor newer than the current generation and still refuses
+// an equal or older one.
+func TestComputerStorageResetAcceptsAnyNewerSuccessorGeneration(t *testing.T) {
+	engine := newFakeEngine()
+	client, stop := startTestServer(t, engine, ServerConfig{})
+	defer stop()
+	session, err := client.OpenSession(t.Context(), testSessionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	requireSweep(t, session)
+	request := func(newGeneration int64) ResetComputerStorageRequest {
+		return ResetComputerStorageRequest{
+			Storage:       ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 3, IntentRevision: 6, DiskBytes: 8 << 30},
+			NewGeneration: newGeneration,
+			Authority: ComputerStorageResetAuthority{NodeID: "node-1", BootSessionID: "boot-1",
+				HelperGeneration: session.Handshake().SessionGeneration, RootInstanceID: "managed-root-1",
+				JobID: "reset-job", PriorJobID: "job-1", IntentRevision: 6, CleanupFence: "reset-fence"},
+		}
+	}
+	for _, stale := range []int64{3, 2} {
+		if _, err := session.ResetComputerStorage(t.Context(), request(stale)); err == nil {
+			t.Fatalf("successor generation %d not newer than 3 authorized a reset", stale)
+		} else {
+			assertRPCCode(t, err, CodeInvalidRequest)
+		}
+	}
+	response, err := session.ResetComputerStorage(t.Context(), request(5))
+	if err != nil || !response.Verified || response.Receipt.OldGeneration != 3 || response.Receipt.NewGeneration != 5 {
+		t.Fatalf("reset past a retired generation = %+v err=%v", response, err)
+	}
+}
+
 func TestComputerBackupRequiresCurrentSessionAndReturnsBoundReceipts(t *testing.T) {
 	engine := newFakeEngine()
 	client, stop := startTestServer(t, engine, ServerConfig{})

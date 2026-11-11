@@ -561,8 +561,10 @@ A Storage reset may internally quiesce a running Computer only when the caller
 explicitly authorizes take-over session termination. This changes the projecting
 Job state without fabricating an operator stop intent; Computer desired state
 remains authoritative. Reservation appends one `reset` intent, admits successor capacity, enters
-revision-fenced `resetting`, and creates exactly one `staging` generation at
-current generation plus one. The helper takes the predecessor's attachment
+revision-fenced `resetting`, and creates exactly one `staging` generation one
+past every recorded generation: current plus one, or further when an aborted
+restore left its retired staging row behind (#1598). The helper accepts any
+successor newer than the current generation. The helper takes the predecessor's attachment
 flock, revalidates detachment, durably fences stale attaches in the shared disk
 manifest, then fully allocates, formats, and verifies the successor. Its
 receipt binds the exact managed-root instance in addition to Computer, Storage,
@@ -570,7 +572,7 @@ both generations, Job, Node, reset revision, cleanup fence, and helper
 generation. L1 durably records that receipt before a separate destroy-last
 publication transaction changes old `current → retired`, staging `→ current`,
 and advances `storage_generation`; the same Job remains stopped and
-unclaimable. Attaching N+1 requires the identity-bound receipt proving N
+unclaimable. Attaching the successor requires the identity-bound receipt proving N
 detached, never an assertion that N's bytes are already absent. Only after
 publication does the agent retire predecessor bytes through the shared
 authority-bound disk deletion and assertion-derived removal attestation. That
