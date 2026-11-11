@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/token"
-	"os"
+	"go/types"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,27 +71,21 @@ func declaredMethods(t *testing.T) map[Method]string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	declared := map[Method]string{}
 	files := token.NewFileSet()
+	var parsed []*ast.File
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
 			continue
 		}
-		source, err := os.ReadFile(path)
+		file, err := parser.ParseFile(files, path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatal(err)
 		}
-		file, err := parser.ParseFile(files, path, source, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatal(err)
-		}
-		found, err := methodConstants(file)
-		if err != nil {
-			t.Fatalf("%s: %v", path, err)
-		}
-		for method, name := range found {
-			declared[method] = name
-		}
+		parsed = append(parsed, file)
+	}
+	declared, err := methodConstants(files, parsed)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(declared) == 0 {
 		t.Fatal("found no Method constants; the source scan is broken")
@@ -99,124 +93,105 @@ func declaredMethods(t *testing.T) map[Method]string {
 	return declared
 }
 
-// methodConstants returns the Method constants one file declares. It reads
-// the two literal forms -- `Name Method = "x"` and `Name = Method("x")`, with
-// or without parentheses -- and refuses every other const that names Method
-// or whose name starts with Method (an untyped string constant converts to
-// Method silently), so no constant can pass by being invisible to the scan.
-func methodConstants(file *ast.File) (map[Method]string, error) {
+type noImports struct{}
+
+func (noImports) Import(path string) (*types.Package, error) {
+	return nil, fmt.Errorf("import %s is not loaded by the Method scan", path)
+}
+
+// methodConstants type-checks the package's own source and returns every
+// package-level constant whose type is its Method, however it is written:
+// typed, converted, parenthesized, computed, or an implicit repetition.
+// Imports are not loaded; the errors that causes are ignored, since a Method
+// constant's value never depends on another package. An untyped string
+// constant converts to Method silently, so a constant named Method* must have
+// the Method type.
+func methodConstants(files *token.FileSet, parsed []*ast.File) (map[Method]string, error) {
+	config := types.Config{Importer: noImports{}, Error: func(error) {}}
+	pkg, _ := config.Check("ocihelper", files, parsed, nil)
+	if pkg == nil {
+		return nil, errors.New("type-check produced no package")
+	}
 	found := map[Method]string{}
-	for _, decl := range file.Decls {
-		block, ok := decl.(*ast.GenDecl)
-		if !ok || block.Tok != token.CONST {
+	for _, name := range pkg.Scope().Names() {
+		object, ok := pkg.Scope().Lookup(name).(*types.Const)
+		if !ok {
 			continue
 		}
-		previousMethod := false
-		for _, spec := range block.Specs {
-			value := spec.(*ast.ValueSpec)
-			typed := false
-			if kind, ok := value.Type.(*ast.Ident); ok && kind.Name == "Method" {
-				typed = true
+		named, ok := object.Type().(*types.Named)
+		if !ok || named.Obj().Name() != "Method" || named.Obj().Pkg() != pkg {
+			if strings.HasPrefix(name, "Method") {
+				return nil, fmt.Errorf("constant %s is named like a Method but has type %s", name, object.Type())
 			}
-			if len(value.Values) == 0 {
-				// An implicit repetition copies the previous spec's type.
-				if previousMethod {
-					return nil, fmt.Errorf("Method constant %s repeats the previous expression; give it its own literal", value.Names[0].Name)
-				}
-				continue
-			}
-			previousMethod = false
-			for i, name := range value.Names {
-				expression := unparen(value.Values[i])
-				if !typed {
-					if call, ok := expression.(*ast.CallExpr); ok && len(call.Args) == 1 {
-						if fun, ok := unparen(call.Fun).(*ast.Ident); ok && fun.Name == "Method" {
-							expression = unparen(call.Args[0])
-							typed = true
-						}
-					}
-				}
-				if !typed {
-					if strings.HasPrefix(name.Name, "Method") || mentionsMethod(value.Values[i]) {
-						return nil, fmt.Errorf("constant %s may be a Method in a form this scan cannot read; write it as `%s Method = \"...\"`", name.Name, name.Name)
-					}
-					continue
-				}
-				previousMethod = true
-				literal, ok := expression.(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					return nil, fmt.Errorf("Method constant %s is not a string literal", name.Name)
-				}
-				method, err := strconv.Unquote(literal.Value)
-				if err != nil {
-					return nil, err
-				}
-				found[Method(method)] = name.Name
-				if value.Type == nil {
-					typed = false
-				}
-			}
+			continue
 		}
+		if object.Val().Kind() != constant.String {
+			return nil, fmt.Errorf("Method constant %s has no string value", name)
+		}
+		found[Method(constant.StringVal(object.Val()))] = name
 	}
 	return found, nil
 }
 
-func unparen(expression ast.Expr) ast.Expr {
-	for {
-		paren, ok := expression.(*ast.ParenExpr)
-		if !ok {
-			return expression
-		}
-		expression = paren.X
-	}
-}
-
-func mentionsMethod(expression ast.Expr) bool {
-	found := false
-	ast.Inspect(expression, func(node ast.Node) bool {
-		if ident, ok := node.(*ast.Ident); ok && ident.Name == "Method" {
-			found = true
-		}
-		return !found
-	})
-	return found
-}
-
 func TestMethodConstantScanSeesEveryForm(t *testing.T) {
-	parse := func(source string) (map[Method]string, error) {
-		file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", "package ocihelper\n"+source, parser.SkipObjectResolution)
+	scan := func(source string) (map[Method]string, error) {
+		files := token.NewFileSet()
+		file, err := parser.ParseFile(files, "fixture.go", "package ocihelper\ntype Method string\n"+source, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return methodConstants(file)
+		return methodConstants(files, []*ast.File{file})
 	}
-	found, err := parse(`const (
+	found, err := scan(`const prefix = "Pre"
+const (
 	MethodTyped Method = "Typed"
 	MethodInferred = Method("Inferred")
 	MethodParen = (Method(("Paren")))
-	MethodParenTyped Method = ("ParenTyped")
+	MethodComputed = Method(prefix + "Computed")
+	MethodSuffixed = Method("New") + "Suffix"
 	unrelated = "Unrelated"
-	unrelatedTyped Code = "Code"
 )
-const MethodSingle = Method("Single")`)
+const (
+	hiddenTyped (Method) = "ParenType"
+	hiddenRepeated
+)
+const (
+	first Method = "First" + iota
+)`)
+	if err == nil {
+		t.Fatalf("scan accepted a non-string iota Method constant: %v", found)
+	}
+	found, err = scan(`const prefix = "Pre"
+const (
+	MethodTyped Method = "Typed"
+	MethodInferred = Method("Inferred")
+	MethodParen = (Method(("Paren")))
+	MethodComputed = Method(prefix + "Computed")
+	MethodSuffixed = Method("New") + "Suffix"
+	unrelated = "Unrelated"
+)
+const (
+	hiddenTyped (Method) = "ParenType"
+	hiddenRepeated
+)`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[Method]string{"Typed": "MethodTyped", "Inferred": "MethodInferred", "Paren": "MethodParen",
-		"ParenTyped": "MethodParenTyped", "Single": "MethodSingle"}
+		"PreComputed": "MethodComputed", "NewSuffix": "MethodSuffixed", "ParenType": "hiddenTyped"}
+	// hiddenRepeated repeats "ParenType"; either name may own the value.
+	if found["ParenType"] == "hiddenRepeated" {
+		want["ParenType"] = "hiddenRepeated"
+	}
 	if fmt.Sprint(found) != fmt.Sprint(want) {
 		t.Fatalf("scan = %v, want %v", found, want)
 	}
 	for _, source := range []string{
-		`const MethodComputed Method = prefix + "x"`,
-		`const MethodComputed = Method(prefix + "x")`,
-		`const MethodSuffixed = Method("New") + "Suffix"`,
 		`const MethodUntyped = "Untyped"`,
-		`const other = Method("x") + "y"`,
-		"const (\n\tMethodA Method = \"A\"\n\tMethodB\n)",
+		"const (\n\tother = \"x\"\n\tMethodHidden\n)",
 	} {
-		if found, err := parse(source); err == nil {
-			t.Fatalf("scan accepted an unreadable Method constant %q: %v", source, found)
+		if found, err := scan(source); err == nil {
+			t.Fatalf("scan accepted an untyped Method-named constant %q: %v", source, found)
 		}
 	}
 }
