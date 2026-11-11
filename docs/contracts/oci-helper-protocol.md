@@ -67,8 +67,8 @@ inactive rather than failed. Nothing is lost, because the next helper start
 runs the whole boot barrier before it admits a session. A reap or barrier
 failure with no stop in progress still exits non-zero. The workflow-written realtiming
 units use the same policy. `RestartSteps` and `RestartMaxDelaySec` require
-systemd 254; `ubuntu-latest` and the Lima `template:_images/ubuntu-24.04`
-baseline both provide systemd 255, and the Linux receipt records the executing
+systemd 254; `ubuntu-latest` provides systemd 255 and the Lima
+`template:_images/ubuntu-26.04` baseline provides systemd 259 (#1589), and the Linux receipt records the executing
 version and selected rendering. The six steps are derived from the incident's six service starts in
 610 ms. At a saturated production restart counter, the kill plus six injected
 exits incur seven delays capped at one second: seven seconds total. Startup
