@@ -1062,9 +1062,8 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 						response.Runbook = ocicontrol.RunbookPath
 						return response, nil
 					}
-					if err := limarunner.WriteTemplate(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"), limarunner.TemplateConfig{
-						Sizing: limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}, HostAllowedMountRoot: *ociLimaMountRoot,
-					}); err != nil {
+					if err := limarunner.UpdateInstanceSizing(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"),
+						limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}); err != nil {
 						return response, err
 					}
 				}
