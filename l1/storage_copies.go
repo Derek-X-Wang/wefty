@@ -17,10 +17,18 @@ import (
 
 const computerStorageCopyReceiptKind = "computer_storage_copy_verified"
 
-// ComputerRestoreFailureStorageCopyEngineFailure is the failure_code of a
-// restore aborted because its Storage copy kept failing with an engine failure
-// on a live helper session (#1591).
-const ComputerRestoreFailureStorageCopyEngineFailure ComputerBackupFailureCode = "storage_copy_engine_failure"
+// ComputerRestoreFailureCode names why L1 aborted a restore. The first three
+// are the failed predecessor Backup copy's own code; the last is a Storage
+// copy that kept failing with an engine failure on a live helper session past
+// the agent's bound (#1591).
+type ComputerRestoreFailureCode string
+
+const (
+	ComputerRestoreFailureInsufficientDisk         ComputerRestoreFailureCode = "insufficient_disk"
+	ComputerRestoreFailureDigestMismatch           ComputerRestoreFailureCode = "digest_mismatch"
+	ComputerRestoreFailureSourceNeverDetached      ComputerRestoreFailureCode = "source_never_detached"
+	ComputerRestoreFailureStorageCopyEngineFailure ComputerRestoreFailureCode = "storage_copy_engine_failure"
+)
 
 type ComputerRestoreRequest struct {
 	ComputerMutationPrecondition
@@ -40,11 +48,11 @@ type ComputerRestoreRequest struct {
 // (#592). A Computer read carries it as `restore_operation` only when the
 // request names it with restore_operation_revision.
 type ComputerRestoreOperation struct {
-	OperationRevision int64                     `json:"operation_revision"`
-	BackupID          string                    `json:"backup_id"`
-	Status            string                    `json:"status"`
-	FailureCode       ComputerBackupFailureCode `json:"failure_code,omitempty"`
-	CompletedAt       *time.Time                `json:"completed_at,omitempty"`
+	OperationRevision int64                      `json:"operation_revision"`
+	BackupID          string                     `json:"backup_id"`
+	Status            string                     `json:"status"`
+	FailureCode       ComputerRestoreFailureCode `json:"failure_code,omitempty"`
+	CompletedAt       *time.Time                 `json:"completed_at,omitempty"`
 }
 
 // ComputerCloneOperation is one clone's own observed state. A clone is
