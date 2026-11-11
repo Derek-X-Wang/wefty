@@ -99,10 +99,11 @@ func declaredMethods(t *testing.T) map[Method]string {
 	return declared
 }
 
-// methodConstants returns the Method constants one file declares. It accepts
-// the two forms Go infers as Method -- `Name Method = "x"` and
-// `Name = Method("x")` -- and refuses any form it cannot read as a literal, so
-// a constant can never pass by being invisible to the scan.
+// methodConstants returns the Method constants one file declares. It reads
+// the two literal forms -- `Name Method = "x"` and `Name = Method("x")`, with
+// or without parentheses -- and refuses every other const that names Method
+// or whose name starts with Method (an untyped string constant converts to
+// Method silently), so no constant can pass by being invisible to the scan.
 func methodConstants(file *ast.File) (map[Method]string, error) {
 	found := map[Method]string{}
 	for _, decl := range file.Decls {
@@ -126,16 +127,20 @@ func methodConstants(file *ast.File) (map[Method]string, error) {
 			}
 			previousMethod = false
 			for i, name := range value.Names {
-				expression := value.Values[i]
+				expression := unparen(value.Values[i])
 				if !typed {
-					call, ok := expression.(*ast.CallExpr)
-					if !ok {
-						continue
+					if call, ok := expression.(*ast.CallExpr); ok && len(call.Args) == 1 {
+						if fun, ok := unparen(call.Fun).(*ast.Ident); ok && fun.Name == "Method" {
+							expression = unparen(call.Args[0])
+							typed = true
+						}
 					}
-					if fun, ok := call.Fun.(*ast.Ident); !ok || fun.Name != "Method" || len(call.Args) != 1 {
-						continue
+				}
+				if !typed {
+					if strings.HasPrefix(name.Name, "Method") || mentionsMethod(value.Values[i]) {
+						return nil, fmt.Errorf("constant %s may be a Method in a form this scan cannot read; write it as `%s Method = \"...\"`", name.Name, name.Name)
 					}
-					expression = call.Args[0]
+					continue
 				}
 				previousMethod = true
 				literal, ok := expression.(*ast.BasicLit)
@@ -147,10 +152,34 @@ func methodConstants(file *ast.File) (map[Method]string, error) {
 					return nil, err
 				}
 				found[Method(method)] = name.Name
+				if value.Type == nil {
+					typed = false
+				}
 			}
 		}
 	}
 	return found, nil
+}
+
+func unparen(expression ast.Expr) ast.Expr {
+	for {
+		paren, ok := expression.(*ast.ParenExpr)
+		if !ok {
+			return expression
+		}
+		expression = paren.X
+	}
+}
+
+func mentionsMethod(expression ast.Expr) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		if ident, ok := node.(*ast.Ident); ok && ident.Name == "Method" {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 func TestMethodConstantScanSeesEveryForm(t *testing.T) {
@@ -164,6 +193,8 @@ func TestMethodConstantScanSeesEveryForm(t *testing.T) {
 	found, err := parse(`const (
 	MethodTyped Method = "Typed"
 	MethodInferred = Method("Inferred")
+	MethodParen = (Method(("Paren")))
+	MethodParenTyped Method = ("ParenTyped")
 	unrelated = "Unrelated"
 	unrelatedTyped Code = "Code"
 )
@@ -171,13 +202,17 @@ const MethodSingle = Method("Single")`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[Method]string{"Typed": "MethodTyped", "Inferred": "MethodInferred", "Single": "MethodSingle"}
+	want := map[Method]string{"Typed": "MethodTyped", "Inferred": "MethodInferred", "Paren": "MethodParen",
+		"ParenTyped": "MethodParenTyped", "Single": "MethodSingle"}
 	if fmt.Sprint(found) != fmt.Sprint(want) {
 		t.Fatalf("scan = %v, want %v", found, want)
 	}
 	for _, source := range []string{
 		`const MethodComputed Method = prefix + "x"`,
 		`const MethodComputed = Method(prefix + "x")`,
+		`const MethodSuffixed = Method("New") + "Suffix"`,
+		`const MethodUntyped = "Untyped"`,
+		`const other = Method("x") + "y"`,
 		"const (\n\tMethodA Method = \"A\"\n\tMethodB\n)",
 	} {
 		if found, err := parse(source); err == nil {
