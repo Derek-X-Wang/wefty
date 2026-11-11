@@ -89,7 +89,7 @@ func TestTemplateCarriesOnlyTheNarrowLimaTransport(t *testing.T) {
 	for _, want := range []string{
 		"vmType: vz", "memory: \"4GiB\"", "cpus: 4", "disk: \"32GiB\"",
 		"system: true", "user: false", "modprobe overlay", "overlayfs",
-		"template:_images/ubuntu-24.04",
+		"template:_images/ubuntu-26.04",
 		"mountPoint: \"/mnt/wefty-host\"", "writable: true",
 		"guestSocket: \"/run/wefty/oci-helper.sock\"",
 		"hostSocket: \"{{.Dir}}/sock/wefty-oci-helper.sock\"",
