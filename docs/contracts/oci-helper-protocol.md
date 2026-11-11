@@ -329,11 +329,19 @@ behaves as before.
 
 The client boundary exposes runtime loss as a typed error only for an active
 session's transport disappearance, `session_stale`, an explicit image
-`engine_loss` fact, or an `engine_failure` that is none of the following: an
-`attempt_scoped` `Run` refusal, a bounded `Delete` cancellation or deadline, or
-any `DeleteManagedVolume`, `DeleteComputerBackupCopy`,
-`CreateComputerBackup`, or `CopyComputerStorage` failure. The
-`attempt_scoped` claim is written and
+`engine_loss` fact, or an `engine_failure` from an allow-list of operations
+(#1606). The list holds the session and whole-namespace operations
+(`AcquireSession`, `Heartbeat`, `Sweep`, `Verify`) and the attempt lifecycle,
+whose recovery is session replacement and its sweep: `Signal`, `Watch`,
+`ReleaseAttemptImagePin`, a `Run` that is not an `attempt_scoped` refusal, and
+a `Delete` other than its own cancellation or deadline. An `engine_failure`
+that names no operation also stays runtime loss. An `engine_failure` for every
+other operation is scoped to that operation: the helper answered on the live
+session, so its caller owns the failure, and the session and every other
+attempt on the Node stay up. Before #1606 the rule was the reverse, a list of
+exemptions, so each Storage, Backup, removal or Custody method missing from it
+ended every attempt on the Node whenever it was refused. The cases below are
+the earlier instances of that shape. The `attempt_scoped` claim is written and
 read only for `Run`; the client ignores it on every other operation. A typed
 `Delete` `deadline_exceeded` or `canceled` fact is attempt-scoped cleanup
 failure. Every `DeleteManagedVolume` failure is scoped to its independently
