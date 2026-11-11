@@ -2440,7 +2440,7 @@ func preparedComputerStorageRemovalAttempt(request InventoryRemovalRequest, root
 		return RemovalAttemptManifest{}, false, err
 	}
 	if witness == nil || !witness.Valid() || witness.NodeID != request.Removal.NodeID || witness.RootInstanceID != request.RootInstanceID ||
-		witness.JobID != request.Removal.JobID || witness.ComputerID != storage.ComputerID || witness.StorageID != storage.StorageID ||
+		witness.ComputerID != storage.ComputerID || witness.StorageID != storage.StorageID ||
 		witness.StorageGeneration != storage.StorageGeneration {
 		return RemovalAttemptManifest{}, false, nil
 	}

@@ -1453,7 +1453,7 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 				}
 			case !attempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
 				if attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
-					attempt.StoragePreparation.NodeID != authority.NodeID || attempt.StoragePreparation.JobID != authority.JobID ||
+					attempt.StoragePreparation.NodeID != authority.NodeID ||
 					attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
 					attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
 					attempt.StoragePreparation.StorageGeneration != attempt.ComputerStorage.StorageGeneration {

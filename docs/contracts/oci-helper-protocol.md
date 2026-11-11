@@ -856,7 +856,9 @@ authority to recreate it; verified successors and tenant-bearing generations
 remain retained inventory.
 A verified reset successor that has never been attached may use its exact
 preparation receipt as Computer reimage quiescence evidence. The receipt binds
-the current Storage generation, prior Job, Node, managed root, and reset fence;
+the current Storage generation, the Job that ran the reset, Node, managed root,
+and reset fence; that Job is not compared to `old_job_id`, which L1 may have
+rotated since (#1607);
 once any attempt attaches, the ordinary detach or prior-boot sweep receipt is
 required instead.
 `DialHostBridge` pairs one authorized host
@@ -1511,11 +1513,27 @@ complete historical Job/attempt/fence/boot fields, and kind-specific proof: a
 `same_boot_reap` receipt must match the consumer's boot and carry no sweep
 epoch, while a `prior_boot_sweep` receipt must carry a sweep epoch and is not
 compared to the consumer's boot. Attach does not compare the historical Job to
-the authenticated successor Job. Reset, Backup creation, and removal instead
-carry a separately named prior Job and require the historical receipt Job to
-equal it; reimage applies the same rule through `OldJobID`. Thus a replacement
-Job can consume its predecessor's proof without allowing an unrelated Job to
-copy, retire, or delete the Storage bytes.
+the authenticated successor Job, and neither do the consumers that copy,
+retire, delete, or reimage detached bytes: reset, Backup creation, removal
+deletion, and reimage preflight (#1607). Each request still names a prior Job
+(`prior_job_id`, or `old_job_id` for reimage). That field stays on the wire,
+must be non-empty, and stays part of the operation's retry identity: a replay
+naming a different prior Job is a different operation and conflicts with the
+recorded one. It is not compared to the receipt's historical Job. L1 replaces
+a stopped Computer's Job without running it, so the receipt keeps naming the
+Job that last attached the generation, and only the helper knows which Job
+that was.
+What makes a receipt acceptable instead is that it is the generation's latest
+attach/detach record. Each generation has one manifest and one detach slot.
+Attach clears the slot in the same durable write that records `pending`,
+under the generation flock and before it mounts anything; detach and the boot
+sweep write a new receipt. Every consumer requires, under that flock, the
+slot to hold no `attached` or `pending` authority, the receipt's kind, boot,
+and sweep-epoch rules above, the exact Storage identity and Node, and positive
+mount and loop absence. A failed attach that restores the earlier receipt is
+therefore usable only once its mount and loop are proven gone. The request's
+own current-session authority, root instance, revision, and fence are checked
+as before; they are the authorization, and the receipt is the evidence.
 Inventory separately enumerates disk
 images, verified full allocations, fixed filesystem quotas, manifests, mounts,
 loop devices, and live attachments; namespace quiescence projects out only
@@ -1553,7 +1571,8 @@ actually consumes rather than immutable image-layer lookalikes.
 plus exact Node, managed-root instance, consumer Job, named prior Job,
 reset-intent revision, cleanup fence, old generation, and successor generation.
 It requires either a same-boot reap receipt for the current boot or a
-sweep-epoch receipt whose historical Job equals that named prior Job, writes
+sweep-epoch receipt for that generation (its historical Job is not compared to
+the named prior Job; see the consumer rule above), writes
 its retirement fence under the attachment flock, then resumes successor
 `allocation_manifest_written → allocated_and_formatted → image_published →
 verified`. The verified receipt is stable across retries and binds every input
@@ -1874,8 +1893,8 @@ of leaving the agent to retry an unobservable transaction error.
 
 Computer removal carries the same exact Storage identity plus current Node,
 boot, consumer Job, named prior Job, removal-generation, and cleanup-fence
-authority to the helper. The helper requires a matching detached receipt whose
-historical Job equals the named prior Job, verifies mount and loop absence,
+authority to the helper. The helper requires the generation's latest detached
+receipt under the consumer rule above, verifies mount and loop absence,
 deletes the image, manifest, and generation quota directory, and positively
 checks their absence before the agent may acknowledge `removed_verified`.
 
@@ -1883,8 +1902,8 @@ checks their absence before the agent may acknowledge `removed_verified`.
 copy. Its authority binds Backup, copy, Computer, `storage_id@generation`,
 allocated size, Node, boot, root instance, consumer Job, named prior Job,
 operation revision, cleanup fence, and helper generation. Before reading, the
-helper requires the exact source lock, an accepted detach receipt whose
-historical Job equals the named prior Job, and positive mount and loop absence.
+helper requires the exact source lock, the generation's latest detach receipt
+under the consumer rule above, and positive mount and loop absence.
 It writes a durable copy manifest before bytes, uses full allocation, copies
 under the attachment fence, compares source and destination SHA-256 digests,
 publishes by rename, and records `encryption=none`. Durable phases cover
@@ -2071,7 +2090,10 @@ call it after the separate idempotent
 cleanup calls it after the corresponding Computer disk deletion succeeds.
 Storage-only attestation has two closed authority shapes: the prepared-removal
 shape carries the exact helper-originated never-attached witness returned by
-`InventoryRemoval`, while reset/restore predecessor and failed-import cleanup
+`InventoryRemoval`. The witness names the Job that prepared the Storage, which
+is not compared to the removal's Job after a Job rotation (#1607); it must
+still name the removal's Node and root instance and the exact Storage
+identity. Reset/restore predecessor and failed-import cleanup
 carry a typed operation/revision attempt identity after their separately
 authorized `DeleteManagedVolume` call. The operation shapes cannot claim the
 never-attached witness, and an arbitrary synthetic attempt identity is refused.

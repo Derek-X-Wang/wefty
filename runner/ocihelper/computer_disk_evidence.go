@@ -32,9 +32,7 @@ type computerDiskDetachmentAuthority struct {
 // validComputerDiskDetachmentEvidence validates a prior attachment's positive
 // detach fact against durable Storage and Node identity. The prior
 // Job/attempt/fence are retained as historical evidence and are not compared
-// to successor authority; consumers that can mutate or copy detached bytes
-// additionally bind the named prior Job through
-// validComputerDiskConsumerDetachmentEvidence.
+// to successor authority.
 func validComputerDiskDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority computerDiskDetachmentAuthority) bool {
 	if evidence == nil || authority.NodeID == "" || authority.BootSessionID == "" || evidence.ReceiptID == "" || evidence.ComputerID != storage.ComputerID || evidence.StorageID != storage.StorageID || evidence.StorageGeneration != storage.StorageGeneration ||
 		evidence.NodeID != authority.NodeID || evidence.JobID == "" || evidence.AttemptID == "" || evidence.FencingToken == "" || evidence.BootSessionID == "" {
@@ -50,9 +48,23 @@ func validComputerDiskDetachmentEvidence(evidence *computerDiskEvidence, storage
 	}
 }
 
+// validComputerDiskConsumerDetachmentEvidence is the detach proof a consumer
+// that copies, retires, deletes, or reimages detached bytes accepts: Backup,
+// reset, removal deletion, and reimage preflight. The request must still name
+// a prior Job, which stays part of its retry identity, but the evidence's
+// historical Job is not compared to it (#1607). L1 replaces a stopped
+// Computer's Job without running it, so the evidence keeps naming the Job
+// that last attached the generation, and only this helper knows which Job
+// that was.
+//
+// Freshness comes from the generation's single manifest slot instead: attach
+// clears PreviousDetachment in the same durable write that records Pending,
+// under the generation flock, before it mounts anything, and detach writes a
+// new record. Every caller also requires that slot to hold no Attached or
+// Pending authority and proves mount and loop absence under the flock, so a
+// detach followed by any newer attach can never be accepted.
 func validComputerDiskConsumerDetachmentEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority computerDiskDetachmentAuthority) bool {
-	return authority.PriorJobID != "" && evidence != nil && evidence.JobID == authority.PriorJobID &&
-		validComputerDiskDetachmentEvidence(evidence, storage, authority)
+	return authority.PriorJobID != "" && validComputerDiskDetachmentEvidence(evidence, storage, authority)
 }
 
 func validComputerDiskEvidence(evidence *computerDiskEvidence, storage ComputerStorageReference, authority AttemptAuthority) bool {

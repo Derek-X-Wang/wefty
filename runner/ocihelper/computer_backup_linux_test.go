@@ -124,9 +124,13 @@ func TestComputerBackupBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 		wantErr       bool
 	}{
 		{name: "same-boot helper sweep", priorJobID: "job-1"},
-		{name: "wrong prior Job", priorJobID: "job-other", wantErr: true},
+		// L1 replaced a stopped Computer's Job: the request names the new Job,
+		// the receipt the Job that last attached (#1607).
+		{name: "rotated prior Job", priorJobID: "job-other"},
 		{name: "unnamed prior Job", wantErr: true},
 		{name: "missing receipt capability", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.ReceiptID = "" }, wantErr: true},
+		{name: "foreign Node", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.NodeID = "node-other" }, wantErr: true},
+		{name: "sweep receipt without epoch", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.SweepEpoch = "" }, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine, storage, prior := prepareSameBootSweptComputerDisk(t)
@@ -470,13 +474,22 @@ func TestComputerBackupOfNeverDetachedGenerationIsATypedPositiveAbsenceFailure(t
 	}
 }
 
-// Detachment evidence that exists but names another prior Job is still the
-// untyped refusal: only a generation with no detachment history at all is
-// source_never_detached.
+// Detachment evidence that exists but is not valid for this generation is
+// still the untyped refusal: only a generation with no detachment history at
+// all is source_never_detached.
 func TestComputerBackupWithForeignDetachmentEvidenceIsNotNeverDetached(t *testing.T) {
 	root, system, storage, sourceAuthority := prepareDetachedBackupSource(t)
 	request := backupTestRequest(storage, sourceAuthority)
-	request.Authority.PriorJobID = "some-other-job"
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || manifest.PreviousDetachment == nil {
+		t.Fatalf("detached manifest = %+v present=%t err=%v", manifest, present, err)
+	}
+	manifest.PreviousDetachment.NodeID = "node-other"
+	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
 	response, err := engine.CreateComputerBackup(t.Context(), request)
 	if err == nil || errors.Is(err, errComputerBackupSourceNeverDetached) {
