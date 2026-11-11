@@ -30,9 +30,10 @@ type fakeComputerDiskSystem struct {
 	mounts         map[string]string
 	loops          map[string]string
 	nextLoop       int
-	// inspectErr makes mount and loop inspection fail, as an unreadable
-	// mountinfo or loop listing would.
-	inspectErr error
+	// mountInspectErr and loopInspectErr make mount or loop inspection fail,
+	// as an unreadable mountinfo or loop listing would.
+	mountInspectErr error
+	loopInspectErr  error
 }
 
 func newFakeComputerDiskSystem() *fakeComputerDiskSystem {
@@ -94,8 +95,8 @@ func (system *fakeComputerDiskSystem) detach(mountPath, loopPath, expectedImageP
 func (system *fakeComputerDiskSystem) mountedSource(path string) (string, bool, error) {
 	system.mu.Lock()
 	defer system.mu.Unlock()
-	if system.inspectErr != nil {
-		return "", false, system.inspectErr
+	if system.mountInspectErr != nil {
+		return "", false, system.mountInspectErr
 	}
 	value, ok := system.mounts[path]
 	return value, ok, nil
@@ -111,8 +112,8 @@ func (system *fakeComputerDiskSystem) loopBackingFile(loop string) (string, bool
 func (system *fakeComputerDiskSystem) loopsForRoot(root string) (map[string]string, error) {
 	system.mu.Lock()
 	defer system.mu.Unlock()
-	if system.inspectErr != nil {
-		return nil, system.inspectErr
+	if system.loopInspectErr != nil {
+		return nil, system.loopInspectErr
 	}
 	result := make(map[string]string)
 	for loop, path := range system.loops {

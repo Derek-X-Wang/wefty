@@ -31,8 +31,13 @@ func detachedStorageConsumers() []detachedStorageConsumer {
 		{name: "Backup", consume: func(t *testing.T, engine *ContainerdEngine, storage ComputerStorageReference, source AttemptAuthority, priorJobID string) error {
 			request := backupTestRequest(storage, source)
 			request.Authority.PriorJobID = priorJobID
-			_, err := engine.CreateComputerBackup(t.Context(), request)
-			return err
+			response, err := engine.CreateComputerBackup(t.Context(), request)
+			if err != nil {
+				return err
+			}
+			// A refused copy can answer with a typed failure receipt and no
+			// error; only a verified copy counts as consumed.
+			return verifiedBackup(response)
 		}},
 		{name: "reset", consume: func(t *testing.T, engine *ContainerdEngine, storage ComputerStorageReference, source AttemptAuthority, priorJobID string) error {
 			request := resetTestRequest(storage, source)
@@ -62,6 +67,14 @@ func detachedStorageConsumers() []detachedStorageConsumer {
 			return nil
 		}},
 	}
+}
+
+func verifiedBackup(response CreateComputerBackupResponse) error {
+	receipt := response.Receipt
+	if receipt.Kind != "computer_backup_copy_verified" || receipt.FailureCode != "" || receipt.CopyAbsent || receipt.ReceiptID == "" {
+		return fmt.Errorf("Backup was not verified: kind %q failure %q copy_absent %t", receipt.Kind, receipt.FailureCode, receipt.CopyAbsent)
+	}
+	return nil
 }
 
 // detachedByJobA attaches and same-boot detaches the test generation under
@@ -183,7 +196,7 @@ func TestStorageConsumersRefuseACrashedNewerAttachUntilTheSweep(t *testing.T) {
 // loop-free: a remaining mount, a remaining loop, or an unreadable inspection
 // refuses every consumer, and the cleaned generation is consumable again.
 func TestStorageConsumersRequireMountAndLoopAbsenceBesideTheRecord(t *testing.T) {
-	for _, leftover := range []string{"mount", "loop", "inspection error"} {
+	for _, leftover := range []string{"mount", "loop", "mount inspection error", "loop inspection error"} {
 		for _, consumer := range detachedStorageConsumers() {
 			t.Run(leftover+"/"+consumer.name, func(t *testing.T) {
 				engine, system, storage, jobA, diskRoot := detachedByJobA(t)
@@ -196,8 +209,10 @@ func TestStorageConsumersRequireMountAndLoopAbsenceBesideTheRecord(t *testing.T)
 					system.mounts[mountPath] = "/dev/loop-left"
 				case "loop":
 					system.loops["/dev/loop-left"] = imagePath
+				case "mount inspection error":
+					system.mountInspectErr = errors.New("mount table unreadable")
 				default:
-					system.inspectErr = errors.New("mount table unreadable")
+					system.loopInspectErr = errors.New("loop listing unreadable")
 				}
 				system.mu.Unlock()
 				if err := consumer.consume(t, engine, storage, jobA, rotationJobC); err == nil {
@@ -206,7 +221,7 @@ func TestStorageConsumersRequireMountAndLoopAbsenceBesideTheRecord(t *testing.T)
 				system.mu.Lock()
 				delete(system.mounts, mountPath)
 				delete(system.loops, "/dev/loop-left")
-				system.inspectErr = nil
+				system.mountInspectErr, system.loopInspectErr = nil, nil
 				system.mu.Unlock()
 				if err := consumer.consume(t, engine, storage, jobA, rotationJobC); err != nil {
 					t.Fatalf("%s refused the cleaned generation: %v", consumer.name, err)
@@ -270,11 +285,13 @@ func TestRecordedStorageOperationsStillBindTheirPriorJob(t *testing.T) {
 		engine, _, storage, jobA, _ := detachedByJobA(t)
 		request := backupTestRequest(storage, jobA)
 		request.Authority.PriorJobID = rotationJobC
-		if _, err := engine.CreateComputerBackup(t.Context(), request); err != nil {
-			t.Fatal(err)
+		first, err := engine.CreateComputerBackup(t.Context(), request)
+		if err != nil || verifiedBackup(first) != nil {
+			t.Fatalf("Backup after a Job rotation = %+v err=%v", first.Receipt, err)
 		}
-		if _, err := engine.CreateComputerBackup(t.Context(), request); err != nil {
-			t.Fatalf("identical Backup replay = %v", err)
+		replay, err := engine.CreateComputerBackup(t.Context(), request)
+		if err != nil || verifiedBackup(replay) != nil || replay.Receipt.ReceiptID != first.Receipt.ReceiptID {
+			t.Fatalf("identical Backup replay = %+v err=%v, want receipt %s", replay.Receipt, err, first.Receipt.ReceiptID)
 		}
 		request.Authority.PriorJobID = "job-replayed-differently"
 		if _, err := engine.CreateComputerBackup(t.Context(), request); err == nil {
