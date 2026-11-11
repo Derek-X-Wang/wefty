@@ -243,17 +243,16 @@ the `LIMA_HOME` environment value and the `--oci-lima-instance` argument
 wefty data folder.
 
 Recovery, with the host VM stopped. The unresolved file is exactly the setup
-template, so Lima can resolve it again. Keep the unresolved copy until the
-check passes:
+template, so Lima can resolve it again. These are manual Lima steps, not wefty
+commands. Run them with `LIMA_HOME` set to the agent's value, in the instance
+folder `$LIMA_HOME/<instance>`, and keep the unresolved copy until the check
+passes:
 
-```sh
-export LIMA_HOME=<the agent's LIMA_HOME>
-I="$LIMA_HOME/<instance>"
-cp "$I/lima.yaml" "$I/lima.yaml.unresolved"
-limactl template copy --embed-all "$I/lima.yaml.unresolved" "$I/lima.yaml.resolved"
-mv "$I/lima.yaml.resolved" "$I/lima.yaml"
-limactl list <instance>
-```
+1. Keep a copy: `cp lima.yaml lima.yaml.unresolved`.
+2. Resolve the copy into a new file:
+   `limactl template copy --embed-all lima.yaml.unresolved lima.yaml.resolved`.
+3. Put it in place: `mv lima.yaml.resolved lima.yaml`.
+4. Check: `limactl list <instance>`.
 
 With `--embed-all`, Lima resolves the `base` into `images` the way
 `limactl create` does. `limactl list` must then show the instance without
