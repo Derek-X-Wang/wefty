@@ -44,10 +44,14 @@ jobs:
     permissions:
       contents: read
 
+  # A cancelled trigger is an acceptance-image run that a newer main push
+  # superseded (cancel-in-progress); that push's own run carries the evidence.
+  # This guard and the same one on realtiming-result skip every job, so the run
+  # concludes skipped: not success (#241), and not a red failure (#1603).
   resolve-published-artifact:
     name: resolve-artifact
     needs: [build-pr-artifacts]
-    if: ${{ always() }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
     runs-on: ubuntu-latest
     outputs:
       available: ${{ steps.resolve.outputs.available }}
@@ -626,7 +630,7 @@ jobs:
   realtiming-result:
     name: realtiming-result
     needs: [resolve-published-artifact, fabric-machine-identity, fabric-person-identity, service-acceptance-realtiming]
-    if: ${{ always() }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out the receipt gate from the artifact-producing commit
