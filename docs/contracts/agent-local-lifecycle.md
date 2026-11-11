@@ -491,6 +491,17 @@ records. Service data and its owner records, including stopped services, and
 Custody write records also refuse recreation. There is no acknowledged-loss
 override.
 
+The new host VM has no guest helper. After `limactl start`, still under the
+Lima lifecycle lock, the recreate runs the per-user installation's guest
+preparation again: it installs the helper and probe image and verifies the
+helper handshake. Only then does the ordinary recovery run. A failed
+reinstall fails the setup request without recovery, and the applied receipt
+does not advance. Before the cycle starts, the recreate removes the per-user
+prepared receipt, so the next node-agent start prepares the new guest even
+when the cycle stopped after the delete. The interim Mac bootstrap keeps no
+helper assets in its running agent; it refuses a recreate with
+`oci_setup_required` before any quiesce or delete.
+
 The guard reads the helper's durable guest files. The node agent's local spool
 records removal acknowledgements, not a complete inventory of physical copies;
 the helper's namespace Verify inventory also omits Backup copies. Neither an
