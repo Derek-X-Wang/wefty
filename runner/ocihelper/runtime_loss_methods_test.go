@@ -4,11 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/constant"
 	"go/parser"
 	"go/token"
 	"go/types"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -63,29 +63,35 @@ var engineFailureLossByMethod = map[Method]bool{
 	MethodObserveComputerSeats:   false,
 }
 
-// declaredMethods reads every Method constant from this package's source, for
-// every GOOS, so a constant behind a build tag still needs a row.
+// declaredMethods reads every Method constant from this package's source for
+// each platform the package builds on, so a constant behind a build tag, or a
+// platform-specific value under the same name, still needs a row.
 func declaredMethods(t *testing.T) map[Method]string {
 	t.Helper()
-	paths, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := token.NewFileSet()
-	var parsed []*ast.File
-	for _, path := range paths {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(files, path, nil, parser.SkipObjectResolution)
+	declared := map[Method]string{}
+	for _, goos := range []string{"linux", "darwin"} {
+		context := build.Default
+		context.GOOS = goos
+		pkg, err := context.ImportDir(".", 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		parsed = append(parsed, file)
-	}
-	declared, err := methodConstants(files, parsed)
-	if err != nil {
-		t.Fatal(err)
+		files := token.NewFileSet()
+		var parsed []*ast.File
+		for _, path := range pkg.GoFiles {
+			file, err := parser.ParseFile(files, path, nil, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed = append(parsed, file)
+		}
+		found, err := methodConstants(files, parsed)
+		if err != nil {
+			t.Fatalf("%s: %v", goos, err)
+		}
+		for method, name := range found {
+			declared[method] = name
+		}
 	}
 	if len(declared) == 0 {
 		t.Fatal("found no Method constants; the source scan is broken")
@@ -99,50 +105,84 @@ func (noImports) Import(path string) (*types.Package, error) {
 	return nil, fmt.Errorf("import %s is not loaded by the Method scan", path)
 }
 
-// methodConstants type-checks the package's own source and returns every
-// package-level constant whose type is its Method, however it is written:
-// typed, converted, parenthesized, computed, or an implicit repetition.
-// Imports are not loaded; the errors that causes are ignored, since a Method
-// constant's value never depends on another package. An untyped string
-// constant converts to Method silently, so a constant named Method* must have
-// the Method type.
+// methodConstants type-checks one platform's file set and returns every
+// constant definition whose type is the package's Method, however it is
+// written (typed, converted, parenthesized, computed, an implicit repetition)
+// and wherever it is declared, package level or inside a function. Imports
+// are not loaded, and only the errors that causes are tolerated: any other
+// checker error, such as a redeclaration, fails the scan. A constant named
+// Method* must have the Method type, because an untyped string converts to
+// Method silently.
+//
+// Limit: a Method constant whose value comes from another package cannot be
+// typed without loading it. Protocol method names are string literals in this
+// package; one built from an import would show here as an invalid constant.
 func methodConstants(files *token.FileSet, parsed []*ast.File) (map[Method]string, error) {
-	config := types.Config{Importer: noImports{}, Error: func(error) {}}
-	pkg, _ := config.Check("ocihelper", files, parsed, nil)
+	var checkErrors []error
+	config := types.Config{Importer: noImports{}, Error: func(err error) { checkErrors = append(checkErrors, err) }}
+	info := &types.Info{Defs: map[*ast.Ident]types.Object{}}
+	pkg, _ := config.Check("ocihelper", files, parsed, info)
 	if pkg == nil {
 		return nil, errors.New("type-check produced no package")
 	}
+	for _, err := range checkErrors {
+		if typeError, ok := err.(types.Error); ok && typeError.Soft {
+			continue
+		}
+		message := err.Error()
+		if strings.Contains(message, "could not import") || strings.Contains(message, "undefined:") ||
+			strings.Contains(message, "invalid operation") || strings.Contains(message, "cannot use") ||
+			strings.Contains(message, "not a type") || strings.Contains(message, "invalid argument") {
+			continue
+		}
+		return nil, fmt.Errorf("Method scan type-check: %w", err)
+	}
 	found := map[Method]string{}
-	for _, name := range pkg.Scope().Names() {
-		object, ok := pkg.Scope().Lookup(name).(*types.Const)
+	for ident, object := range info.Defs {
+		defined, ok := object.(*types.Const)
 		if !ok {
 			continue
 		}
-		named, ok := object.Type().(*types.Named)
-		if !ok || named.Obj().Name() != "Method" || named.Obj().Pkg() != pkg {
-			if strings.HasPrefix(name, "Method") {
-				return nil, fmt.Errorf("constant %s is named like a Method but has type %s", name, object.Type())
+		named, isNamed := defined.Type().(*types.Named)
+		isMethod := isNamed && named.Obj().Name() == "Method" && named.Obj().Pkg() == pkg
+		if !isMethod {
+			if strings.HasPrefix(ident.Name, "Method") {
+				return nil, fmt.Errorf("constant %s is named like a Method but has type %s", ident.Name, defined.Type())
 			}
 			continue
 		}
-		if object.Val().Kind() != constant.String {
-			return nil, fmt.Errorf("Method constant %s has no string value", name)
+		if defined.Val().Kind() != constant.String {
+			return nil, fmt.Errorf("Method constant %s has no string value", ident.Name)
 		}
-		found[Method(constant.StringVal(object.Val()))] = name
+		method := Method(constant.StringVal(defined.Val()))
+		if previous, exists := found[method]; exists && previous != ident.Name {
+			return nil, fmt.Errorf("Method %q is declared as both %s and %s", method, previous, ident.Name)
+		}
+		found[method] = ident.Name
 	}
 	return found, nil
 }
 
 func TestMethodConstantScanSeesEveryForm(t *testing.T) {
-	scan := func(source string) (map[Method]string, error) {
+	scan := func(sources ...string) (map[Method]string, error) {
 		files := token.NewFileSet()
-		file, err := parser.ParseFile(files, "fixture.go", "package ocihelper\ntype Method string\n"+source, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatal(err)
+		var parsed []*ast.File
+		for i, source := range sources {
+			body := "package ocihelper\n" + source + "\n"
+			if i == 0 {
+				body += "type Method string\n"
+			}
+			file, err := parser.ParseFile(files, fmt.Sprintf("fixture%d.go", i), body, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed = append(parsed, file)
 		}
-		return methodConstants(files, []*ast.File{file})
+		return methodConstants(files, parsed)
 	}
-	found, err := scan(`const prefix = "Pre"
+	found, err := scan(`import "example.invalid/unloaded"
+var _ = unloaded.Value
+const prefix = "Pre"
 const (
 	MethodTyped Method = "Typed"
 	MethodInferred = Method("Inferred")
@@ -153,45 +193,30 @@ const (
 )
 const (
 	hiddenTyped (Method) = "ParenType"
-	hiddenRepeated
 )
-const (
-	first Method = "First" + iota
-)`)
-	if err == nil {
-		t.Fatalf("scan accepted a non-string iota Method constant: %v", found)
-	}
-	found, err = scan(`const prefix = "Pre"
-const (
-	MethodTyped Method = "Typed"
-	MethodInferred = Method("Inferred")
-	MethodParen = (Method(("Paren")))
-	MethodComputed = Method(prefix + "Computed")
-	MethodSuffixed = Method("New") + "Suffix"
-	unrelated = "Unrelated"
-)
-const (
-	hiddenTyped (Method) = "ParenType"
-	hiddenRepeated
-)`)
+func call() Method {
+	const local Method = "Local"
+	return local
+}`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[Method]string{"Typed": "MethodTyped", "Inferred": "MethodInferred", "Paren": "MethodParen",
-		"PreComputed": "MethodComputed", "NewSuffix": "MethodSuffixed", "ParenType": "hiddenTyped"}
-	// hiddenRepeated repeats "ParenType"; either name may own the value.
-	if found["ParenType"] == "hiddenRepeated" {
-		want["ParenType"] = "hiddenRepeated"
-	}
+		"PreComputed": "MethodComputed", "NewSuffix": "MethodSuffixed", "ParenType": "hiddenTyped", "Local": "local"}
 	if fmt.Sprint(found) != fmt.Sprint(want) {
 		t.Fatalf("scan = %v, want %v", found, want)
 	}
-	for _, source := range []string{
-		`const MethodUntyped = "Untyped"`,
-		"const (\n\tother = \"x\"\n\tMethodHidden\n)",
+	for name, sources := range map[string][]string{
+		"untyped Method-named constant": {`const MethodUntyped = "Untyped"`},
+		"untyped implicit repetition":   {"const (\n\tother = \"x\"\n\tMethodHidden\n)"},
+		"repeated Method value":         {"const (\n\tfirst Method = \"Same\"\n\tsecond\n)"},
+		"non-string Method value":       {`const first Method = "First" + iota`},
+		"redeclared across files":       {`const MethodA Method = "A"`, `const MethodA Method = "B"`},
+		"same value under two names":    {`const MethodA Method = "A"`, `const MethodB Method = "A"`},
+		"Method-named local untyped":    {"func call() {\n\tconst MethodLocal = \"x\"\n\t_ = MethodLocal\n}"},
 	} {
-		if found, err := scan(source); err == nil {
-			t.Fatalf("scan accepted an untyped Method-named constant %q: %v", source, found)
+		if found, err := scan(sources...); err == nil {
+			t.Fatalf("scan accepted %s: %v", name, found)
 		}
 	}
 }
