@@ -2245,7 +2245,7 @@
       "post": {
         "operationId": "acknowledgeComputerStorageCopy",
         "summary": "Publish an assertion-derived restore, clone, or Custody import destination",
-        "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import only, a mutually exclusive preparation_outcome persists the helper's exact-generation interrupted, deferred, or quarantined result without granting publication authority.",
+        "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import and Computer clone, a mutually exclusive preparation_outcome persists the helper's exact-generation interrupted, deferred, or quarantined result without granting publication authority. For a restore, the only accepted preparation_outcome is computer_storage_preparation_interrupted with reason engine_failure, sent once the agent's bound on live-session engine failures is spent: it aborts the restore as failed with failure_code storage_copy_engine_failure, keeps the old generation current, and returns the Computer stable; an identical replay names the same restore by intent_revision and reads the same answer.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
       "required": ["node_id", "boot_session_id", "idempotency_key"],

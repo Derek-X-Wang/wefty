@@ -972,7 +972,18 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 				return Backup{}, err
 			}
 			r := request.Receipt
-			if storageCopy.Status != "superseded" || !storageCopy.KeepOldBackup ||
+			var failureCode string
+			if err := tx.QueryRowContext(ctx, `SELECT failure_code FROM computer_storage_copy_operations
+				WHERE destination_computer_id=? AND operation_revision=?`, computerID,
+				storageCopy.OperationRevision).Scan(&failureCode); err != nil {
+				return Backup{}, internalError(err, "read restore predecessor Backup copy outcome")
+			}
+			// A restore that a removal overtook, or one aborted after its copy
+			// kept failing (#1591), may leave a finished predecessor Backup copy
+			// that was never cataloged.
+			uncataloged := storageCopy.Status == "superseded" || (storageCopy.Status == "failed" &&
+				failureCode == string(ComputerRestoreFailureStorageCopyEngineFailure))
+			if !uncataloged || !storageCopy.KeepOldBackup ||
 				!storageCopy.OldBackupID.Valid || !storageCopy.OldCopyID.Valid ||
 				r.BackupID != storageCopy.OldBackupID.String || r.CopyID != storageCopy.OldCopyID.String ||
 				r.ComputerID != storageCopy.DestinationComputerID || r.StorageID != storageCopy.DestinationStorageID ||
@@ -1004,7 +1015,7 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET old_backup_absence_receipt_json=?,
 				old_backup_absence_acknowledgement_key=?, old_backup_absence_acknowledgement_hash=?, completed_ns=?
-				WHERE destination_computer_id=? AND status='superseded' AND old_copy_id=?`, receiptJSON,
+				WHERE destination_computer_id=? AND status IN ('superseded', 'failed') AND old_copy_id=?`, receiptJSON,
 				request.IdempotencyKey, bodyHash, now.UnixNano(), computerID, request.Receipt.CopyID); err != nil {
 				return Backup{}, internalError(err, "record superseded restore predecessor Backup absence")
 			}

@@ -17,6 +17,11 @@ import (
 
 const computerStorageCopyReceiptKind = "computer_storage_copy_verified"
 
+// ComputerRestoreFailureStorageCopyEngineFailure is the failure_code of a
+// restore aborted because its Storage copy kept failing with an engine failure
+// on a live helper session (#1591).
+const ComputerRestoreFailureStorageCopyEngineFailure ComputerBackupFailureCode = "storage_copy_engine_failure"
+
 type ComputerRestoreRequest struct {
 	ComputerMutationPrecondition
 	BackupID       string `json:"-"`
@@ -25,10 +30,12 @@ type ComputerRestoreRequest struct {
 }
 
 // ComputerRestoreOperation is one restore's own observed state. A restore
-// ends `retired` once its predecessor generation is gone, `failed` when the
-// precommitted predecessor Backup copy failed and L1 aborted the restore with
-// the old generation still current (failure_code is that copy's code), or
-// `superseded` when a removal overtook it. The Computer returns to `stable`
+// ends `retired` once its predecessor generation is gone, `failed` when L1
+// aborted it with the old generation still current, or `superseded` when a
+// removal overtook it. A `failed` restore's failure_code is either the code of
+// its failed precommitted predecessor Backup copy, or
+// storage_copy_engine_failure when its copy kept failing on a live helper
+// session past the agent's bound (#1591). The Computer returns to `stable`
 // for both `retired` and `failed`, so only this record tells them apart
 // (#592). A Computer read carries it as `restore_operation` only when the
 // request names it with restore_operation_revision.
@@ -327,7 +334,13 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 		return Computer{}, false, err
 	}
 	revision := computer.IntentRevision + 1
-	generation := computer.StorageGeneration + 1
+	// An aborted restore keeps its retired staging row, so the next
+	// generation is past every recorded one, not the current one plus one.
+	var generation int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(storage_generation), 0) + 1
+		FROM computer_storage_generations WHERE computer_id=?`, computerID).Scan(&generation); err != nil {
+		return Computer{}, false, internalError(err, "reserve monotonic restored Storage generation")
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET intent_revision=?, reconfiguration_phase=?,
 		reconfiguration_revision=?, updated_ns=? WHERE computer_id=? AND intent_revision=?`, revision,
 		ComputerReconfigurationRestoring, revision, now.UnixNano(), computerID, computer.IntentRevision)
@@ -973,11 +986,6 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 	if receipt.Kind != computerBackupFailureReceiptKind {
 		return protocolError(contract.ErrorInvalidRequest, "restore predecessor copy failure evidence is invalid")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
-		WHERE computer_id=? AND storage_generation=? AND phase='staging'`, now.UnixNano(),
-		row.DestinationComputerID, row.DestinationGeneration); err != nil {
-		return internalError(err, "retire aborted restore staging generation")
-	}
 	receiptJSON, err := json.Marshal(receipt)
 	if err != nil {
 		return internalError(err, "encode failed restore predecessor copy")
@@ -988,13 +996,98 @@ func abortRestoreForFailedPredecessorCopy(ctx context.Context, tx *sql.Tx, row c
 		receiptJSON, now.UnixNano(), row.DestinationComputerID, row.OperationRevision); err != nil {
 		return internalError(err, "record failed restore predecessor copy")
 	}
+	return abortComputerRestore(ctx, tx, row, now)
+}
+
+// abortRestoreForCopyEngineFailure ends a restore whose copy kept failing with
+// an engine failure on a live helper session (#1591). The agent sends the
+// outcome only once its bound is spent. The restore records `failed` with
+// storage_copy_engine_failure and the outcome, and then aborts like a failed
+// predecessor copy: the old generation stays current. It deletes nothing. The
+// helper may still hold the partial copy under the retired staging
+// generation, and a predecessor Backup copy when keep_old_as_backup is set;
+// removal of the Computer proves both absent.
+func abortRestoreForCopyEngineFailure(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	request ComputerStorageCopyAcknowledgementRequest, outcomeJSON []byte, bodyHash string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='failed',
+		failure_code=?, preparation_outcome_json=?, preparation_acknowledgement_key=?,
+		preparation_acknowledgement_hash=?, completed_ns=?
+		WHERE destination_computer_id=? AND operation_revision=? AND status='reserved'`,
+		ComputerRestoreFailureStorageCopyEngineFailure, outcomeJSON, request.IdempotencyKey, bodyHash, now.UnixNano(),
+		row.DestinationComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "record failed restore Storage copy")
+	}
+	return abortComputerRestore(ctx, tx, row, now)
+}
+
+// abortComputerRestore retires the restore's staging generation and returns
+// the Computer to `stable` on its old generation.
+func abortComputerRestore(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+		WHERE computer_id=? AND storage_generation=? AND phase='staging'`, now.UnixNano(),
+		row.DestinationComputerID, row.DestinationGeneration); err != nil {
+		return internalError(err, "retire aborted restore staging generation")
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE computers SET applied_revision=?, reconfiguration_phase='stable',
 		reconfiguration_revision=NULL, updated_ns=? WHERE computer_id=? AND intent_revision=? AND reconfiguration_phase='restoring'`,
 		row.OperationRevision, now.UnixNano(), row.DestinationComputerID, row.OperationRevision)
 	if err != nil {
-		return internalError(err, "abort restore after predecessor copy failure")
+		return internalError(err, "abort Computer restore")
 	}
 	return requireComputerCAS(result, row.DestinationComputerID, row.OperationRevision)
+}
+
+// acknowledgeComputerRestorePreparation accepts the one preparation outcome a
+// restore has: a live-session engine failure the agent reports once its bound
+// is spent (#1591). It aborts the restore. Any other outcome stays rejected,
+// because a restore's predecessor still owns the bytes and a deferral or a
+// runtime loss resolves on a later sweep.
+func acknowledgeComputerRestorePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
+	now time.Time) (Computer, error) {
+	if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer restore preparation outcome is mutually exclusive with copy receipts")
+	}
+	if err := validateStorageCopyPreparationOutcome(row, "Computer restore", request.PreparationOutcome); err != nil {
+		return Computer{}, err
+	}
+	if !terminalImportPreparationFailure(*request.PreparationOutcome) {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest,
+			"a Computer restore acknowledges only a live-session engine failure as a preparation outcome")
+	}
+	var storedKey, storedHash sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT preparation_acknowledgement_key, preparation_acknowledgement_hash
+		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
+		destinationComputerID, row.OperationRevision).Scan(&storedKey, &storedHash); err != nil {
+		return Computer{}, internalError(err, "read Computer restore preparation idempotency")
+	}
+	// The replay check precedes the status check: the abort leaves the
+	// restore `failed`, and an agent that never saw the answer sends the same
+	// acknowledgement again.
+	if storedKey.Valid && storedKey.String == request.IdempotencyKey {
+		if !storedHash.Valid || storedHash.String != bodyHash {
+			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer restore preparation replay differs from durable evidence")
+		}
+		return readComputerAuthority(ctx, tx, destinationComputerID, now)
+	}
+	if row.Status != "reserved" {
+		return Computer{}, protocolError(contract.ErrorConflict, "Computer restore is not awaiting preparation")
+	}
+	outcomeJSON, err := json.Marshal(*request.PreparationOutcome)
+	if err != nil {
+		return Computer{}, internalError(err, "encode Computer restore preparation outcome")
+	}
+	if err := abortRestoreForCopyEngineFailure(ctx, tx, row, request, outcomeJSON, bodyHash, now); err != nil {
+		return Computer{}, err
+	}
+	computer, err := readComputerAuthority(ctx, tx, destinationComputerID, now)
+	if err != nil {
+		return Computer{}, internalError(err, "read aborted Computer restore authority")
+	}
+	if err := tx.Commit(); err != nil {
+		return Computer{}, internalError(err, "commit aborted Computer restore")
+	}
+	return computer, nil
 }
 
 // validateStorageCopyPreparationOutcome binds one generation-bound preparation
@@ -1243,8 +1336,29 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer Storage copy acknowledgement target")
 	}
+	// A restore's preparation outcome names its own operation revision. A
+	// replay of an aborted restore's outcome must reach that restore even
+	// after a newer restore of the same Computer has started.
+	if outcome := request.PreparationOutcome; outcome != nil && outcome.IntentRevision != row.OperationRevision {
+		claimed, claimedErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
+			FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?
+			AND operation='restore'`, destinationComputerID, outcome.IntentRevision))
+		if claimedErr == nil {
+			row = claimed
+		} else if !errors.Is(claimedErr, sql.ErrNoRows) {
+			return Computer{}, internalError(claimedErr, "read claimed Computer restore")
+		}
+	}
 	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
+	}
+	if request.PreparationOutcome != nil && row.Operation == "restore" {
+		computer, err := acknowledgeComputerRestorePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		if err != nil {
+			return Computer{}, err
+		}
+		s.notifyComputerPolicyChanged()
+		return computer, nil
 	}
 	if request.PreparationOutcome != nil {
 		computer, err := acknowledgeComputerClonePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)

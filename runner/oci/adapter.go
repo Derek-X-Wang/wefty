@@ -2525,12 +2525,12 @@ func (adapter *Adapter) CopyComputerStorage(ctx context.Context, request workloa
 		var rpcError *ocihelper.RPCError
 		// A typed engine failure the live session answered for this copy is
 		// not runtime loss (#1581): the session and every other attempt on
-		// the Node stay up. For an import or a clone it ends that one copy,
-		// as the exact-generation outcome bound to the live helper generation.
-		// There is no retry: the same call on the same session fails the same
-		// way. A restore keeps an ordinary error, because its predecessor
-		// still owns the bytes.
-		if (request.Operation == "import" || request.Operation == "clone") && errors.As(err, &rpcError) &&
+		// the Node stay up. It becomes the exact-generation outcome bound to
+		// the live helper generation. For an import or a clone it ends that
+		// one copy: there is no retry, since the same call on the same session
+		// fails the same way. A restore's predecessor still owns the bytes, so
+		// the agent retries it within a bound before it aborts (#1591).
+		if (request.Operation == "import" || request.Operation == "clone" || request.Operation == "restore") && errors.As(err, &rpcError) &&
 			rpcError.Code == ocihelper.CodeEngineFailure && rpcError.EngineFailure != nil &&
 			rpcError.EngineFailure.Operation == ocihelper.MethodCopyStorage {
 			return workloadrunner.ComputerStorageCopyReceipt{}, &workloadrunner.ComputerStoragePreparationError{
