@@ -2,6 +2,7 @@ package ocihelper
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -24,12 +25,12 @@ var engineFailureLossByMethod = map[Method]bool{
 	MethodSweep:          true,
 	MethodVerify:         true,
 	// Attempt lifecycle. Run and Delete have conditional rows below.
-	MethodRun:               true,
-	MethodSignal:            true,
-	MethodWatch:             true,
-	MethodDelete:            true,
-	MethodReleaseAttemptPin: true,
+	MethodRun:    true,
+	MethodSignal: true,
+	MethodWatch:  true,
+	MethodDelete: true,
 	// Operation-scoped: the caller owns the failure.
+	MethodReleaseAttemptPin:      false,
 	MethodEnsureImage:            false,
 	MethodReconcileImagePins:     false,
 	MethodReleaseImagePin:        false,
@@ -84,34 +85,105 @@ func declaredMethods(t *testing.T) map[Method]string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, decl := range file.Decls {
-			block, ok := decl.(*ast.GenDecl)
-			if !ok || block.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range block.Specs {
-				value := spec.(*ast.ValueSpec)
-				if kind, ok := value.Type.(*ast.Ident); !ok || kind.Name != "Method" {
-					continue
-				}
-				for i, name := range value.Names {
-					literal, ok := value.Values[i].(*ast.BasicLit)
-					if !ok || literal.Kind != token.STRING {
-						t.Fatalf("%s: Method constant %s is not a string literal", path, name.Name)
-					}
-					method, err := strconv.Unquote(literal.Value)
-					if err != nil {
-						t.Fatal(err)
-					}
-					declared[Method(method)] = name.Name
-				}
-			}
+		found, err := methodConstants(file)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		for method, name := range found {
+			declared[method] = name
 		}
 	}
 	if len(declared) == 0 {
 		t.Fatal("found no Method constants; the source scan is broken")
 	}
 	return declared
+}
+
+// methodConstants returns the Method constants one file declares. It accepts
+// the two forms Go infers as Method -- `Name Method = "x"` and
+// `Name = Method("x")` -- and refuses any form it cannot read as a literal, so
+// a constant can never pass by being invisible to the scan.
+func methodConstants(file *ast.File) (map[Method]string, error) {
+	found := map[Method]string{}
+	for _, decl := range file.Decls {
+		block, ok := decl.(*ast.GenDecl)
+		if !ok || block.Tok != token.CONST {
+			continue
+		}
+		previousMethod := false
+		for _, spec := range block.Specs {
+			value := spec.(*ast.ValueSpec)
+			typed := false
+			if kind, ok := value.Type.(*ast.Ident); ok && kind.Name == "Method" {
+				typed = true
+			}
+			if len(value.Values) == 0 {
+				// An implicit repetition copies the previous spec's type.
+				if previousMethod {
+					return nil, fmt.Errorf("Method constant %s repeats the previous expression; give it its own literal", value.Names[0].Name)
+				}
+				continue
+			}
+			previousMethod = false
+			for i, name := range value.Names {
+				expression := value.Values[i]
+				if !typed {
+					call, ok := expression.(*ast.CallExpr)
+					if !ok {
+						continue
+					}
+					if fun, ok := call.Fun.(*ast.Ident); !ok || fun.Name != "Method" || len(call.Args) != 1 {
+						continue
+					}
+					expression = call.Args[0]
+				}
+				previousMethod = true
+				literal, ok := expression.(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					return nil, fmt.Errorf("Method constant %s is not a string literal", name.Name)
+				}
+				method, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					return nil, err
+				}
+				found[Method(method)] = name.Name
+			}
+		}
+	}
+	return found, nil
+}
+
+func TestMethodConstantScanSeesEveryForm(t *testing.T) {
+	parse := func(source string) (map[Method]string, error) {
+		file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", "package ocihelper\n"+source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return methodConstants(file)
+	}
+	found, err := parse(`const (
+	MethodTyped Method = "Typed"
+	MethodInferred = Method("Inferred")
+	unrelated = "Unrelated"
+	unrelatedTyped Code = "Code"
+)
+const MethodSingle = Method("Single")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[Method]string{"Typed": "MethodTyped", "Inferred": "MethodInferred", "Single": "MethodSingle"}
+	if fmt.Sprint(found) != fmt.Sprint(want) {
+		t.Fatalf("scan = %v, want %v", found, want)
+	}
+	for _, source := range []string{
+		`const MethodComputed Method = prefix + "x"`,
+		`const MethodComputed = Method(prefix + "x")`,
+		"const (\n\tMethodA Method = \"A\"\n\tMethodB\n)",
+	} {
+		if found, err := parse(source); err == nil {
+			t.Fatalf("scan accepted an unreadable Method constant %q: %v", source, found)
+		}
+	}
 }
 
 func engineFailure(fact *EngineFailureFact) *RPCError {
@@ -164,8 +236,9 @@ func TestEngineFailureRuntimeLossCoversEveryMethod(t *testing.T) {
 	}
 }
 
-// The six Computer Storage and removal methods #1606 found unexempt: one
-// refusal used to close the session and end every OCI attempt on the Node.
+// The six Computer Storage and removal methods #1606 found unexempt, and the
+// pre-Run attempt pin release: one refusal used to close the session and end
+// every OCI attempt on the Node.
 // It now returns to its caller, and the session stays healthy.
 func TestScopedEngineFailureKeepsTheSessionHealthy(t *testing.T) {
 	client, stop := startTestServer(t, newFakeEngine(), ServerConfig{HeartbeatTimeout: 5 * time.Second})
@@ -175,7 +248,7 @@ func TestScopedEngineFailureKeepsTheSessionHealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	for _, method := range []Method{MethodResetStorage, MethodGrowStorage, MethodExportCustody, MethodInventoryRemoval, MethodAttestRemoval, MethodPreflightReimage} {
+	for _, method := range []Method{MethodResetStorage, MethodGrowStorage, MethodExportCustody, MethodInventoryRemoval, MethodAttestRemoval, MethodPreflightReimage, MethodReleaseAttemptPin} {
 		refusal := engineFailure(&EngineFailureFact{Operation: method, Reason: EngineFailureOperationFailed})
 		var loss *RuntimeLossError
 		if err := session.markOperationFailure(t.Context(), refusal); err != refusal || errors.As(err, &loss) {

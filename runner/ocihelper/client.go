@@ -1225,7 +1225,8 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 // Every other method is scoped to the one operation and the resource it names:
 // a Computer's Storage, Backup copy, Custody export, removal inventory or
 // attestation, Seat, memory limit, control state or token, a managed volume, a
-// run mailbox, an attempt port or bridge, an image pin, or a read. Its refusal
+// run mailbox, an attempt port or bridge, an image pin (including a pre-Run
+// attempt pin), or a read. Its refusal
 // was answered on this live session, so it proves the session answered. Its
 // caller owns the failure. Under the old deny-by-default rule, each of these
 // made one refused request close the session and end every OCI attempt on the
@@ -1245,10 +1246,12 @@ func engineFailureProvesRuntimeLoss(fact *EngineFailureFact) bool {
 		// A Run the helper refused after positively reaping that attempt, with
 		// its session still live, is bounded by the attempt (#424).
 		return !fact.AttemptScoped
-	case MethodSignal, MethodWatch, MethodReleaseAttemptPin:
-		// Attempt lifecycle: a failure leaves the payload's state, or the
+	case MethodSignal, MethodWatch:
+		// Attempt lifecycle: a failure leaves the live payload's state, or the
 		// teardown that ends it, unproven. Session replacement and its sweep
-		// are what reap the attempt.
+		// are what reap the attempt. ReleaseAttemptImagePin is not here: it
+		// runs only before Run, for an attempt with no payload, and the helper
+		// keeps the pin for a retry.
 		return true
 	case MethodDelete:
 		// Delete is bounded and followed by attempt-scoped verification. Its

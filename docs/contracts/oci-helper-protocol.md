@@ -332,9 +332,11 @@ session's transport disappearance, `session_stale`, an explicit image
 `engine_loss` fact, or an `engine_failure` from an allow-list of operations
 (#1606). The list holds the session and whole-namespace operations
 (`AcquireSession`, `Heartbeat`, `Sweep`, `Verify`) and the attempt lifecycle,
-whose recovery is session replacement and its sweep: `Signal`, `Watch`,
-`ReleaseAttemptImagePin`, a `Run` that is not an `attempt_scoped` refusal, and
-a `Delete` other than its own cancellation or deadline. An `engine_failure`
+whose recovery is session replacement and its sweep: `Signal`, `Watch`, a
+`Run` that is not an `attempt_scoped` refusal, and a `Delete` other than its
+own cancellation or deadline. `ReleaseAttemptImagePin` is scoped: it runs only
+before `Run`, for an attempt with no payload, and the helper keeps the pin for
+a retry. An `engine_failure`
 that names no operation also stays runtime loss. An `engine_failure` for every
 other operation is scoped to that operation: the helper answered on the live
 session, so its caller owns the failure, and the session and every other

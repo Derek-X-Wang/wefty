@@ -183,8 +183,9 @@ type EngineFailureFact struct {
 	// AttemptScoped is the helper's positive claim that this failure is bounded
 	// by the one attempt it names: the helper reaped that attempt's runtime
 	// resources successfully and its exclusive session remained live, so the
-	// session capability the caller holds is still authoritative. Absent the
-	// claim the failure remains runtime-loss evidence.
+	// session capability the caller holds is still authoritative. It is read
+	// only for Run: absent the claim, a Run failure remains runtime-loss
+	// evidence (see engineFailureProvesRuntimeLoss).
 	AttemptScoped bool `json:"attempt_scoped,omitempty"`
 }
 
