@@ -118,7 +118,7 @@ func TestRestoreBeginNamesItsOwnOperationAndTheReadReturnsItsOutcome(t *testing.
 	status, observedB := read(fmt.Sprintf("?restore_operation_revision=%d", revisionB))
 	if status != http.StatusOK || observedB.RestoreOperation == nil || observedB.RestoreOperation.OperationRevision != revisionB ||
 		observedB.RestoreOperation.Status != "failed" ||
-		observedB.RestoreOperation.FailureCode != ComputerBackupFailureInsufficientDisk ||
+		observedB.RestoreOperation.FailureCode != ComputerRestoreFailureInsufficientDisk ||
 		observedB.RestoreOperation.CompletedAt == nil {
 		t.Fatalf("aborted restore B read = %d %#v", status, observedB.RestoreOperation)
 	}

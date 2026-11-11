@@ -341,7 +341,8 @@ func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, n
 					o.old_generation, o.destination_size, o.bound_node_id, o.root_instance_id,
 					o.operation_revision, o.cleanup_fence, 1
 				FROM computer_storage_copy_operations o
-				WHERE o.destination_computer_id=? AND o.status='superseded' AND o.keep_old_as_backup=1
+				WHERE o.destination_computer_id=? AND (o.status='superseded'
+					OR (o.status='failed' AND o.failure_code='storage_copy_engine_failure')) AND o.keep_old_as_backup=1
 					AND o.old_backup_absence_acknowledgement_key IS NULL
 					AND NOT EXISTS(SELECT 1 FROM backups b WHERE b.backup_id=o.old_backup_id)
 				ORDER BY copy_id`, computerID.String, computerID.String, computerID.String)
@@ -595,7 +596,8 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			return Job{}, internalError(err, "count superseded Computer Backup copies")
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_storage_copy_operations
-			WHERE destination_computer_id=? AND status='superseded' AND keep_old_as_backup=1
+			WHERE destination_computer_id=? AND (status='superseded'
+				OR (status='failed' AND failure_code='storage_copy_engine_failure')) AND keep_old_as_backup=1
 				AND old_backup_absence_acknowledgement_key IS NULL
 				AND NOT EXISTS(SELECT 1 FROM backups b WHERE b.backup_id=computer_storage_copy_operations.old_backup_id)`,
 			computerID).Scan(&outstandingRestorePrecommits); err != nil {

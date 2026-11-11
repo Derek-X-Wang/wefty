@@ -2493,10 +2493,10 @@
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "storage_copy_engine_failure"] },
           "completed_at": { "type": "string", "format": "date-time" }
         },
-        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the precommitted predecessor Backup copy failed and the restore was aborted with the old generation still current, and carries that copy's failure_code; `superseded` means a removal overtook it. The Computer is `stable` after both `retired` and `failed`."
+        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the restore was aborted with the old generation still current: failure_code is the failed precommitted predecessor Backup copy's code, or storage_copy_engine_failure when the restore's Storage copy kept failing on a live helper session past the agent's bound; `superseded` means a removal overtook it. The Computer is `stable` after both `retired` and `failed`."
       },
       "ComputerCloneOperation": {
         "type": "object",

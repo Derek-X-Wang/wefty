@@ -223,7 +223,7 @@ func TestFailedRestoreWaitExitsFiveFromTheRealBinary(t *testing.T) {
 				StorageGeneration: 2, ReconfigurationPhase: l1.ComputerReconfigurationStable}
 			if r.URL.Query().Get("restore_operation_revision") == "3" {
 				computer.RestoreOperation = &l1.ComputerRestoreOperation{OperationRevision: 3, BackupID: "backup-1",
-					Status: "failed", FailureCode: l1.ComputerBackupFailureDigestMismatch, CompletedAt: &now}
+					Status: "failed", FailureCode: l1.ComputerRestoreFailureDigestMismatch, CompletedAt: &now}
 			}
 			_ = json.NewEncoder(w).Encode(computer)
 		case r.Method == http.MethodPost && r.URL.Path == base+"/backups/backup-1/restore":
