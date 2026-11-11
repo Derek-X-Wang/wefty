@@ -194,7 +194,7 @@ cpus: %d
 memory: %s
 disk: %s
 base:
-  - template:_images/ubuntu-24.04
+  - template:_images/ubuntu-26.04
 mountType: virtiofs
 mounts:
   - location: %s

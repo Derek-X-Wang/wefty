@@ -735,7 +735,38 @@ A restore that precommitted "keep predecessor as Backup" and whose predecessor
 copy fails with a typed Backup failure receipt is aborted before switchover:
 L1 records the restore operation `failed` with that copy's `failure_code`,
 retires the never-published staging generation, and returns the Computer to
-`stable` on the old generation. A completed restore (`retired`) also ends
+`stable` on the old generation.
+A restore whose copy keeps failing with a typed engine failure on a live helper
+session is aborted the same way (#1591). Each failure leaves the restore
+`restoring` and the next sweep calls the copy again, so a transient host fault
+clears by itself. The agent counts these failures per restore operation and
+destination generation, and keeps the count and the time of the first failure
+until the copy succeeds or L1 accepts the abort; other errors neither count
+nor reset it. Once at least 5 failures have been counted and at least 10
+minutes have passed since the first, the agent writes one terminal log line
+(code, Computer, revision, generation, count, elapsed) and sends L1 the
+exact-generation `computer_storage_preparation_interrupted` outcome with
+reason `engine_failure`, retrying only that acknowledgement and never the copy.
+It is the only preparation outcome a restore acknowledges. L1 records the
+restore `failed` with `failure_code=storage_copy_engine_failure` and the
+outcome, retires the staging generation, and returns the Computer to `stable`
+on the old generation; the directive is no longer listed. An identical replay
+is resolved by the outcome's own `intent_revision`, so it reads the same answer
+even after a newer restore started. The count lives in the agent's memory: an
+agent restart starts the bound again, an accepted limit. The abort deletes
+nothing. The helper may hold the partial copy under the retired staging
+generation and, when "keep predecessor as Backup" was set, a finished
+predecessor Backup copy that was never cataloged. Removal of the Computer
+proves both absent: removal inventories every recorded generation and runs the
+unpublished-copy recovery step, and it plans the predecessor Backup copy like a
+superseded restore's. Two shapes still wait on the helper's next startup sweep
+or stay pending, as they do for an engine-failed import or clone: a copy record
+a startup sweep already deferred, and a removal after the Computer's
+`current_job_id` rotated (reimage, reconfigure), because the copy record binds
+the Job that ran the copy. A later restore reserves a generation past every
+recorded one, so it never collides with an aborted restore's retired row or
+its residue.
+A completed restore (`retired`) also ends
 `stable`, so the Computer alone cannot tell the two apart. The restore
 response, fresh or replayed, names the operation its idempotency key started
 in a `Restore-Operation-Revision` header -- never the Computer's latest
