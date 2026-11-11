@@ -237,19 +237,29 @@ validation" and "field `images` must be set", and `limactl start` fails with
 "configuration errors". The VM disk, Computer Storage and Backups are not
 affected. Only the instance config is wrong.
 
-Recovery, with the host VM stopped and the install's own `LIMA_HOME` (the
-`lima` folder under the wefty data folder; instance `wefty-oci`):
+Find the instance first. The node agent's launchd configuration names it:
+the `LIMA_HOME` environment value and the `--oci-lima-instance` argument
+(default `wefty-oci`). A per-user install uses the `lima` folder under the
+wefty data folder.
+
+Recovery, with the host VM stopped. The unresolved file is exactly the setup
+template, so Lima can resolve it again. Keep the unresolved copy until the
+check passes:
 
 ```sh
-LIMA_HOME=<install Lima home> limactl template copy --embed-all \
-  <wefty config folder>/host-vm.yaml <install Lima home>/wefty-oci/lima.yaml
-LIMA_HOME=<install Lima home> limactl list wefty-oci
+export LIMA_HOME=<the agent's LIMA_HOME>
+I="$LIMA_HOME/<instance>"
+cp "$I/lima.yaml" "$I/lima.yaml.unresolved"
+limactl template copy --embed-all "$I/lima.yaml.unresolved" "$I/lima.yaml.resolved"
+mv "$I/lima.yaml.resolved" "$I/lima.yaml"
+limactl list <instance>
 ```
 
-`host-vm.yaml` is the setup template rendered for this install. With
-`--embed-all`, Lima resolves its `base` into `images` the way `limactl create`
-does. `limactl list` must then show the instance without errors. An existing
-disk is kept: Lima downloads an image only for an instance that has no disk.
+With `--embed-all`, Lima resolves the `base` into `images` the way
+`limactl create` does. `limactl list` must then show the instance without
+errors. If it does not, restore `lima.yaml.unresolved` and escalate. An
+existing disk is kept: Lima downloads an image only for an instance that has
+no disk, so a 24.04 disk stays 24.04 even if the template names a newer base.
 Then run setup again. Setup now changes only `cpus`, `memory` and `disk` in
 the resolved config.
 
