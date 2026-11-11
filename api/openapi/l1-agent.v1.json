@@ -2275,7 +2275,7 @@
         } } } },
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
-          "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement. A restore engine_failure preparation_outcome also answers 200: the restore is failed with storage_copy_engine_failure and the Computer is stable on its old generation.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

@@ -164,6 +164,28 @@ func TestRestoreEngineFailureAbortsOnceTheBoundIsSpent(t *testing.T) {
 	}
 }
 
+// The count holds its half of the bound on its own: four failures spread over
+// more than ten minutes keep retrying, and the fifth aborts.
+func TestRestoreEngineFailureNeedsFiveFailures(t *testing.T) {
+	var fixture *restoreBoundFixture
+	fixture = newRestoreBoundFixture(t, func(int) error { return fixture.engineFailure() }, nil)
+	for failure := 1; failure <= 4; failure++ {
+		if err := fixture.controller.process(t.Context(), fixture.directive); err == nil {
+			t.Fatalf("failure %d was not reported", failure)
+		}
+		fixture.now = fixture.now.Add(4 * time.Minute)
+	}
+	if fixture.preparationAcknowledgements() != 0 {
+		t.Fatalf("restore aborted after 4 failures in 12 minutes")
+	}
+	if err := fixture.controller.process(t.Context(), fixture.directive); err != nil {
+		t.Fatalf("fifth failure abort: %v", err)
+	}
+	if fixture.copies != 5 || fixture.preparationAcknowledgements() != 1 {
+		t.Fatalf("copies=%d acknowledgements=%d", fixture.copies, fixture.preparationAcknowledgements())
+	}
+}
+
 // When L1 does not accept the abort, the next sweep sends the same
 // acknowledgement again and never calls the copy again.
 func TestRestoreEngineFailureAbortRetriesOnlyTheAcknowledgement(t *testing.T) {
