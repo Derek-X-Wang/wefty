@@ -226,6 +226,33 @@ is failing. The finding says which clause applies. For delivery failure, read
 the agent log for the job it names: `declare stalled removal for service` names
 the L1 refusal, and the repeated typed refusal under it is the cause to fix.
 
+## Unresolved host VM Lima config
+
+Meaning: setup refused with HTTP 412 `oci_setup_required` and the message
+"the host VM's Lima config is unresolved". Before #1595, a macOS `setup-oci`
+run wrote the setup template, which names a template `base` and has no
+`images`, over the instance's `lima.yaml`. Lima then refuses to load the
+instance: `limactl list` warns "field `base` must be empty for YAML
+validation" and "field `images` must be set", and `limactl start` fails with
+"configuration errors". The VM disk, Computer Storage and Backups are not
+affected. Only the instance config is wrong.
+
+Recovery, with the host VM stopped and the install's own `LIMA_HOME` (the
+`lima` folder under the wefty data folder; instance `wefty-oci`):
+
+```sh
+LIMA_HOME=<install Lima home> limactl template copy --embed-all \
+  <wefty config folder>/host-vm.yaml <install Lima home>/wefty-oci/lima.yaml
+LIMA_HOME=<install Lima home> limactl list wefty-oci
+```
+
+`host-vm.yaml` is the setup template rendered for this install. With
+`--embed-all`, Lima resolves its `base` into `images` the way `limactl create`
+does. `limactl list` must then show the instance without errors. An existing
+disk is kept: Lima downloads an image only for an instance that has no disk.
+Then run setup again. Setup now changes only `cpus`, `memory` and `disk` in
+the resolved config.
+
 ## The helper stopped restarting (wedged startup barrier)
 
 `systemctl status dev.wefty.oci-helper.service` (Lima) or

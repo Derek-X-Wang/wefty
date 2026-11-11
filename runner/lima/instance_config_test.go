@@ -2,6 +2,7 @@ package lima
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -112,8 +113,9 @@ func TestUpdateInstanceSizingRefusesAnUnresolvedConfig(t *testing.T) {
 	if err := os.WriteFile(path, unresolved, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := UpdateInstanceSizing(path, Sizing{Memory: "6GiB", CPUs: 6, Disk: "64GiB"}); err == nil {
-		t.Fatal("an unresolved instance config was accepted")
+	var unresolvedErr *UnresolvedInstanceConfigError
+	if err := UpdateInstanceSizing(path, Sizing{Memory: "6GiB", CPUs: 6, Disk: "64GiB"}); !errors.As(err, &unresolvedErr) {
+		t.Fatalf("an unresolved instance config was not refused as unresolved: %v", err)
 	}
 	kept, _ := os.ReadFile(path)
 	if !bytes.Equal(kept, unresolved) {

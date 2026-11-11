@@ -57,6 +57,21 @@ func TestRecreateRefusalDetailsOmitEmptyFields(t *testing.T) {
 	}
 }
 
+func TestUnresolvedHostVMConfigReachesTheOperator(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeControlResponse(recorder, nil, fmt.Errorf("setup: %w", &lima.UnresolvedInstanceConfigError{}))
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusPreconditionFailed || response.Error.Code != ErrorSetupRequired || response.Error.Retryable {
+		t.Fatalf("bad refusal: %s", recorder.Body.String())
+	}
+	if !strings.Contains(response.Error.Message, "Unresolved host VM Lima config") || !strings.Contains(response.Error.Message, "unresolved") {
+		t.Fatalf("refusal lacks the diagnosis or the runbook pointer: %s", recorder.Body.String())
+	}
+}
+
 func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeControlResponse(recorder, nil, &ocihelper.RPCError{

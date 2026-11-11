@@ -41,7 +41,7 @@ func UpdateInstanceSizing(path string, sizing Sizing) error {
 	}
 	root := document.Content[0]
 	if mappingValue(root, "base") != nil || mappingValue(root, "images") == nil {
-		return errors.New("Lima instance config is not resolved (it names a base or has no images); Lima cannot load it; restore the instance's lima.yaml from Lima's own record before running setup again")
+		return &UnresolvedInstanceConfigError{}
 	}
 	setMappingScalar(root, "cpus", "!!int", strconv.Itoa(sizing.CPUs), 0)
 	setMappingScalar(root, "memory", "!!str", sizing.Memory, yaml.DoubleQuotedStyle)
@@ -56,6 +56,17 @@ func UpdateInstanceSizing(path string, sizing Sizing) error {
 		return fmt.Errorf("encode Lima instance config: %w", err)
 	}
 	return replaceFile(path, encoded.Bytes())
+}
+
+// UnresolvedInstanceConfigError means the instance's lima.yaml still names a
+// template `base` or has no `images`, so Lima refuses to load it. Setup before
+// #1595 wrote such a file; setup refuses to edit it, and the operator rebuilds
+// it with the runbook's recovery step.
+type UnresolvedInstanceConfigError struct{}
+
+func (*UnresolvedInstanceConfigError) Error() string {
+	return "the host VM's Lima config is unresolved (it names a template base or has no images), so Lima cannot load or start the VM; " +
+		"with the host VM stopped, rebuild it as the OCI node runbook describes under \"Unresolved host VM Lima config\", then run setup again"
 }
 
 func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
