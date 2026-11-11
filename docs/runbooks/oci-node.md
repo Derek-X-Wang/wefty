@@ -226,6 +226,42 @@ is failing. The finding says which clause applies. For delivery failure, read
 the agent log for the job it names: `declare stalled removal for service` names
 the L1 refusal, and the repeated typed refusal under it is the cause to fix.
 
+## Unresolved host VM Lima config
+
+Meaning: setup refused with HTTP 412 `oci_setup_required` and the message
+"the host VM's Lima config is unresolved". Before #1595, a macOS `setup-oci`
+run wrote the setup template, which names a template `base` and has no
+`images`, over the instance's `lima.yaml`. Lima then refuses to load the
+instance: `limactl list` warns "field `base` must be empty for YAML
+validation" and "field `images` must be set", and `limactl start` fails with
+"configuration errors". The VM disk, Computer Storage and Backups are not
+affected. Only the instance config is wrong.
+
+Find the instance first. The node agent's launchd configuration names it:
+the `LIMA_HOME` environment value and the `--oci-lima-instance` argument
+(default `wefty-oci`). A per-user install uses the `lima` folder under the
+wefty data folder.
+
+Recovery, with the host VM stopped. The unresolved file is exactly the setup
+template, so Lima can resolve it again. These are manual Lima steps, not wefty
+commands. Run them with `LIMA_HOME` set to the agent's value, in the instance
+folder `$LIMA_HOME/<instance>`, and keep the unresolved copy until the check
+passes:
+
+1. Keep a copy: `cp lima.yaml lima.yaml.unresolved`.
+2. Resolve the copy into a new file:
+   `limactl template copy --embed-all lima.yaml.unresolved lima.yaml.resolved`.
+3. Put it in place: `mv lima.yaml.resolved lima.yaml`.
+4. Check: `limactl list <instance>`.
+
+With `--embed-all`, Lima resolves the `base` into `images` the way
+`limactl create` does. `limactl list` must then show the instance without
+errors. If it does not, restore `lima.yaml.unresolved` and escalate. An
+existing disk is kept: Lima downloads an image only for an instance that has
+no disk, so a 24.04 disk stays 24.04 even if the template names a newer base.
+Then run setup again. Setup now changes only `cpus`, `memory` and `disk` in
+the resolved config.
+
 ## The helper stopped restarting (wedged startup barrier)
 
 `systemctl status dev.wefty.oci-helper.service` (Lima) or

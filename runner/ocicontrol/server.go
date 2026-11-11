@@ -360,6 +360,11 @@ func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, blocked.Error(), details)
 			return
 		}
+		var unresolved *lima.UnresolvedInstanceConfigError
+		if errors.As(err, &unresolved) {
+			writeControlError(writer, http.StatusPreconditionFailed, ErrorSetupRequired, unresolved.Error())
+			return
+		}
 		failure := &ControlError{Code: ErrorInternal, Status: http.StatusInternalServerError, Message: "node-local OCI control failed", Cause: err}
 		if !errors.As(err, &failure) {
 			failure.Cause = err
