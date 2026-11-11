@@ -304,14 +304,17 @@ func (engine *ContainerdEngine) prepareResetSuccessor(ctx context.Context, reque
 	return receipt, nil
 }
 
-// ResetComputerStorage prepares and verifies N+1 without deleting N. L1 first
+// ResetComputerStorage prepares and verifies a successor without deleting N.
+// The successor is any generation newer than N: L1 reserves one past every
+// recorded generation, which skips a retired row an aborted restore left
+// behind (#1598). L1 first
 // publishes the verified successor; retirement then runs through the shared
 // managed-volume delete and removal-attestation path.
 func (engine *ContainerdEngine) ResetComputerStorage(ctx context.Context, request ResetComputerStorageRequest) (ResetComputerStorageResponse, error) {
 	engine.storageResetMu.Lock()
 	defer engine.storageResetMu.Unlock()
 	if request.Storage.DiskBytes <= 0 || request.Storage.IntentRevision != request.Authority.IntentRevision ||
-		request.NewGeneration != request.Storage.StorageGeneration+1 || request.Authority.NodeID == "" ||
+		request.NewGeneration <= request.Storage.StorageGeneration || request.Authority.NodeID == "" ||
 		request.Authority.BootSessionID == "" || request.Authority.RootInstanceID == "" ||
 		request.Authority.JobID == "" || request.Authority.PriorJobID == "" || request.Authority.HelperGeneration == 0 ||
 		request.Authority.IntentRevision < 1 || strings.TrimSpace(request.Authority.CleanupFence) == "" {

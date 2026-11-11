@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -57,6 +58,15 @@ func TestComputerStorageResetBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 }
 
 func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
+	for _, skip := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("current+%d", skip), func(t *testing.T) { testComputerStorageResetFreshSuccessor(t, skip) })
+	}
+}
+
+// testComputerStorageResetFreshSuccessor resets to current+skip. A skip of
+// two is the generation L1 reserves after an aborted restore left a retired
+// row at current+1 (#1598).
+func testComputerStorageResetFreshSuccessor(t *testing.T, skip int64) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
@@ -70,9 +80,15 @@ func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := resetTestRequest(storage, prior)
+	request.NewGeneration = storage.StorageGeneration + skip
 	request.Storage.IntentRevision = request.Authority.IntentRevision
-	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+	reset, err := engine.ResetComputerStorage(t.Context(), request)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if reset.Receipt.OldGeneration != storage.StorageGeneration || reset.Receipt.NewGeneration != request.NewGeneration {
+		t.Fatalf("reset receipt generations = %d -> %d, want %d -> %d", reset.Receipt.OldGeneration,
+			reset.Receipt.NewGeneration, storage.StorageGeneration, request.NewGeneration)
 	}
 	successor := storage
 	successor.StorageGeneration = request.NewGeneration
@@ -174,113 +190,125 @@ func TestComputerStorageResetResumesEveryPreparationBoundaryThenUsesSharedRemova
 		computerStorageResetImagePublished,
 		computerStorageResetVerified,
 	} {
-		t.Run(string(checkpoint), func(t *testing.T) {
-			root := t.TempDir()
-			system := newFakeComputerDiskSystem()
-			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
-			storage := testComputerStorage()
-			authority := testComputerAuthority("attempt-a", "fence-a", "boot-a")
-			attachment, err := engine.attachComputerDisk(t.Context(), storage, authority)
-			if err != nil {
-				t.Fatal(err)
-			}
-			credentialPath := filepath.Join(filepath.Dir(attachment.imagePath), "planted-credential")
-			if err := os.WriteFile(credentialPath, []byte("old-generation"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
-				t.Fatal(err)
-			}
-			request := resetTestRequest(storage, authority)
-			request.Storage.IntentRevision = request.Authority.IntentRevision
-			crash := errors.New("injected crash")
-			fired := false
-			engine.storageResetHook = func(observed computerStorageResetPhase) error {
-				if observed == checkpoint && !fired {
-					fired = true
-					return crash
+		// current+2 is the successor L1 reserves after an aborted restore
+		// left a retired row at current+1 (#1598).
+		for _, skip := range []int64{1, 2} {
+			t.Run(fmt.Sprintf("%s/current+%d", checkpoint, skip), func(t *testing.T) {
+				root := t.TempDir()
+				system := newFakeComputerDiskSystem()
+				engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+				storage := testComputerStorage()
+				authority := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+				attachment, err := engine.attachComputerDisk(t.Context(), storage, authority)
+				if err != nil {
+					t.Fatal(err)
 				}
-				return nil
-			}
-			if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, crash) {
-				t.Fatalf("checkpoint %q error = %v, want injected crash", checkpoint, err)
-			}
+				credentialPath := filepath.Join(filepath.Dir(attachment.imagePath), "planted-credential")
+				if err := os.WriteFile(credentialPath, []byte("old-generation"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+					t.Fatal(err)
+				}
+				request := resetTestRequest(storage, authority)
+				request.NewGeneration = storage.StorageGeneration + skip
+				request.Storage.IntentRevision = request.Authority.IntentRevision
+				crash := errors.New("injected crash")
+				fired := false
+				engine.storageResetHook = func(observed computerStorageResetPhase) error {
+					if observed == checkpoint && !fired {
+						fired = true
+						return crash
+					}
+					return nil
+				}
+				if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, crash) {
+					t.Fatalf("checkpoint %q error = %v, want injected crash", checkpoint, err)
+				}
 
-			engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
-			request.Authority.BootSessionID = "boot-b"
-			request.Authority.HelperGeneration = 2
-			response, err := engine.ResetComputerStorage(t.Context(), request)
-			if err != nil || !response.Verified || response.Receipt.ReceiptID == "" {
-				t.Fatalf("resumed preparation = %+v err=%v", response, err)
-			}
-			expectedHelperGeneration := uint64(2)
-			if checkpoint == computerStorageResetVerified {
-				expectedHelperGeneration = 1
-			}
-			if response.Receipt.HelperGeneration != expectedHelperGeneration ||
-				response.Receipt.RootInstanceID != request.Authority.RootInstanceID {
-				t.Fatalf("prepared receipt = %+v", response.Receipt)
-			}
-			if _, err := os.Lstat(credentialPath); err != nil {
-				t.Fatalf("pre-publication reset destroyed old bytes: %v", err)
-			}
-			if _, err := engine.attachComputerDisk(t.Context(), storage,
-				testComputerAuthority("stale", "stale", "boot-b")); err == nil {
-				t.Fatal("retirement-fenced Storage generation was reattached")
-			}
+				engine = &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
+				request.Authority.BootSessionID = "boot-b"
+				request.Authority.HelperGeneration = 2
+				response, err := engine.ResetComputerStorage(t.Context(), request)
+				if err != nil || !response.Verified || response.Receipt.ReceiptID == "" {
+					t.Fatalf("resumed preparation = %+v err=%v", response, err)
+				}
+				expectedHelperGeneration := uint64(2)
+				if checkpoint == computerStorageResetVerified {
+					expectedHelperGeneration = 1
+				}
+				if response.Receipt.HelperGeneration != expectedHelperGeneration ||
+					response.Receipt.RootInstanceID != request.Authority.RootInstanceID ||
+					response.Receipt.OldGeneration != storage.StorageGeneration || response.Receipt.NewGeneration != request.NewGeneration {
+					t.Fatalf("prepared receipt = %+v", response.Receipt)
+				}
+				// A replay of the verified preparation, as after a lost answer,
+				// returns the same stored receipt.
+				replayed, err := engine.ResetComputerStorage(t.Context(), request)
+				if err != nil || replayed.Receipt != response.Receipt {
+					t.Fatalf("replayed preparation = %+v err=%v, want %+v", replayed.Receipt, err, response.Receipt)
+				}
+				if _, err := os.Lstat(credentialPath); err != nil {
+					t.Fatalf("pre-publication reset destroyed old bytes: %v", err)
+				}
+				if _, err := engine.attachComputerDisk(t.Context(), storage,
+					testComputerAuthority("stale", "stale", "boot-b")); err == nil {
+					t.Fatal("retirement-fenced Storage generation was reattached")
+				}
 
-			fresh := storage
-			fresh.StorageGeneration++
-			fresh.IntentRevision = request.Authority.IntentRevision
-			freshName, _ := deterministicComputerDiskName(fresh)
-			if err := verifyComputerDiskAllocation(filepath.Join(root, "computer-disks", freshName, "disk.ext4"), fresh.DiskBytes); err != nil {
-				t.Fatalf("successor was not fully allocated: %v", err)
-			}
+				fresh := storage
+				fresh.StorageGeneration = request.NewGeneration
+				fresh.IntentRevision = request.Authority.IntentRevision
+				freshName, _ := deterministicComputerDiskName(fresh)
+				if err := verifyComputerDiskAllocation(filepath.Join(root, "computer-disks", freshName, "disk.ext4"), fresh.DiskBytes); err != nil {
+					t.Fatalf("successor was not fully allocated: %v", err)
+				}
 
-			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID,
-				BootSessionID: request.Authority.BootSessionID, JobID: request.Authority.JobID, PriorJobID: authority.JobID,
-				RemovalGeneration: uint64(request.Authority.IntentRevision), CleanupFence: request.Authority.CleanupFence}
-			oldName, _ := deterministicComputerDiskName(storage)
-			legacyManifestRoot := filepath.Join(root, "computer-storage-resets")
-			legacyQuarantineRoot := filepath.Join(root, "computer-disk-quarantine", oldName+"-reset-2")
-			if err := os.MkdirAll(legacyManifestRoot, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(legacyManifestRoot, oldName+".json"), []byte("{}\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(legacyQuarantineRoot, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			before := ResourceInventory{}
-			if err := engine.inventoryComputerDiskResources(&before); err != nil ||
-				!slices.Contains(before.ComputerResetManifests, oldName) || !slices.Contains(before.ComputerQuarantines, oldName) ||
-				!slices.ContainsFunc(before.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
-					return entry.DiskName == oldName && entry.Operation == "legacy_reset" && entry.Reason == "legacy_reset_quarantine"
-				}) || len(before.ComputerDiskAnomalies) != 0 {
-				t.Fatalf("legacy reset residue was not inventoried: %+v err=%v", before, err)
-			}
-			if err := engine.deleteComputerDisk(storage, removal); err != nil {
-				t.Fatalf("shared disk removal failed: %v", err)
-			}
-			after := ResourceInventory{}
-			if err := engine.inventoryComputerDiskResources(&after); err != nil ||
-				slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) ||
-				slices.Contains(after.ComputerDiskAnomalies, oldName+"-reset-2:quarantine_authority_invalid") {
-				t.Fatalf("legacy reset residue survived shared removal: %+v err=%v", after, err)
-			}
-			resources := expectedComputerStorageRemovalResources(&storage)
-			attestation, err := attestRemovalInventory(ResourceInventory{}, AttestRemovalRequest{
-				JobID: request.Authority.JobID, RemovalGeneration: "2",
-				Attempts: []RemovalAttemptManifest{{StorageOnly: true, ComputerStorage: &storage, Resources: resources}},
+				removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID,
+					BootSessionID: request.Authority.BootSessionID, JobID: request.Authority.JobID, PriorJobID: authority.JobID,
+					RemovalGeneration: uint64(request.Authority.IntentRevision), CleanupFence: request.Authority.CleanupFence}
+				oldName, _ := deterministicComputerDiskName(storage)
+				legacyManifestRoot := filepath.Join(root, "computer-storage-resets")
+				legacyQuarantineRoot := filepath.Join(root, "computer-disk-quarantine", oldName+"-reset-2")
+				if err := os.MkdirAll(legacyManifestRoot, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(legacyManifestRoot, oldName+".json"), []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(legacyQuarantineRoot, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				before := ResourceInventory{}
+				if err := engine.inventoryComputerDiskResources(&before); err != nil ||
+					!slices.Contains(before.ComputerResetManifests, oldName) || !slices.Contains(before.ComputerQuarantines, oldName) ||
+					!slices.ContainsFunc(before.ComputerStorageQuarantined, func(entry ComputerStorageRecoveryInventoryEntry) bool {
+						return entry.DiskName == oldName && entry.Operation == "legacy_reset" && entry.Reason == "legacy_reset_quarantine"
+					}) || len(before.ComputerDiskAnomalies) != 0 {
+					t.Fatalf("legacy reset residue was not inventoried: %+v err=%v", before, err)
+				}
+				if err := engine.deleteComputerDisk(storage, removal); err != nil {
+					t.Fatalf("shared disk removal failed: %v", err)
+				}
+				after := ResourceInventory{}
+				if err := engine.inventoryComputerDiskResources(&after); err != nil ||
+					slices.Contains(after.ComputerResetManifests, oldName) || slices.Contains(after.ComputerQuarantines, oldName) ||
+					slices.Contains(after.ComputerDiskAnomalies, oldName+"-reset-2:quarantine_authority_invalid") {
+					t.Fatalf("legacy reset residue survived shared removal: %+v err=%v", after, err)
+				}
+				resources := expectedComputerStorageRemovalResources(&storage)
+				attestation, err := attestRemovalInventory(ResourceInventory{}, AttestRemovalRequest{
+					JobID: request.Authority.JobID, RemovalGeneration: "2",
+					Attempts: []RemovalAttemptManifest{{StorageOnly: true, ComputerStorage: &storage, Resources: resources}},
+				})
+				if err != nil || len(attestation.Assertions) != len(resources) {
+					t.Fatalf("shared removal attestation = %+v err=%v", attestation, err)
+				}
+				if _, err := os.Lstat(filepath.Join(root, "computer-disks", oldName)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("old generation survived shared removal: %v", err)
+				}
 			})
-			if err != nil || len(attestation.Assertions) != len(resources) {
-				t.Fatalf("shared removal attestation = %+v err=%v", attestation, err)
-			}
-			if _, err := os.Lstat(filepath.Join(root, "computer-disks", oldName)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("old generation survived shared removal: %v", err)
-			}
-		})
+		}
 	}
 }
 
