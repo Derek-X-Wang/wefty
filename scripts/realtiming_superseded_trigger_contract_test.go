@@ -22,8 +22,8 @@ func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 		}
 	}
 
-	// values describes the trigger; a nil conclusion is a pull_request event,
-	// which has no github.event.workflow_run.
+	// values describes the trigger; a pull_request event has no
+	// github.event.workflow_run, so its conclusion is '' or nil.
 	values := func(event string, conclusion any, resolveResult string) map[string]any {
 		return map[string]any{
 			"always()":                                           true,
@@ -78,6 +78,8 @@ func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 			{"workflow_run", "neutral"},
 			{"workflow_run", "skipped"},
 			{"workflow_run", "stale"},
+			// GitHub evaluates a missing property as ''; nil covers null too.
+			{"pull_request", ""},
 			{"pull_request", nil},
 		} {
 			for _, name := range []string{"resolve-published-artifact", "realtiming-result"} {
