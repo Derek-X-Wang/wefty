@@ -2245,7 +2245,7 @@
       "post": {
         "operationId": "acknowledgeComputerStorageCopy",
         "summary": "Publish an assertion-derived restore, clone, or Custody import destination",
-        "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import only, a mutually exclusive preparation_outcome persists the helper's exact-generation interrupted, deferred, or quarantined result without granting publication authority.",
+        "description": "A success/failure receipt binds source bytes and destination Storage authority. For Custody import and Computer clone, a mutually exclusive preparation_outcome persists the helper's exact-generation interrupted, deferred, or quarantined result without granting publication authority. For a restore, the only accepted preparation_outcome is computer_storage_preparation_interrupted with reason engine_failure, sent once the agent's bound on live-session engine failures is spent: it aborts the restore as failed with failure_code storage_copy_engine_failure, keeps the old generation current, and returns the Computer stable; an identical replay names the same restore by intent_revision and reads the same answer.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
       "required": ["node_id", "boot_session_id", "idempotency_key"],
@@ -2275,7 +2275,7 @@
         } } } },
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
-          "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
+          "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement. A restore engine_failure preparation_outcome also answers 200: the restore is failed with storage_copy_engine_failure and the Computer is stable on its old generation.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }

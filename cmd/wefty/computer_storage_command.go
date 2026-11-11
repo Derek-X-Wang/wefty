@@ -580,7 +580,7 @@ func awaitedComputerRestoreFailure(computer l1.Computer) error {
 		"operation_revision": outcome.OperationRevision, "status": outcome.Status,
 		"failure_code": string(outcome.FailureCode)}
 	code := contract.ErrorConflict
-	if outcome.FailureCode == l1.ComputerBackupFailureInsufficientDisk {
+	if outcome.FailureCode == l1.ComputerRestoreFailureInsufficientDisk {
 		code = contract.ErrorCapacityExhausted
 	}
 	message := "Computer restore " + outcome.Status

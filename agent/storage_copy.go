@@ -33,7 +33,30 @@ type storageCopyController struct {
 	// agent restart the next helper session sweeps the copy first, as after
 	// runtime loss.
 	terminal map[string]workloadrunner.ComputerStoragePreparationOutcome
-	wg       sync.WaitGroup
+	// restoreFailures counts the engine failures a live helper session
+	// answered for one restore's copy (#1591). The count and the time of the
+	// first failure stay until the copy succeeds or L1 accepts the abort;
+	// other errors neither count nor reset them. The map lives in memory, so
+	// an agent restart starts the bound again: an accepted limit.
+	restoreFailures map[string]restoreEngineFailures
+	now             func() time.Time
+	wg              sync.WaitGroup
+}
+
+// A restore aborts once its copy has failed with a live-session engine
+// failure at least restoreEngineFailureLimit times and at least
+// restoreEngineFailureWindow after the first one. Both must hold: the count
+// keeps a burst of fast failures from aborting at once, and the window gives
+// a transient host fault time to clear. At the default 15 s heartbeat this is
+// about 41 failed calls.
+const (
+	restoreEngineFailureLimit  = 5
+	restoreEngineFailureWindow = 10 * time.Minute
+)
+
+type restoreEngineFailures struct {
+	count int
+	first time.Time
 }
 
 func newStorageCopyController(client *Client, copier workloadrunner.ComputerStorageCopier,
@@ -44,7 +67,8 @@ func newStorageCopyController(client *Client, copier workloadrunner.ComputerStor
 	return &storageCopyController{client: client, copier: copier, backupper: backupper,
 		nodeID: nodeID, bootSessionID: bootSessionID, rootInstanceID: rootInstanceID,
 		logf: logf, inflight: make(map[string]struct{}),
-		terminal: make(map[string]workloadrunner.ComputerStoragePreparationOutcome)}
+		terminal:        make(map[string]workloadrunner.ComputerStoragePreparationOutcome),
+		restoreFailures: make(map[string]restoreEngineFailures), now: time.Now}
 }
 
 func (controller *storageCopyController) process(ctx context.Context, directive l1.ComputerStorageCopyDirective) error {
@@ -109,7 +133,14 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 		// destination generation, so both may close a preparation outcome at
 		// L1 rather than retrying the same copy every sweep. A restore's
 		// destination is a live Computer whose predecessor still holds the
-		// bytes, so its failures stay ordinary errors.
+		// bytes, so its failures stay ordinary errors, except a live-session
+		// engine failure that persists past the bound (#1591).
+		var preparation *workloadrunner.ComputerStoragePreparationError
+		if directive.Operation == "restore" && errors.As(err, &preparation) &&
+			preparation.Outcome.Code == workloadrunner.ComputerStoragePreparationInterrupted &&
+			preparation.Outcome.Reason == workloadrunner.ComputerStoragePreparationReasonEngineFailure {
+			return controller.boundRestoreEngineFailure(ctx, directive, preparation.Outcome, err)
+		}
 		acknowledges := directive.Operation == "import" || directive.Operation == "clone"
 		var runtimeLoss *workloadrunner.RuntimeLossError
 		if acknowledges && errors.As(err, &runtimeLoss) && runtimeLoss.Generation.Generation > 0 {
@@ -124,7 +155,6 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			}
 			return controller.acknowledgePreparation(ctx, directive, outcome)
 		}
-		var preparation *workloadrunner.ComputerStoragePreparationError
 		if acknowledges && errors.As(err, &preparation) {
 			if preparation.Outcome.Code == workloadrunner.ComputerStoragePreparationInterrupted &&
 				preparation.Outcome.Reason == workloadrunner.ComputerStoragePreparationReasonEngineFailure {
@@ -133,6 +163,11 @@ func (controller *storageCopyController) process(ctx context.Context, directive 
 			return controller.acknowledgePreparation(ctx, directive, preparation.Outcome)
 		}
 		return err
+	}
+	if directive.Operation == "restore" {
+		controller.mu.Lock()
+		delete(controller.restoreFailures, terminalCopyKey(directive))
+		controller.mu.Unlock()
 	}
 	if directive.Operation == "import" && receipt.Kind == "computer_storage_copy_failed_absent" {
 		if err := controller.attestFailedImportCleanup(ctx, directive); err != nil {
@@ -150,6 +185,36 @@ func terminalCopyKey(directive l1.ComputerStorageCopyDirective) string {
 	return fmt.Sprintf("%s/%d/%d", directive.DestinationComputerID, directive.OperationRevision, directive.DestinationGeneration)
 }
 
+// boundRestoreEngineFailure counts one live-session engine failure of a
+// restore's copy. Inside the bound it returns the copy error, so the next
+// sweep calls the copy again. Once the bound is spent it ends the restore: the
+// outcome goes to L1 as a terminal preparation outcome, which aborts the
+// restore with the old generation still current.
+func (controller *storageCopyController) boundRestoreEngineFailure(ctx context.Context, directive l1.ComputerStorageCopyDirective,
+	outcome workloadrunner.ComputerStoragePreparationOutcome, copyErr error) error {
+	key := terminalCopyKey(directive)
+	now := controller.now()
+	controller.mu.Lock()
+	failures := controller.restoreFailures[key]
+	if failures.count == 0 {
+		failures.first = now
+	}
+	failures.count++
+	controller.restoreFailures[key] = failures
+	controller.mu.Unlock()
+	elapsed := now.Sub(failures.first)
+	if failures.count < restoreEngineFailureLimit || elapsed < restoreEngineFailureWindow {
+		return fmt.Errorf("Computer restore Storage copy engine failure %d (abort after %d and %s): %w",
+			failures.count, restoreEngineFailureLimit, restoreEngineFailureWindow, copyErr)
+	}
+	if controller.logf != nil {
+		controller.logf("agent: abort Computer restore: %s computer=%s revision=%d generation=%d failures=%d elapsed=%s: %v",
+			l1.ComputerRestoreFailureStorageCopyEngineFailure, directive.DestinationComputerID, directive.OperationRevision,
+			directive.DestinationGeneration, failures.count, elapsed.Round(time.Second), copyErr)
+	}
+	return controller.acknowledgeTerminalPreparation(ctx, directive, outcome)
+}
+
 // acknowledgeTerminalPreparation retains a terminal engine_failure outcome
 // and sends it to L1, dropping it only once L1 has accepted it.
 func (controller *storageCopyController) acknowledgeTerminalPreparation(ctx context.Context, directive l1.ComputerStorageCopyDirective,
@@ -163,6 +228,7 @@ func (controller *storageCopyController) acknowledgeTerminalPreparation(ctx cont
 	}
 	controller.mu.Lock()
 	delete(controller.terminal, key)
+	delete(controller.restoreFailures, key)
 	controller.mu.Unlock()
 	return nil
 }

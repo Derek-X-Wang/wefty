@@ -71,17 +71,13 @@ func TestComputerStoragePreparationOutcomeRequiresExactSweepIdentity(t *testing.
 func TestComputerStorageCopyEngineFailureEndsOnlyThatCopy(t *testing.T) {
 	// A typed engine failure the live session answered for one copy is not
 	// runtime loss (#1581). Read as loss, it closed the helper session and
-	// ended every attempt on the Node. Now the session stays healthy. An
-	// import or a clone owns a fresh destination generation, so the failure
-	// reaches the agent as the terminal, exact-generation interrupted outcome
-	// with reason engine_failure, bound to the live helper generation. A
-	// restore keeps its predecessor's bytes and stays an ordinary engine
-	// failure.
-	for _, test := range []struct {
-		operation string
-		bound     bool
-	}{{operation: "import", bound: true}, {operation: "clone", bound: true}, {operation: "restore"}} {
-		t.Run(test.operation, func(t *testing.T) {
+	// ended every attempt on the Node. Now the session stays healthy, and the
+	// failure reaches the agent as the exact-generation interrupted outcome
+	// with reason engine_failure, bound to the live helper generation. An
+	// import or a clone ends on it at once; a restore keeps its predecessor's
+	// bytes, so the agent retries it within a bound before it aborts (#1591).
+	for _, operation := range []string{"import", "clone", "restore"} {
+		t.Run(operation, func(t *testing.T) {
 			engine := &adapterTestEngine{storageCopyErr: io.ErrUnexpectedEOF}
 			adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
 			defer closeAdapter()
@@ -91,7 +87,7 @@ func TestComputerStorageCopyEngineFailureEndsOnlyThatCopy(t *testing.T) {
 			}
 			handshake := session.Handshake()
 			request := workloadrunner.ComputerStorageCopyRequest{
-				Operation: test.operation, BackupID: "backup-copy", CopyID: "copy-copy",
+				Operation: operation, BackupID: "backup-copy", CopyID: "copy-copy",
 				SourceComputerID: "source-computer", SourceStorageID: "source-storage", SourceGeneration: 1,
 				SourceSize: 1 << 20, SourceDigest: adapterTestDigest, ExportID: "export-copy",
 				ExternalPath: "/operator/import", ManifestDigest: adapterTestDigest,
@@ -103,22 +99,14 @@ func TestComputerStorageCopyEngineFailureEndsOnlyThatCopy(t *testing.T) {
 			_, err = adapter.CopyComputerStorage(t.Context(), request)
 			var loss *workloadrunner.RuntimeLossError
 			if errors.As(err, &loss) {
-				t.Fatalf("%s engine failure read as runtime loss: %v", test.operation, err)
+				t.Fatalf("%s engine failure read as runtime loss: %v", operation, err)
 			}
 			if healthErr := session.HealthError(); healthErr != nil {
-				t.Fatalf("%s engine failure closed the helper session: %v", test.operation, healthErr)
+				t.Fatalf("%s engine failure closed the helper session: %v", operation, healthErr)
 			}
 			var preparation *workloadrunner.ComputerStoragePreparationError
-			if errors.As(err, &preparation) != test.bound {
-				t.Fatalf("%s preparation outcome = %v, want bound=%t", test.operation, err, test.bound)
-			}
-			if !test.bound {
-				var rpcError *ocihelper.RPCError
-				if !errors.As(err, &rpcError) || rpcError.Code != ocihelper.CodeEngineFailure ||
-					rpcError.EngineFailure == nil || rpcError.EngineFailure.Operation != ocihelper.MethodCopyStorage {
-					t.Fatalf("%s engine failure = %v", test.operation, err)
-				}
-				return
+			if !errors.As(err, &preparation) {
+				t.Fatalf("%s preparation outcome = %v", operation, err)
 			}
 			outcome := preparation.Outcome
 			if outcome.Code != workloadrunner.ComputerStoragePreparationInterrupted ||
@@ -126,7 +114,7 @@ func TestComputerStorageCopyEngineFailureEndsOnlyThatCopy(t *testing.T) {
 				outcome.Operation != "computer_storage_copy" || outcome.Storage != request.Destination ||
 				outcome.HelperGeneration != handshake.SessionGeneration || outcome.HelperGeneration == 0 ||
 				outcome.SweepEpoch != "" || outcome.RecordedAt.IsZero() {
-				t.Fatalf("%s preparation outcome = %#v", test.operation, outcome)
+				t.Fatalf("%s preparation outcome = %#v", operation, outcome)
 			}
 		})
 	}
