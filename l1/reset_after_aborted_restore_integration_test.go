@@ -58,4 +58,41 @@ func TestStorageResetAfterAbortedRestoreSkipsTheRetiredGeneration(t *testing.T) 
 			resets[0].OldGeneration, resets[0].NewGeneration, computer.StorageGeneration,
 			computer.StorageGeneration+2, directives[0].DestinationGeneration)
 	}
+
+	// The helper's receipt for current+2 is accepted, replayed, published, and
+	// retires the predecessor exactly as a current+1 reset does.
+	reset := resets[0]
+	receipt := resetReceipt(reset)
+	acknowledgement := ComputerStorageResetAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		IdempotencyKey: receipt.ReceiptID, Receipt: receipt}
+	published, err := h.store.AcknowledgeComputerStorageReset(ctx, "fabric-computer-node", computer.ComputerID, acknowledgement)
+	if err != nil || published.StorageGeneration != reset.NewGeneration ||
+		published.ReconfigurationPhase != ComputerReconfigurationResetting {
+		t.Fatalf("published reset past the retired generation = %#v err=%v", published, err)
+	}
+	replayed, err := h.store.AcknowledgeComputerStorageReset(ctx, "fabric-computer-node", computer.ComputerID, acknowledgement)
+	if err != nil || replayed.StorageGeneration != published.StorageGeneration || replayed.IntentRevision != published.IntentRevision {
+		t.Fatalf("replayed reset acknowledgement = %#v err=%v", replayed, err)
+	}
+	completed, err := h.store.AcknowledgeComputerStorageRetirement(ctx, "fabric-computer-node", computer.ComputerID,
+		RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			RemovalGeneration: uint64(reset.IntentRevision), CleanupFence: reset.CleanupFence,
+			RootInstanceID: reset.RootInstanceID, IdempotencyKey: "retired-after-aborted-restore"})
+	if err != nil || completed.ReconfigurationPhase != ComputerReconfigurationStable ||
+		completed.StorageGeneration != reset.NewGeneration || completed.AppliedRevision != completed.IntentRevision {
+		t.Fatalf("completed reset past the retired generation = %#v err=%v", completed, err)
+	}
+	generations, err := testReads(h.store).ListComputerStorageGenerations(ctx, computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phases := map[int64]ComputerStorageGenerationPhase{}
+	for _, generation := range generations.Generations {
+		phases[generation.StorageGeneration] = generation.Phase
+	}
+	if phases[computer.StorageGeneration] != ComputerStorageGenerationRetired ||
+		phases[directives[0].DestinationGeneration] != ComputerStorageGenerationRetired ||
+		phases[reset.NewGeneration] != ComputerStorageGenerationCurrent {
+		t.Fatalf("Storage generations after the reset = %#v", phases)
+	}
 }

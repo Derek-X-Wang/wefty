@@ -36,7 +36,7 @@ memory-only failure may stop at the retention deadline plus 24 hours. A helper
 that has no failure evidence attempts GC rather than treating age as evidence.
 Inventory and doctor surface the GC count, timestamps, last failure, evidence
 location, and escalation count. The supported recovery path
-prepares and admits reset generation N+1 and clears N only through authorized
+prepares and admits a newer reset generation and clears N only through authorized
 removal. A legacy `-reset-N` directory is only a retained
 `legacy_reset_quarantine` tombstone when it lacks a validated historical reset
 manifest; its name and modification time never authorize deletion. When that
