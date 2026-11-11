@@ -1987,7 +1987,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			body.Authority.HelperGeneration != session.helper.SessionGeneration || body.Authority.HelperGeneration == 0 ||
 			body.Authority.RootInstanceID == "" || body.Authority.JobID == "" || body.Authority.PriorJobID == "" || body.Authority.IntentRevision < 1 || body.Authority.CleanupFence == "" ||
 			body.Storage.ComputerID == "" || body.Storage.StorageID == "" || body.Storage.StorageGeneration < 1 ||
-			body.Storage.IntentRevision != body.Authority.IntentRevision || body.NewGeneration != body.Storage.StorageGeneration+1 {
+			body.Storage.IntentRevision != body.Authority.IntentRevision || body.NewGeneration <= body.Storage.StorageGeneration {
 			_ = writeFailure(wire, CodeInvalidRequest, "complete current-session Computer Storage reset authority is required")
 			return
 		}

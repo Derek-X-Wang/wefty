@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -57,6 +58,15 @@ func TestComputerStorageResetBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 }
 
 func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
+	for _, skip := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("current+%d", skip), func(t *testing.T) { testComputerStorageResetFreshSuccessor(t, skip) })
+	}
+}
+
+// testComputerStorageResetFreshSuccessor resets to current+skip. A skip of
+// two is the generation L1 reserves after an aborted restore left a retired
+// row at current+1 (#1598).
+func testComputerStorageResetFreshSuccessor(t *testing.T, skip int64) {
 	root := t.TempDir()
 	system := newFakeComputerDiskSystem()
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system}
@@ -70,9 +80,15 @@ func TestComputerStorageResetMarksSuccessorFreshForFirstAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := resetTestRequest(storage, prior)
+	request.NewGeneration = storage.StorageGeneration + skip
 	request.Storage.IntentRevision = request.Authority.IntentRevision
-	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
+	reset, err := engine.ResetComputerStorage(t.Context(), request)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if reset.Receipt.OldGeneration != storage.StorageGeneration || reset.Receipt.NewGeneration != request.NewGeneration {
+		t.Fatalf("reset receipt generations = %d -> %d, want %d -> %d", reset.Receipt.OldGeneration,
+			reset.Receipt.NewGeneration, storage.StorageGeneration, request.NewGeneration)
 	}
 	successor := storage
 	successor.StorageGeneration = request.NewGeneration

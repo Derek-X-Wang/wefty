@@ -91,7 +91,7 @@ func reimageDetachmentEvidence(manifest computerDiskManifest, request PreflightC
 	if !manifest.Prepared || preparation == nil || receipt == nil || manifest.PreviousDetachment != nil ||
 		receipt.Kind != "computer_storage_reset_verified" || receipt.ReceiptID == "" || receipt.HelperGeneration == 0 ||
 		receipt.ComputerID != request.Storage.ComputerID || receipt.StorageID != request.Storage.StorageID ||
-		receipt.NewGeneration != request.Storage.StorageGeneration || receipt.OldGeneration+1 != receipt.NewGeneration ||
+		receipt.NewGeneration != request.Storage.StorageGeneration || receipt.NewGeneration <= receipt.OldGeneration ||
 		receipt.NodeID != request.Authority.NodeID || receipt.RootInstanceID != request.Authority.RootInstanceID ||
 		receipt.JobID != request.Authority.OldJobID || receipt.IntentRevision != manifest.Storage.IntentRevision ||
 		receipt.CleanupFence == "" || preparation.NodeID != receipt.NodeID ||
