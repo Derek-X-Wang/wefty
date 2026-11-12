@@ -88,7 +88,7 @@ func (s *Store) abortStagedGeneration(ctx context.Context, identity, nodeID, gen
 	if _, err = tx.ExecContext(ctx, `INSERT INTO node_generation_promotions(node_id,operation_id,request_json,result_json) VALUES(?,?,?,?)`, nodeID, operation, payload, result); err != nil {
 		return in, err
 	}
-	return in, tx.Commit()
+	return in, write.commit()
 }
 
 func stagedAbortConflict(message string) error {

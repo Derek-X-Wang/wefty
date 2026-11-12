@@ -127,7 +127,7 @@ func (s *Store) markLogEventDocumentsCompactOnNewDatabase(ctx context.Context) e
 		logEventDocumentMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log event document migration: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return fmt.Errorf("l1: commit log event document migration check: %w", err)
 	}
 	return nil
@@ -221,7 +221,7 @@ func (s *Store) CompactLogEventDocuments(ctx context.Context) (LogEventCompactio
 		logEventDocumentMigration, through, ceiling); err != nil {
 		return LogEventCompaction{}, internalError(err, "advance log event document migration cursor")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return LogEventCompaction{}, internalError(err, "commit log event document migration")
 	}
 	return result, nil

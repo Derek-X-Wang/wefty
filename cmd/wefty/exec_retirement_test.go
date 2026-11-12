@@ -127,15 +127,27 @@ func TestExecSlowRemovalSurvivesAttemptEnd(t *testing.T) {
 	observed, release := blockExecRemoval(t)
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
-	ctx, stop := context.WithTimeout(t.Context(), 8*time.Second)
+	// This bound only ends a run that hangs; the wait is measured below.
+	ctx, stop := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer stop()
 	var stderr bytes.Buffer
-	started := time.Now()
 	err := execute(ctx, stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", `test "$1" = __WEFTY_EXEC_CLEANUP__`, "sh", "__WEFTY_EXEC_CLEANUP__"}, io.Discard, &stderr)
+	returned := time.Now()
 	if err != nil {
-		t.Fatalf("removal kept run open: %v (%s), %s", err, time.Since(started), stderr.String())
+		t.Fatalf("exec with a blocked removal: %v, %s", err, stderr.String())
 	}
 	waitExecPath(t, observed, true)
+	// Starting a real run takes as long as the host allows, so the whole
+	// command has no fixed bound. The run must not wait on the deletion: count
+	// only from the blocked delete step, against the old ten-second wait (#1617).
+	blocked, err := os.Stat(observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waited := returned.Sub(blocked.ModTime()); waited > 8*time.Second {
+		t.Fatalf("removal kept run open for %s after the delete step blocked: %s", waited, stderr.String())
+	}
+	t.Logf("exec returned %s after the delete step blocked", returned.Sub(blocked.ModTime()))
 	raw, err := os.ReadFile(observed)
 	if err != nil {
 		t.Fatal(err)

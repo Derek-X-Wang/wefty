@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -106,13 +107,13 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 	if e := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, &stderr); e != nil {
 		t.Fatal(e)
 	}
+	// Check the protected folders after the last sweep: on a busy host the
+	// first sweep can stop at its budget before it reaches them.
+	sweepExecUntilGone(t, stack.clients, old)
 	for _, path := range []string{params.Storage, young, unrelated, unknown, outside} {
 		if _, e := os.Stat(path); e != nil {
 			t.Errorf("sweep removed protected folder %s: %v", path, e)
 		}
-	}
-	if _, e := os.Stat(old); !os.IsNotExist(e) {
-		t.Errorf("never-accepted capture leaked: %v", e)
 	}
 	if !strings.Contains(stderr.String(), "warning") {
 		t.Errorf("unverifiable sweep did not warn: %q", stderr.String())
@@ -142,11 +143,28 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 	if e := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, io.Discard); e != nil {
 		t.Fatal(e)
 	}
-	for _, path := range []string{params.Storage, residue} {
-		if _, e := os.Stat(path); !os.IsNotExist(e) {
-			t.Errorf("terminal capture leaked at %s: %v", path, e)
+	sweepExecUntilGone(t, stack.clients, params.Storage, residue)
+}
+
+// sweepExecUntilGone repeats the sweep until it has retired every path. One
+// sweep stops at its two-second budget and warns; a later exec sweeps again.
+// On a busy host retiring one capture can use that whole budget, so a single
+// sweep is not required to finish (#1617).
+func sweepExecUntilGone(t *testing.T, clients *apiClients, paths ...string) {
+	t.Helper()
+	testwait.Until(t, "exec sweep to retire "+strings.Join(paths, ", "), func() (bool, error) {
+		for _, path := range paths {
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				var warnings bytes.Buffer
+				if err := sweepExecStorage(t.Context(), clients, &warnings); err != nil {
+					return false, err
+				}
+				t.Logf("%s remained; swept again: %s", path, warnings.String())
+				return false, fmt.Errorf("%s remained before the last sweep", path)
+			}
 		}
-	}
+		return true, nil
+	})
 }
 
 func waitExecRunTerminal(t *testing.T, clients *apiClients, id string) {
@@ -219,20 +237,26 @@ func TestExecSweepTimeAndFailureAreBounded(t *testing.T) {
 	path := filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-stalled")
 	writeExecFile(t, filepath.Join(path, "run-id"), "run_stalled")
 	base := stack.clients.l3.client.Transport
-	probed := false
+	// The whole command also starts a real run, so its duration follows host
+	// load. The sweep's bound is the deadline on its own stalled lookup (#1617).
+	probed, bounded := false, false
 	stack.clients.l3.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/v1/runs/run_stalled" {
 			probed = true
+			deadline, ok := r.Context().Deadline()
+			if !ok || time.Until(deadline) > execSweepBudget {
+				return nil, fmt.Errorf("sweep lookup has no deadline within %s", execSweepBudget)
+			}
+			bounded = true
 			<-r.Context().Done()
 			return nil, r.Context().Err()
 		}
 		return base.RoundTrip(r)
 	})
-	started := time.Now()
 	var stderr bytes.Buffer
 	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, &stderr)
-	if err != nil || !probed || !strings.Contains(stderr.String(), "warning") || time.Since(started) > 5*time.Second {
-		t.Fatalf("sweep stall: err=%v probed=%v elapsed=%v stderr=%q", err, probed, time.Since(started), stderr.String())
+	if err != nil || !probed || !bounded || !strings.Contains(stderr.String(), "warning") {
+		t.Fatalf("sweep stall: err=%v probed=%v bounded=%v stderr=%q", err, probed, bounded, stderr.String())
 	}
 	if _, e := os.Stat(path); e != nil {
 		t.Fatalf("unverified capture removed: %v", e)

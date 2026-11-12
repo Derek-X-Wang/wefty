@@ -618,8 +618,8 @@ was unchanged. A fresh grow intent may retry immediately and the helper then
 re-evaluates the locked current capacity facts; the still-running Computer
 does not need a restart. Shrink is never an operation.
 
-`backing_up`, `resetting`, `reimaging`, `growing`, `exporting`, and `importing`
-have one typed abort escape hatch
+`backing_up`, `resetting`, `reimaging`, `growing`, `exporting`, `importing`,
+`restoring`, and `cloning` have one typed abort escape hatch
 when their exact bound Node is durably `dead`. Abort is CAS- and
 idempotency-guarded, preserves Computer desired state, supersedes uncertain
 artifacts for later composite removal, fences the current attempt `lost`, and
@@ -631,6 +631,24 @@ Aborting `importing` supersedes the import reservation with the same
 `failure_code=aborted_dead_node`, retires its staging Storage generation, and
 renames the destination Computer to `aborted-import-<computer_id>` so the
 reserved name is free again.
+Aborting `restoring` supersedes the restore with the same
+`failure_code=aborted_dead_node` at `reserved`, `prepared` or `published` and
+retires its staging generation if it is still staging. Before publication the
+old generation stays current; after publication the restored generation stays
+current and the old one's bytes are owed to removal. The token authority the
+restore revoked before its copy was listed stays revoked: abort does not give
+it back. Aborting `cloning` supersedes the clone with the same code, retires
+its staging generation, and renames the destination to
+`aborted-clone-<computer_id>`; the destination has no current generation, so
+it cannot start and the owner removes it. A copy still running on a Node that
+is partitioned rather than dead cannot publish: its acknowledgement is refused
+because the operation is no longer `reserved`, and a late failure report is
+answered `superseded` (#1608).
+Removing a Computer that is the source of a `reserved` or `prepared` clone
+ends that clone `failed` with `failure_code=source_removed` through the clone
+end: its staging generation is retired and the destination is latched failed,
+so it leaves `cloning` and the owner removes it. The source's removal still
+claims the destination's staging generation, as for a superseded clone.
 
 #### Storage operation failure budget (#1608)
 

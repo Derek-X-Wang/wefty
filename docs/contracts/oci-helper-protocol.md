@@ -1771,9 +1771,15 @@ bytes under it and only an absence receipt authorizes deleting them; ordinary
 removal of the latched Computer is the exit. L1's import ledger remains
 the immutable idempotency and provenance authority even after a terminal result
 has released the reserved Computer identity, so its row is not age-pruned.
-`services custody import --wait` ends on the first durable preparation outcome
-and distinguishes deferred, quarantined, failed/interrupted, and superseded
-exit statuses instead of timing out on an unchanging Computer projection.
+`services custody import --wait` no longer ends on an interrupted copy
+while the import is still `reserved`: L1 counts it and retries, and the wait
+prints the running failed-attempt count on stderr (#1643). It ends with the
+failed status when L1 ends the import `failed` (a spent budget of any class,
+a dead-Node abort, or a legacy `engine_failure` acknowledgement), with the
+quarantined status for a quarantine (L1's `failed` with that code, or a legacy
+quarantine outcome on a running import), with the deferred status on a
+recorded deferral, and with the superseded status. A deferral can still clear
+on a later attempt; its status says deferred, not failed.
 
 For a clone a deferral is the same retryable observation, because the helper
 kept the payload and asked to be called again. That deferral is bounded by
