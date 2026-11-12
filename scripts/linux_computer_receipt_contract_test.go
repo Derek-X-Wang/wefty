@@ -74,6 +74,19 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 			t.Logf("mutated %s receipt gate: PASS", mutated)
 		})
 	}
+	// A mutated row must still have been evaluated. The producer stamps
+	// completed_at on a failed row (#1646); a row that was only begun has none.
+	t.Run("mutated row was begun and never evaluated", func(t *testing.T) {
+		receipt := conformantLinuxComputerReceipt(candidate, "xfce")
+		receipt["status"] = "FAIL"
+		row := receipt["rows"].(map[string]any)["linux.removal"].(map[string]any)
+		row["status"] = "FAIL"
+		row["assertions"] = map[string]bool{"live_product_path": false}
+		delete(row, "completed_at")
+		if err := runGate(t, receipt, "xfce", "linux.removal"); err == nil {
+			t.Fatal("receipt gate accepted a mutated row with no completion time")
+		}
+	})
 	for name, mutate := range map[string]func(map[string]any){
 		"missing row": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any), "linux.removal")
