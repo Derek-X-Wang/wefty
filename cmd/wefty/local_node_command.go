@@ -206,7 +206,8 @@ func writeSetupConvergenceDetail(stdout io.Writer, response ocicontrol.SetupResp
 	case base.Current == "":
 		_, err = fmt.Fprintf(stdout, "host VM base: current not observed yet (recorded when the node agent next prepares the host VM); template %s\n", base.Desired)
 	case base.UpgradeAvailable:
-		_, err = fmt.Fprintf(stdout, "host VM base upgrade available: current %s, template %s. Staying on the current base is supported.\n", base.Current, base.Desired)
+		_, err = fmt.Fprintf(stdout, "host VM base upgrade available: %s current %s, template %s. Staying on the current base is supported; to upgrade, %s.\n",
+			ocicontrol.HostVMBaseField, base.Current, base.Desired, ocicontrol.ConvergenceAction(ocicontrol.ConvergenceRecreateRequired))
 	default:
 		_, err = fmt.Fprintf(stdout, "host VM base: %s (matches the template)\n", base.Current)
 	}
