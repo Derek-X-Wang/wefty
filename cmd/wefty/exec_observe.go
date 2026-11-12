@@ -11,14 +11,35 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// Attached exec outlasts transient transport failures during a service restart.
-// Each read has a bounded recovery window; successful reads reset the window.
-// Keep the log cursor outside retries so already delivered output is not replayed.
-func readExec[T any](caller context.Context, clients *apiClients, read func(context.Context) (T, error)) (T, error) {
-	ctx, stop := context.WithTimeout(withoutClientRetry(caller), execReadRecoveryBudget)
+// Attached exec outlasts transient read failures. A successful read ends the
+// retries. Keep the log cursor outside retries so already delivered output is
+// not replayed.
+//
+// An unreachable service gets the restart window, counted from the first of
+// its failures in a row. With stillFollowing, the read follows a live run, and
+// a service that is there but busy (it answers a retryable server error, or
+// nothing before the attempt's deadline) gets the longer overload window and a
+// growing gap, so a loaded host is not asked again every second (#1629).
+// stillFollowing runs once per read, when the next try starts past the restart
+// window, so a silent follow does not look hung. Without it every failure shares the
+// restart window and the fixed gap: a known verdict is not held back for a
+// busy service.
+func readExec[T any](caller context.Context, clients *apiClients, stillFollowing func(), read func(context.Context) (T, error)) (T, error) {
+	following := stillFollowing != nil
+	budget := execReadRecoveryBudget
+	if following {
+		budget = execReadOverloadBudget
+	}
+	ctx, stop := context.WithTimeout(withoutClientRetry(caller), budget)
 	defer stop()
+	started := time.Now()
+	var unreachableSince time.Time
+	busyGap := execPollInterval
 	for {
-		value, err := read(ctx)
+		attempt, stopAttempt := context.WithTimeout(ctx, execReadRecoveryBudget)
+		value, err := read(attempt)
+		timedOut := attempt.Err() != nil && errors.Is(err, context.DeadlineExceeded)
+		stopAttempt()
 		if err == nil {
 			return value, nil
 		}
@@ -27,12 +48,24 @@ func readExec[T any](caller context.Context, clients *apiClients, read func(cont
 		}
 		var transport *unavailableError
 		var response *apiResponseError
-		transient := errors.As(err, &transport) || errors.Is(err, context.DeadlineExceeded) ||
-			(errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable)
-		if !transient || ctx.Err() != nil {
+		gap := execPollInterval
+		if timedOut || (errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable) {
+			unreachableSince = time.Time{}
+			if following {
+				gap, busyGap = busyGap, min(2*busyGap, execReadOverloadGapLimit*execPollInterval)
+			}
+			if stillFollowing != nil && time.Since(started)+gap >= execReadRecoveryBudget {
+				stillFollowing()
+				stillFollowing = nil
+			}
+		} else if !errors.As(err, &transport) && !errors.Is(err, context.DeadlineExceeded) {
+			return value, err
+		} else if unreachableSince.IsZero() {
+			unreachableSince = time.Now()
+		} else if time.Since(unreachableSince) >= execReadRecoveryBudget {
 			return value, err
 		}
-		if e := clients.wait(ctx, execPollInterval); e != nil {
+		if ctx.Err() != nil || clients.wait(ctx, gap) != nil {
 			return value, err
 		}
 	}
@@ -51,9 +84,20 @@ func observeExecRunOutput(ctx context.Context, clients *apiClients, runID, nodeI
 	var truncation truncationAnnouncer
 	started := time.Now()
 	waiting := execWaitingAnnouncer{nodeID: nodeID}
+	announcedBusy := false
+	stillFollowing := func() {
+		if !announcedBusy {
+			announcedBusy = true
+			fmt.Fprintf(stderr, "wefty: control plane busy; still following run %s\n", runID)
+		}
+	}
 	for {
 		wasTerminal := runIsTerminal(record.Status)
-		page, err := readExec(ctx, clients, func(readCtx context.Context) (l1.LogPage, error) {
+		if wasTerminal {
+			// The verdict is known; only the drain is left.
+			stillFollowing = nil
+		}
+		page, err := readExec(ctx, clients, stillFollowing, func(readCtx context.Context) (l1.LogPage, error) {
 			return clients.getRunLogs(readCtx, runID, cursor, l1.DefaultLogPageLimit)
 		})
 		if err != nil {
@@ -71,7 +115,7 @@ func observeExecRunOutput(ctx context.Context, clients *apiClients, runID, nodeI
 			return record, err
 		}
 		cursor = page.NextCursor
-		nextRecord, err := readExec(ctx, clients, func(readCtx context.Context) (contract.RunRecord, error) {
+		nextRecord, err := readExec(ctx, clients, stillFollowing, func(readCtx context.Context) (contract.RunRecord, error) {
 			return clients.getRun(readCtx, runID)
 		})
 		if err != nil {
