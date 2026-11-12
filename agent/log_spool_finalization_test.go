@@ -18,7 +18,25 @@ import (
 
 // Holding the spool's sole connection after the payload result forces the
 // close-request query, rather than an HTTP upload, to consume finalization.
+//
+// The finalization bound is real time. On a busy host it can end before the
+// close request reaches SQL; that run proves nothing, so it repeats with a
+// longer bound. The usual run keeps the short one (#1617).
 func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
+	for timeout := 25 * time.Millisecond; ; timeout *= 4 {
+		if pendingSpoolDeadlineProbe(t, timeout) {
+			return
+		}
+		if timeout > 5*time.Second {
+			t.Fatal("invalid probe: pending query did not wait for bounded finalization")
+		}
+		t.Logf("finalization bound %s ended before the pending query waited; retrying with a longer bound", timeout)
+	}
+}
+
+// pendingSpoolDeadlineProbe reports false when the bound ended before the
+// pending query waited for the held connection.
+func pendingSpoolDeadlineProbe(t *testing.T, finalizationTimeout time.Duration) bool {
 	clock := &boundedReplayL1Clock{now: time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)}
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{Clock: clock, LeaseDuration: 10 * time.Second})
 	if err != nil {
@@ -83,7 +101,7 @@ func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
 		nodeID: registration.NodeID, bootSessionID: registration.BootSessionID,
 		managedResource: managedResource, client: client, outbox: outbox,
 		runtimes: workloadRuntimeSet{contract.JobKindProcess: runtime},
-		clock:    systemClock{}, finalizationTimeout: 25 * time.Millisecond,
+		clock:    systemClock{}, finalizationTimeout: finalizationTimeout,
 	})
 	before := outbox.spool.db.Stats()
 	result, runErr := lifecycle.runWorkload(t.Context(), *claim)
@@ -92,6 +110,9 @@ func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
 		t.Fatalf("probe never reached reaping: result=%+v err=%v", result, runErr)
 	}
 	t.Logf("SQL wait_count=%d wait_duration=%s finalization Err=%v Cause=%v result=%+v err=%v", after.WaitCount-before.WaitCount, after.WaitDuration-before.WaitDuration, runtime.finalization.Err(), context.Cause(runtime.finalization), result, runErr)
+	if after.WaitCount == before.WaitCount && context.Cause(runtime.finalization) == context.DeadlineExceeded {
+		return false
+	}
 	if after.WaitCount-before.WaitCount != 1 || after.WaitDuration <= before.WaitDuration || context.Cause(runtime.finalization) != context.DeadlineExceeded {
 		t.Fatal("invalid probe: pending query did not wait for bounded finalization")
 	}
@@ -121,6 +142,7 @@ func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
 	if completed.State != contract.JobQueued || completed.ServiceJob.BoundNodeID != registration.NodeID || !completed.ServiceJob.HoldsSlot(completed.State) || completed.ServiceJob.NextRestartAt == nil || completed.ServiceJob.RestartStreak != 1 {
 		t.Errorf("service restart reservation=%+v state=%s", completed.ServiceJob, completed.State)
 	}
+	return true
 }
 
 type pendingSpoolDeadlineRuntime struct {

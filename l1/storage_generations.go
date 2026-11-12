@@ -249,7 +249,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		if replay.RequestHash != requestHash {
 			return Computer{}, false, protocolError(contract.ErrorConflict, "Computer Storage reset idempotency key was reused with different authority")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, false, internalError(err, "commit Computer Storage reset replay")
 		}
 		return computer, true, nil
@@ -330,7 +330,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		return Computer{}, false, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer Storage reset reservation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -543,7 +543,7 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 			reset.AcknowledgementKey.String != request.IdempotencyKey || reset.AcknowledgementHash.String != ackHash {
 			return protocolError(contract.ErrorConflict, "Computer Storage reset acknowledgement conflicts with durable verification")
 		}
-		return tx.Commit()
+		return write.commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='prepared',
 		verification_receipt_json=?, verification_receipt_hash=?, acknowledgement_key=?,
@@ -559,7 +559,7 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 	if affected != 1 {
 		return protocolError(contract.ErrorConflict, "Computer Storage reset verification affected %d rows", affected)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return internalError(err, "commit Computer Storage reset verification")
 	}
 	return nil
@@ -606,7 +606,7 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 		return Computer{}, internalError(err, "read verified Computer Storage reset")
 	}
 	if reset.Status == "published" || reset.Status == "retired" {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Computer Storage reset publication replay")
 		}
 		return computer, nil
@@ -665,7 +665,7 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 	if err != nil {
 		return Computer{}, internalError(err, "read published Computer Storage reset")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage reset publication")
 	}
 	return updated, nil
@@ -775,7 +775,7 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 		if err != nil {
 			return Computer{}, internalError(err, "read quarantined Computer Storage cleanup")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Computer Storage cleanup quarantine")
 		}
 		return computer, nil
@@ -785,7 +785,7 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 		return Computer{}, internalError(err, "read Computer Storage retirement target")
 	}
 	if reset.Status == "retired" {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Computer Storage retirement replay")
 		}
 		return computer, nil
@@ -821,7 +821,7 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 	if err != nil {
 		return Computer{}, internalError(err, "read completed Computer Storage reset")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage retirement acknowledgement")
 	}
 	return updated, nil

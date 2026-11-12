@@ -80,7 +80,7 @@ func (s *Store) seedLogContinuity(ctx context.Context) error {
 		logContinuitySeedMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log stream continuity seed: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return fmt.Errorf("l1: commit log stream continuity seed: %w", err)
 	}
 	return nil

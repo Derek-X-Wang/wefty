@@ -279,7 +279,7 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 			computer.SubmitEnabled, desiredEnabled, desiredMaxInflight, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
 			return Computer{}, false, false, internalError(err, "append Computer submission no-op audit")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, false, false, internalError(err, "commit Computer submission no-op")
 		}
 		return computer, false, false, nil
@@ -315,7 +315,7 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	if err != nil {
 		return Computer{}, false, false, internalError(err, "read mutated Computer submission authority")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, false, internalError(err, "commit Computer submission mutation")
 	}
 	s.notifyComputerPolicyChanged()

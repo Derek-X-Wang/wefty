@@ -142,7 +142,7 @@ func (s *Store) InterruptRestartableAttempt(ctx context.Context, nodeID, attempt
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, false, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, false, internalError(err, "commit interruption Lease expiry")
 		}
 		return Job{}, false, protocolError(contract.ErrorLeaseExpired, "Attempt Lease expired")
@@ -154,7 +154,7 @@ func (s *Store) InterruptRestartableAttempt(ctx context.Context, nodeID, attempt
 	if err != nil {
 		return Job{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, false, internalError(err, "commit interruption request")
 	}
 	return job, false, nil

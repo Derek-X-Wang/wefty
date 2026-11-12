@@ -94,7 +94,7 @@ func (s *Store) AppendComputerTakeoverAudit(
 			return ComputerTakeoverAuditReceipt{}, protocolError(contract.ErrorIdempotencyConflict,
 				"Computer take-over audit event %q conflicts with its prior upload", request.Event.EventID)
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return ComputerTakeoverAuditReceipt{}, internalError(err, "commit Computer take-over audit replay")
 		}
 		return ComputerTakeoverAuditReceipt{Event: stored, Replayed: true}, nil
@@ -116,7 +116,7 @@ func (s *Store) AppendComputerTakeoverAudit(
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "append Computer take-over audit event")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "commit Computer take-over audit event")
 	}
 	return ComputerTakeoverAuditReceipt{Event: event}, nil
