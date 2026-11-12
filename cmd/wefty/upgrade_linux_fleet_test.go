@@ -684,9 +684,14 @@ func TestLinuxFleetUpgradeInterruptedDrainRecovery(t *testing.T) {
 				return command(ctx, dir, env, name, args...)
 			}
 			var out bytes.Buffer
-			_, err := runUpgrade(t.Context(), f.host, false, &out)
+			report, err := runUpgrade(t.Context(), f.host, false, &out)
 			if err == nil || !strings.Contains(err.Error(), "injected fetch failure after recovery") || !strings.Contains(out.String(), "Restored intent from interrupted upgrade.") {
 				t.Fatal("recovery not completed before fetch", err, out.String())
+			}
+			// Recovery restarted a service, so the stack did change (#1622).
+			if strings.Contains(err.Error(), "installed stack unchanged") || !strings.Contains(err.Error(), "upgrade fetch failed; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged") ||
+				!slices.Equal(report.RestartedServices, []string{"service"}) || report.ClaimsDisabled != operatorDisabled {
+				t.Fatalf("preparation failure hides recovery: err=%v report=%+v", err, report)
 			}
 			if restarted != 1 || f.node.ClaimsEnabled == operatorDisabled || len(s.mutations()) != 0 {
 				t.Fatal("wrong recovery", restarted, f.node.ClaimsEnabled, s.mutations())
