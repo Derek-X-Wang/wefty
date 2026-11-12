@@ -1006,6 +1006,10 @@ const (
 	// helper session was lost while it ran.
 	SpawnFailureComputerStorageQuarantined            SpawnFailureCode = "computer_storage_quarantined"
 	SpawnFailureComputerStoragePreparationInterrupted SpawnFailureCode = "computer_storage_preparation_interrupted"
+	// A Storage operation spent its failure budget (#1608): L1 ended it and
+	// holds the Computer until an explicit start, or latches a clone or import
+	// destination failed. The message names the class and attempt count.
+	SpawnFailureComputerStorageOperationFailed SpawnFailureCode = "computer_storage_operation_failed"
 )
 
 // TerminationCause identifies who initiated a termination. A service

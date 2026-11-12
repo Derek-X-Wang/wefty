@@ -28,6 +28,14 @@ const (
 	ComputerRestoreFailureDigestMismatch           ComputerRestoreFailureCode = "digest_mismatch"
 	ComputerRestoreFailureSourceNeverDetached      ComputerRestoreFailureCode = "source_never_detached"
 	ComputerRestoreFailureStorageCopyEngineFailure ComputerRestoreFailureCode = "storage_copy_engine_failure"
+	// A restore that spent its failure budget (#1608) ends with the class of
+	// the report that spent it, `failed` before publication and
+	// `cleanup_owed` after it.
+	ComputerRestoreFailureEngine                 ComputerRestoreFailureCode = "engine_failure"
+	ComputerRestoreFailureRuntimeLoss            ComputerRestoreFailureCode = "runtime_loss"
+	ComputerRestoreFailureQuarantined            ComputerRestoreFailureCode = "computer_storage_quarantined"
+	ComputerRestoreFailureAcknowledgementRefused ComputerRestoreFailureCode = "acknowledgement_refused"
+	ComputerRestoreFailureAgentRefused           ComputerRestoreFailureCode = "agent_refused"
 )
 
 type ComputerRestoreRequest struct {
@@ -39,13 +47,14 @@ type ComputerRestoreRequest struct {
 
 // ComputerRestoreOperation is one restore's own observed state. A restore
 // ends `retired` once its predecessor generation is gone, `failed` when L1
-// aborted it with the old generation still current, or `superseded` when a
-// removal overtook it. A `failed` restore's failure_code is either the code of
-// its failed precommitted predecessor Backup copy, or
-// storage_copy_engine_failure when its copy kept failing on a live helper
-// session past the agent's bound (#1591). The Computer returns to `stable`
-// for both `retired` and `failed`, so only this record tells them apart
-// (#592). A Computer read carries it as `restore_operation` only when the
+// aborted it with the old generation still current, `cleanup_owed` when it
+// published but its predecessor could not be deleted within the failure
+// budget, or `superseded` when a removal overtook it. A `failed` restore's
+// failure_code is the code of its failed precommitted predecessor Backup
+// copy, or the class of the report that spent its failure budget (#1608);
+// storage_copy_engine_failure is the older form of that (#1591). The Computer
+// returns to `stable` for `retired`, `failed` and `cleanup_owed`, so only this
+// record tells them apart (#592). A Computer read carries it as `restore_operation` only when the
 // request names it with restore_operation_revision.
 type ComputerRestoreOperation struct {
 	OperationRevision int64                      `json:"operation_revision"`
@@ -53,6 +62,9 @@ type ComputerRestoreOperation struct {
 	Status            string                     `json:"status"`
 	FailureCode       ComputerRestoreFailureCode `json:"failure_code,omitempty"`
 	CompletedAt       *time.Time                 `json:"completed_at,omitempty"`
+	// Failure is the restore's failure budget, present once an attempt was
+	// reported failed (#1608).
+	Failure *ComputerStorageOperationFailure `json:"failure,omitempty"`
 }
 
 // ComputerCloneOperation is one clone's own observed state. A clone is
@@ -71,6 +83,9 @@ type ComputerCloneOperation struct {
 	Status            string     `json:"status"`
 	FailureCode       string     `json:"failure_code,omitempty"`
 	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	// Failure is the clone's failure budget, present once an attempt was
+	// reported failed (#1608).
+	Failure *ComputerStorageOperationFailure `json:"failure,omitempty"`
 	// DestinationComputerID names the Computer the clone created. It is not
 	// serialized: the record is read through that Computer.
 	DestinationComputerID string `json:"-"`
@@ -455,6 +470,10 @@ func readComputerRestoreOperation(ctx context.Context, q queryer, computerID str
 		value := time.Unix(0, completedNS.Int64).UTC()
 		outcome.CompletedAt = &value
 	}
+	outcome.Failure, err = readComputerStorageOperationFailure(ctx, q, computerID, operationRevision, ComputerStorageOperationRestore)
+	if err != nil {
+		return ComputerRestoreOperation{}, internalError(err, "read Computer restore operation failure")
+	}
 	return outcome, nil
 }
 
@@ -553,6 +572,10 @@ func readComputerCloneOperation(ctx context.Context, q queryer, computerID strin
 	if completedNS.Valid {
 		value := time.Unix(0, completedNS.Int64).UTC()
 		outcome.CompletedAt = &value
+	}
+	outcome.Failure, err = readComputerStorageOperationFailure(ctx, q, computerID, operationRevision, ComputerStorageOperationClone)
+	if err != nil {
+		return ComputerCloneOperation{}, internalError(err, "read Computer clone operation failure")
 	}
 	return outcome, nil
 }
@@ -958,6 +981,26 @@ func validateStorageCopyReceipt(row computerStorageCopyRow, receipt ComputerStor
 	}
 	return nil
 }
+
+// restorePredecessorMayBeUncataloged reports whether a restore with
+// keep_old_as_backup may have left a finished predecessor Backup copy that was
+// never cataloged: one a removal overtook, or one that ended `failed` for any
+// reason other than its predecessor copy's own failure receipt, which already
+// proved that copy absent. restorePredecessorMayBeUncatalogedSQL is the same
+// predicate over a computer_storage_copy_operations row.
+func restorePredecessorMayBeUncataloged(status, failureCode string) bool {
+	if status == "superseded" {
+		return true
+	}
+	switch ComputerRestoreFailureCode(failureCode) {
+	case ComputerRestoreFailureInsufficientDisk, ComputerRestoreFailureDigestMismatch, ComputerRestoreFailureSourceNeverDetached:
+		return false
+	}
+	return status == "failed"
+}
+
+const restorePredecessorMayBeUncatalogedSQL = `(status='superseded' OR (status='failed'
+	AND failure_code NOT IN ('insufficient_disk', 'digest_mismatch', 'source_never_detached')))`
 
 func validateOldBackupReceipt(row computerStorageCopyRow, receipt *ComputerBackupCopyReceipt) error {
 	if !row.KeepOldBackup {

@@ -2357,6 +2357,51 @@
         }
       }
     },
+    "/v1/agent/computers/{computer_id}/storage-operation-failure": {
+      "parameters": [
+        { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "reportComputerStorageOperationFailure",
+        "summary": "Count one failed attempt of a Computer Storage operation against its durable failure budget",
+        "description": "The authenticated bound Node reports that one attempt of a reset, restore, clone, Custody import, Backup or grow directive failed, with a closed class. L1 owns the budget (#1608): an operation stage ends after 5 counted failures and 10 minutes since the first, on the L1 clock; quarantined ends it at once; resume_deferred is recorded and not counted. Ending deletes nothing on the Node. Before publication a restore, Backup or grow ends failed with the Computer stable on its old generation, and a clone or import latches its destination failed. After publication a restore or reset ends cleanup_owed: the Computer is stable on the new generation, held stopped, and the old generation's bytes are owed to removal. A reset before publication is counted but does not yet end. report_id is minted once per failed attempt: a retried report is answered replayed and not counted again, and the same report_id with a different body is idempotency_conflict. A report for an operation that ended, moved past the stage, or was overtaken by a newer revision writes nothing and is answered superseded. A report from a Node that is not the operation's bound Node is attempt_not_owned; a fence other than the directive's is stale_fence. Typed positive-absence receipts keep their acknowledgement routes.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "required": ["node_id", "boot_session_id", "report_id", "verb", "operation_revision", "stage", "fence", "class", "code"],
+          "properties": {
+            "node_id": { "type": "string", "minLength": 1 },
+            "boot_session_id": { "type": "string", "minLength": 1 },
+            "report_id": { "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "Minted once per failed attempt." },
+            "verb": { "enum": ["import", "clone", "restore", "reset", "backup", "grow"] },
+            "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+            "stage": { "enum": ["prepare", "retire"], "description": "retire is the predecessor deletion after publication; only restore and reset have it." },
+            "fence": { "type": "string", "minLength": 1, "description": "The directive's cleanup_fence, or operation_fence for a grow." },
+            "class": { "enum": ["engine_failure", "runtime_loss", "quarantined", "resume_deferred", "acknowledgement_refused", "agent_refused"] },
+            "code": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$", "description": "Context: the helper method or reason, or the L1 error code." },
+            "detail": { "type": "string", "maxLength": 1024 },
+            "helper_generation": { "type": "integer", "minimum": 1 },
+            "preparation_outcome": { "$ref": "./common.v1.json#/components/schemas/ComputerStoragePreparationOutcome", "description": "Optional generation-bound helper evidence for a restore, clone or import prepare stage." }
+          }
+        } } } },
+        "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
+          "200": { "description": "The report's final answer for this attempt.", "content": { "application/json": { "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["disposition", "failed_attempts", "retry_after_seconds"],
+            "properties": {
+              "disposition": { "enum": ["counted", "recorded", "replayed", "exhausted", "superseded"] },
+              "failed_attempts": { "type": "integer", "format": "int64", "minimum": 0 },
+              "first_failed_at": { "type": "string", "format": "date-time" },
+              "retry_after_seconds": { "type": "integer", "format": "int64", "minimum": 0, "description": "Pacing for the next attempt of this directive; zero once the operation no longer runs." },
+              "operation_status": { "type": "string", "minLength": 1, "description": "The operation's durable status after this report. Absent when the operation no longer exists." }
+            }
+          } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/storage-grow-acknowledgement": {
       "parameters": [
         { "name": "computer_id", "in": "path", "required": true, "schema": { "type": "string" } }

@@ -300,6 +300,18 @@
     "slice": "permanent"
   },
   {
+    "site": "store.go:*Store.migrateStorageOperationFailureConstraints | connection",
+    "count": 7,
+    "reason": "infrastructure: initialization and schema migration",
+    "slice": "permanent"
+  },
+  {
+    "site": "store.go:*Store.migrateStorageOperationFailureConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration",
+    "slice": "permanent"
+  },
+  {
     "site": "store.go:*Store.migrateStorageProvenanceConstraints | connection",
     "count": 6,
     "reason": "infrastructure: initialization and schema migration",

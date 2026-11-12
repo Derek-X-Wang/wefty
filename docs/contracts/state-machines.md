@@ -632,6 +632,72 @@ Aborting `importing` supersedes the import reservation with the same
 renames the destination Computer to `aborted-import-<computer_id>` so the
 reserved name is free again.
 
+#### Storage operation failure budget (#1608)
+
+Every Storage operation stage has one durable failure budget in L1, keyed by
+Computer, operation revision, and stage. The `prepare` stage is everything
+before the new generation is current; the `retire` stage is the deletion of
+the predecessor after publication, which only reset and restore have. The
+bound Node reports each failed attempt of a directive on
+`POST /v1/agent/computers/{id}/storage-operation-failure` with a fresh
+`report_id`, the operation's revision, stage and fence, and one closed class:
+`engine_failure` (the live helper session answered with a typed error that is
+not a receipt), `runtime_loss` (the session was lost during the call),
+`quarantined`, `resume_deferred`, `acknowledgement_refused` (the helper call
+succeeded and L1 refused its acknowledgement with a non-transient error), or
+`agent_refused` (the agent refused the directive locally). The agent keeps no
+count; L1 decides.
+
+The rule: an operation stage ends when it has at least 5 counted failures and
+at least 10 minutes have passed since the first, measured on the L1 clock as
+each report arrives. A `quarantined` report ends it at once, because quarantine
+never clears by itself. A `resume_deferred` report is recorded, not counted,
+and never ends the operation, even once the count and window are met: the
+helper already bounds deferral and turns one that never converges into a
+quarantine. Nothing resets the count but the end of the stage. L1 keeps every
+accepted `report_id`, so a retried report is answered `replayed` and not
+counted again even after later reports; the same `report_id` with another body
+is `idempotency_conflict`. A
+report for an operation that no longer exists, has ended, is past the stage, or
+whose revision the Computer no longer holds writes nothing and is answered
+`superseded`. A report from a Node that is not the operation's bound Node is
+`attempt_not_owned`; another fence is `stale_fence`. Each answer carries a
+`retry_after_seconds` pacing hint (15 seconds doubling to 5 minutes), so an
+operation that cannot succeed ends 10 to 15 minutes after its first failure.
+
+Ending an operation deletes nothing on the Node. It releases L1 orchestration,
+retires never-published staging rows as other exits already do, and leaves the
+residue for removal, which inventories every recorded generation:
+
+| Verb and stage | Operation ends | The Computer |
+|---|---|---|
+| restore, prepare | `failed`, code = last class | `stable` on the old generation, stopped (as a failed predecessor copy aborts it) |
+| restore, retire | `cleanup_owed` | `stable` on the new generation, held stopped, failure latched |
+| reset, prepare | counted and shown; not ended yet (#1609) | stays `resetting` |
+| reset, retire | `cleanup_owed` | `stable` on the new generation, held stopped, failure latched; not resumed |
+| Backup | `failed`, code = last class | `stable`; resumes when the Backup stopped a running Computer, as after a failure receipt |
+| grow | `failed`, code = last class | `stable`, same size, failure latched with no pending restart |
+| clone, import | `failed`, code = last class | destination latched failed through the shared terminal tail |
+
+The latched failure is `computer_storage_operation_failed`, and its message
+names the stage, the attempt count, and the last class and code. A reset is
+not ended before publication until a fenced reset can heal (#1609): the helper
+fences the old generation before it prepares the successor, so ending it early
+would strand the Computer. `cleanup_owed` is not `failed`: the data switch
+happened and the old generation is no longer current. The Computer is usable
+after an explicit start, and the old generation's bytes stay on the Node until
+removal deletes them. A Backup the budget ended has no copy receipt, so its
+copy is owed to removal like a superseded Backup's, and a restore the budget
+ended with "keep predecessor as Backup" owes its uncataloged predecessor copy
+the same way. A restore whose predecessor copy failed by receipt already proved
+that copy absent and owes nothing. Each operation read (`restore_operation`,
+`clone_operation`, `last_backup_operation`, `last_grow_operation`,
+`last_reset_operation`, and the Custody import observation) carries the
+latest stage's budget as `failure`: class, code, attempts, and the first and
+last failure times. Typed positive-absence receipts keep their own routes and
+end their operations at once, as below. Agents that do not report keep the
+per-verb outcome paths below unchanged.
+
 A cold Backup is one explicitly disruptive Computer intent. L1 first commits
 the immutable logical Backup identity and its one planned V1 source-node copy
 authority before the helper may write bytes, then enters revision-fenced
