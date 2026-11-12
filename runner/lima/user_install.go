@@ -95,6 +95,8 @@ type userInstallOps struct {
 	ensure       func(context.Context) error
 	install      func(context.Context, GuestHelperInstallConfig) error
 	hostStartEnd func() time.Time
+	// guestReadBudget bounds the advisory guest OS read; zero is the default.
+	guestReadBudget time.Duration
 }
 
 // PrepareUserInstall runs in the installed node agent, before its normal OCI
@@ -184,8 +186,12 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 	if err := ops.install(ctx, helper); err != nil {
 		return err
 	}
+	readBudget := ops.guestReadBudget
+	if readBudget == 0 {
+		readBudget = guestReadBudget
+	}
 	if err := recordGuestOSAdvisory(ctx, func() ([]byte, error) {
-		release, err := guest("cat", "/etc/os-release")
+		release, err := readGuest(ctx, ops.run, readBudget, "limactl", c.Instance, "cat", "/etc/os-release")
 		if err != nil {
 			return nil, errors.New("cannot read Lima guest /etc/os-release")
 		}
