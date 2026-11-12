@@ -444,8 +444,9 @@ func removalJSON(t *testing.T, ctx context.Context, h *acceptanceHarness, method
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	// A slow runner can expire the read that follows a change. The harness
-	// retries that typed answer for reads and for the removal POST (#1618).
+	// A slow runner can expire a read snapshot: the poll for removed_verified
+	// (the #1618 failure), or the read that follows the remove change. The
+	// harness retries that typed answer for reads and for the removal POST.
 	status, body, err := harnessHTTP(ctx, t.Logf, h.client, request)
 	if err != nil {
 		t.Fatal(err)
@@ -461,20 +462,28 @@ func removalJSON(t *testing.T, ctx context.Context, h *acceptanceHarness, method
 	return status, body
 }
 
-// The remove request's own read can expire on a slow runner. One typed
-// retryable answer must not fail a removal test (#1618).
+// One typed retryable answer on a slow runner must not fail a removal test.
+// The poll for removed_verified is the request that failed in #1618; the
+// remove POST gets the same answer when its post-change read expires.
 func TestRemovalHelperRetriesExpiredReadSnapshot(t *testing.T) {
-	calls := 0
-	client := &http.Client{Transport: harnessReadTransport(func(request *http.Request) (*http.Response, error) {
-		calls++
-		status, payload := http.StatusAccepted, `{}`
-		if calls == 1 {
-			status, payload = http.StatusServiceUnavailable, `{"error":{"code":"unavailable","message":"read snapshot unavailable","retryable":true,"details":{"reason":"read_snapshot_expired"}}}`
-		}
-		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
-	})}
-	status, body := removalJSON(t, t.Context(), &acceptanceHarness{client: client}, http.MethodPost, "/v1/jobs/job/remove?class=service", nil, nil)
-	if status != http.StatusAccepted || calls != 2 {
-		t.Fatalf("remove after one expired read snapshot: calls=%d status=%d body=%s", calls, status, body)
+	for _, test := range []struct{ name, method, path, refusal string }{
+		{"state poll", http.MethodGet, "/v1/jobs/job?class=service", `{"error":{"code":"unavailable","message":"read snapshot unavailable","retryable":true,"details":{"reason":"read_snapshot_expired"}}}`},
+		{"remove", http.MethodPost, "/v1/jobs/job/remove?class=service", `{"error":{"code":"unavailable","message":"job change committed but its post-change read is unavailable","retryable":true,"details":{"reason":"read_snapshot_post_change_failed","mutation_applied":true,"job_id":"job","read_reason":"read_snapshot_expired"}}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: harnessReadTransport(func(request *http.Request) (*http.Response, error) {
+				calls++
+				status, payload := http.StatusAccepted, `{}`
+				if calls == 1 {
+					status, payload = http.StatusServiceUnavailable, test.refusal
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
+			})}
+			status, body := removalJSON(t, t.Context(), &acceptanceHarness{client: client}, test.method, test.path, nil, nil)
+			if status != http.StatusAccepted || calls != 2 {
+				t.Fatalf("calls=%d status=%d body=%s", calls, status, body)
+			}
+		})
 	}
 }
