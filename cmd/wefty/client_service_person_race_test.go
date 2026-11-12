@@ -42,11 +42,14 @@ func TestClientServiceKeepsClientWhenPersonStateDisappearsBeforeOpen(t *testing.
 		}
 		return fabricconfig.Open(ctx, config)
 	}
+	// The socket file appears at bind, before the service listens. The ready
+	// file is published after listen, so only it proves a Check can connect (#1633).
+	ready := filepath.Join(f.home, "client-ready.json")
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	var serviceErr error
 	go func() {
-		serviceErr = executeClientServiceWithOpener(ctx, options, []string{"--socket=" + f.socket}, io.Discard, io.Discard, open)
+		serviceErr = executeClientServiceWithOpener(ctx, options, []string{"--socket=" + f.socket, "--ready-file=" + ready}, io.Discard, io.Discard, open)
 		close(done)
 	}()
 	t.Cleanup(func() {
@@ -57,21 +60,15 @@ func TestClientServiceKeepsClientWhenPersonStateDisappearsBeforeOpen(t *testing.
 			t.Error("client service did not stop")
 		}
 	})
-	deadline := time.Now().Add(3 * time.Second)
-	for {
+	testwait.Until(t, "client service ready file", func() (bool, error) {
 		select {
 		case <-done:
 			t.Fatalf("optional-person race stopped client service: %v", serviceErr)
 		default:
 		}
-		if _, err := os.Stat(f.socket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("client service did not publish its socket")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		_, err := os.Stat(ready)
+		return err == nil, err
+	})
 	if !raced.Load() {
 		t.Fatal("test did not exercise the saved-state/Open race")
 	}
