@@ -61,7 +61,7 @@ func TestUpgradeRestartableInterruptedCleanupRealL1(t *testing.T) {
 	if claim, err := h.store.ClaimJob(ctx, registered.identity.NodeID, registered.node.NodeID, registered.node.BootSessionID, contract.JobClassOneShot); err != nil || claim != nil {
 		t.Fatalf("claimed before receipt recovery: %+v %v", claim, err)
 	}
-	if err := recoverUpgradeDrain(ctx, op, paths, profile, io.Discard); err != nil {
+	if _, err := recoverUpgradeDrain(ctx, op, paths, profile, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	next, err := h.store.ClaimJob(ctx, registered.identity.NodeID, registered.node.NodeID, registered.node.BootSessionID, contract.JobClassOneShot)

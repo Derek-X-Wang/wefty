@@ -460,7 +460,7 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		if _, err := root.Lstat(filepath.Join(paths.dataRel, plainHistoryFolder)); !errors.Is(err, fs.ErrNotExist) {
 			return report, errors.New("unrecorded plain history folder exists or cannot be inspected; conversion refused")
 		}
-		if err := recoverUpgradeDrain(ctx, op, paths, record.Profile, out); err != nil {
+		if _, err := recoverUpgradeDrain(ctx, op, paths, record.Profile, out); err != nil {
 			return report, err
 		}
 		record.Phase = "drain"
@@ -928,7 +928,7 @@ func restorePlainConversion(ctx context.Context, host setupHost, paths setupPath
 			}
 		}
 	}
-	if err := recoverUpgradeDrain(recovery, op, paths, r.Profile, out); err != nil {
+	if _, err := recoverUpgradeDrain(recovery, op, paths, r.Profile, out); err != nil {
 		return err
 	}
 	// The plain stack runs again before the private inventory copy is removed.
