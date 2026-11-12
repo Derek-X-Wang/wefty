@@ -2097,3 +2097,28 @@ func recordErrStorage(err *computerDiskRecoveryRecordError) ComputerStorageRefer
 	}
 	return err.Storage
 }
+
+// detachedComputerStorageFacts reports whether a generation is positively
+// detached, for a caller that holds its flock: the manifest holds no attached
+// or pending authority and no loop device, its single detach slot holds a
+// valid record for this Storage, Node, and boot (a same-boot reap must belong
+// to this boot; a record from an earlier boot counts only once a sweep has
+// re-proven it), and the kernel shows no mount and no loop for it. The slot
+// is always the latest attach/detach record, because attach clears it before
+// it mounts anything (#1607, #1611).
+func detachedComputerStorageFacts(system computerDiskSystem, runtimeRoot, root, name string, manifest computerDiskManifest, nodeID, bootSessionID string) (bool, error) {
+	if manifest.Attached != nil || manifest.Pending != nil || manifest.LoopDevice != "" ||
+		!validComputerDiskDetachmentEvidence(manifest.PreviousDetachment, manifest.Storage, computerDiskDetachmentAuthority{
+			NodeID: nodeID, BootSessionID: bootSessionID,
+		}) {
+		return false, nil
+	}
+	if _, mounted, err := system.mountedSource(filepath.Join(runtimeRoot, "computer-mounts", name)); err != nil || mounted {
+		return false, err
+	}
+	loops, err := system.loopsForRoot(root)
+	if err != nil || len(loops) != 0 {
+		return false, err
+	}
+	return true, nil
+}

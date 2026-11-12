@@ -2043,9 +2043,10 @@ removal truth.
 `InventoryRemoval` normally reconstructs exact observed attempt authority from
 one Job-scoped scan. Each subsequent Computer-generation request returns only
 that generation's deterministic Storage rows, so the adapter cannot duplicate
-runtime authority across generations. Its no-runtime results are either an
-exact prepared disk with no attached, pending, previously detached, or retired
-authority, or an exact typed absent-Storage authority. The latter covers a
+runtime authority across generations. Its no-runtime results are one of three
+arms: an exact prepared disk with no attached, pending, previously detached, or
+retired authority; an exact detached disk (#1611, described below); or an
+exact typed absent-Storage authority. The absent arm covers a
 missing root or a refused generation containing only its lock and durable
 refusal tombstone, with no payload. The refusal must match the requested
 Computer/Storage generation, Node, and managed-root instance, and must name a
@@ -2058,9 +2059,21 @@ authority names the refusing Job. It is absence
 evidence, not preparation evidence, and does not create a missing root.
 Every result remains bound to the authenticated current helper session and
 durable removal fence. Malformed, anomalous, or identity-mismatched disks still
-fail closed; historical attachment cannot become preparation evidence. A detached
-generation without eligible preparation evidence returns `no_storage_evidence` with no attempts; it does not
-assert runtime absence. The Job-scoped runtime scan remains the sole runtime
+fail closed; historical attachment cannot become preparation evidence. A
+once-attached generation is instead the detached arm (#1611) when, under the
+generation flock, its manifest holds no `attached` or `pending` authority and
+no loop device, its single detach slot holds a valid record for this Storage,
+Node, and boot (a same-boot reap of this boot, or a sweep receipt with its
+epoch), and the kernel shows no mount and no loop for it. The slot is always
+the latest attach/detach record, so a detach followed by any newer attach is
+never read as detached. The witness copies the record's last attachment and
+kind; the server stamps it with the helper session generation that proved
+absence, and the response is bound to that session. A generation whose mount
+remains is still refused with the existing error. Any other generation that is
+neither prepared, detached, nor absent returns `no_storage_evidence` with no
+attempts; it does not assert runtime absence. A per-generation inventory is fenced by any live attempt on
+the same Storage, whatever its Job, because after a Job rotation the attaching
+Job can differ from the one being removed. The Job-scoped runtime scan remains the sole runtime
 authority, and reconstruction refuses only when neither scan proves authority.
 
 Frozen `storage_absent` evidence is carried as a restrictive precondition through

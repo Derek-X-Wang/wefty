@@ -70,7 +70,6 @@ func TestLegacyComputerRemovalReconstructsDetachedStorage(t *testing.T) {
 		"foreign Storage":        func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.StorageID = "other" },
 		"foreign generation":     func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.StorageGeneration = 2 },
 		"reap from another boot": func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.AttachedBootSessionID = "old-boot" },
-		"older helper session":   func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.HelperGeneration++ },
 		"invalid witness":        func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.SweepEpoch = "epoch" },
 		"stale cleanup fence":    func(a *ocihelper.RemovalAttemptManifest) { a.Authority.FencingToken = "stale" },
 		"prepared attempt ID": func(a *ocihelper.RemovalAttemptManifest) {
@@ -89,6 +88,16 @@ func TestLegacyComputerRemovalReconstructsDetachedStorage(t *testing.T) {
 		if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
 			t.Errorf("%s: detached reconstruction accepted", name)
 		}
+	}
+
+	// The helper server stamps HelperGeneration with the live session's
+	// generation (TestRemovalInventoryStampsTheDetachmentWitnessWithItsSession),
+	// so an older generation cannot reach the adapter through it; the
+	// adapter's own comparison stays as a second check.
+	engine.inventoryRemoval = row(func(a *ocihelper.RemovalAttemptManifest) { a.StorageDetachment.HelperGeneration = 0 })
+	if attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err != nil ||
+		attempts[0].StorageDetachment.HelperGeneration != session.Handshake().SessionGeneration {
+		t.Fatalf("detached witness was not bound to the live session: %+v err=%v", attempts, err)
 	}
 
 	// A sweep witness carries a detach across a restart: its last attachment
