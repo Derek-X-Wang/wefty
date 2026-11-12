@@ -642,3 +642,40 @@ func TestComputerGrowHeldDeltaChargesOnlyNewcomer(t *testing.T) {
 func firstSafeGrowBytes(available int64) int64 {
 	return (8 << 20) + available/2
 }
+
+// A grow that fails at its intent write, before it resized anything, releases
+// its pending capacity (#1644). Once L1's failure budget ends it, a grow to
+// another size under new authority must succeed without a helper restart.
+func TestComputerGrowFailureAtIntentWriteReleasesItsReservation(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(_ context.Context, path, _ string, _, newBytes int64) error {
+			return fullyAllocateComputerDisk(path, newBytes)
+		},
+		computerGrowFilesystemBytes: func(context.Context, string) (int64, error) { return 12 << 20, nil },
+	}
+	// An unreadable intent path makes the intent write fail after admission.
+	blocker := filepath.Join(filepath.Dir(imagePath), computerStorageGrowIntentName)
+	if err := os.MkdirAll(filepath.Join(blocker, "occupied"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.GrowComputerStorage(t.Context(), request); err == nil {
+		t.Fatal("grow succeeded with an unwritable intent")
+	}
+	if reservation := engine.capacityReservations[request.Authority.JobID]; reservation != nil && reservation.pendingDiskBytes != 0 {
+		t.Fatalf("failed grow kept pending capacity: %+v", reservation)
+	}
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	request.NewDiskBytes = 12 << 20
+	request.Storage.IntentRevision = 8
+	request.Authority.OperationRevision = 8
+	request.Authority.OperationFence = "fence-2"
+	response, err := engine.GrowComputerStorage(t.Context(), request)
+	if err != nil || !response.Receipt.Applied {
+		t.Fatalf("grow to another size after the failed one = %+v err=%v", response, err)
+	}
+}

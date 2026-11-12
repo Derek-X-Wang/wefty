@@ -203,6 +203,24 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 	return available, true, nil
 }
 
+// abandonGrowBeforeResize releases what an admitted grow holds when it fails
+// before it resized anything (#1644): its pending capacity and its own grow
+// intent. Kept, the pending delta made every later grow of this Computer to
+// another size conflict with the reservation until the helper restarted, even
+// after L1 ended this grow. A resumed grow whose image already has the new
+// size keeps both: its recovery owns them.
+func (engine *ContainerdEngine) abandonGrowBeforeResize(diskRoot string, request GrowComputerStorageRequest, imageSize int64) error {
+	if imageSize != request.Storage.DiskBytes {
+		return nil
+	}
+	engine.rollbackGrowCapacity(request.Authority.JobID, request.Storage.DiskBytes, true)
+	intent, present, err := readComputerStorageGrowIntent(diskRoot)
+	if err != nil || !present || intent.Request != request {
+		return err
+	}
+	return removeComputerStorageGrowIntent(diskRoot)
+}
+
 func (engine *ContainerdEngine) rollbackGrowCapacity(jobID string, oldBytes int64, imagePresent bool) {
 	engine.capacityMu.Lock()
 	defer engine.capacityMu.Unlock()
@@ -498,13 +516,14 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		return GrowComputerStorageResponse{}, err
 	}
 	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
-		return GrowComputerStorageResponse{}, err
+		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize))
 	}
 	loopDevice := ""
 	if attachment != nil {
 		loopDevice = attachment.loopDevice
 	} else if present && manifest.Attached != nil {
-		return GrowComputerStorageResponse{}, errors.New("Computer grow found an attached manifest without live attachment ownership")
+		err := errors.New("Computer grow found an attached manifest without live attachment ownership")
+		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize))
 	}
 	if err := engine.resizeComputerStorage(ctx, imagePath, loopDevice, request.Storage.DiskBytes, request.NewDiskBytes); err != nil {
 		var uncertain *ComputerStorageGrowUncertainError
