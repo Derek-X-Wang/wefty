@@ -2095,8 +2095,9 @@ generation, plus separate operation-cleanup shapes.
   The witness names the Job that prepared the Storage, which is not compared
   to the removal's Job after a Job rotation (#1607); it must still name the
   removal's Node and root instance and the exact Storage identity.
-- Absent (`storage-absent-<generation>`, `storage_absent`): the exact managed
-  disk root is already gone. It carries no witness.
+- Absent (`storage-absent-<generation>`, `storage_absent`): no Storage payload
+  of the exact generation remains; a lock or refusal tombstone without bytes
+  may. It carries no witness.
 - Detached (`storage-detached-<generation>`, #1611): carries a
   `storage_detachment` witness, helper evidence that a once-attached
   generation is positively detached. It names the generation's last
