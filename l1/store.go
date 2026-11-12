@@ -93,6 +93,7 @@ type Store struct {
 	readSnapshotLastLog               atomic.Int64
 	logf                              func(string, ...any)
 	readSnapshotOverruns              atomic.Uint64
+	writeLockLogThreshold             time.Duration
 	personObservationFallbacks        atomic.Uint64
 	personObservationFallbackLastLog  atomic.Int64
 	db                                *sql.DB
@@ -2715,7 +2716,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKe
 	if err != nil {
 		// A concurrent identical submit can win the unique dispatch key. Read
 		// it after rolling this transaction back and preserve replay semantics.
-		_ = tx.Rollback()
+		_ = write.rollback()
 		return s.readConcurrentSubmit(ctx, spec, requestHash, origin, err)
 	}
 	if err := admitSeatRun(ctx, tx, now, job, submittedByRunLedger); err != nil {
@@ -2745,7 +2746,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKe
 			return Job{}, false, internalError(err, "store job routing tags")
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, false, internalError(err, "commit job creation")
 	}
 	return job, false, nil
@@ -3254,7 +3255,7 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 	if err != nil {
 		return Node{}, internalError(err, "read registered node")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit node registration")
 	}
 	return node, nil
@@ -3409,7 +3410,7 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	if err != nil {
 		return Node{}, internalError(err, "read heartbeating node")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit node heartbeat")
 	}
 	return node, nil
@@ -3466,7 +3467,7 @@ func (s *Store) claimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 		return nil, err
 	}
 	if nodeState != contract.NodeAlive {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return nil, internalError(err, "commit node liveness transition")
 		}
 		switch nodeState {
@@ -3663,7 +3664,7 @@ AND state=@job_queued
 		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS,
 			&claimedParentJobID, &claimedParentAttemptID, &originatingSubmitter, &submittedByRunLedger, &spawnDepth)
 	if errors.Is(err, sql.ErrNoRows) {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return nil, internalError(err, "commit empty claim")
 		}
 		return nil, nil
@@ -3798,7 +3799,7 @@ AND state=@job_queued
 			return nil, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
 	}
 	claim := &Claim{
@@ -3896,7 +3897,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return AttemptLease{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return AttemptLease{}, internalError(err, "commit lease expiry")
 		}
 		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -3935,7 +3936,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if err := establishHealth(ctx, tx, attemptID, healthFromRenewal, now); err != nil {
 		return AttemptLease{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AttemptLease{}, internalError(err, "commit lease renewal")
 	}
 	return AttemptLease{
@@ -4012,7 +4013,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit image observation lease expiry")
 		}
 		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -4073,7 +4074,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	if err != nil {
 		return Job{}, internalError(err, "read image-observed job")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit image observation")
 	}
 	return job, nil
@@ -4152,7 +4153,7 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit Started lease expiry")
 		}
 		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -4207,7 +4208,7 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if err != nil {
 		return Job{}, internalError(err, "read Started job")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit Started acknowledgement")
 	}
 	return job, nil
@@ -4276,7 +4277,7 @@ func (s *Store) SetAttemptPublication(
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit publication lease expiry")
 		}
 		return Job{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -4365,7 +4366,7 @@ func (s *Store) SetAttemptPublication(
 	if err != nil {
 		return Job{}, internalError(err, "read published job")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit publication mutation")
 	}
 	return job, nil
@@ -4558,7 +4559,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 
 	// Already-accepted events remain replayable after authority loss.
 	if len(newEvents) == 0 {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return AppendLogsResponse{}, internalError(err, "commit log replay")
 		}
 		return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
@@ -4614,7 +4615,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	if _, err := s.pruneServiceAttemptSummaries(ctx, tx, jobID, now); err != nil {
 		return AppendLogsResponse{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AppendLogsResponse{}, internalError(err, "commit log append")
 	}
 	return AppendLogsResponse{Acknowledged: acknowledged, AttemptState: attempt.state}, nil
@@ -4947,7 +4948,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, internalError(err, "record late completion evidence")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return CompletionOutcome{}, internalError(err, "commit late completion evidence")
 		}
 		return CompletionOutcome{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -4959,7 +4960,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return CompletionOutcome{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return CompletionOutcome{}, internalError(err, "commit completion lease expiry")
 		}
 		return CompletionOutcome{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
@@ -5126,7 +5127,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 			}
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return CompletionOutcome{}, internalError(err, "commit completion")
 	}
 	return CompletionOutcome{Job: job, ComputerID: computerID, owedRevocationID: owedRevocationID}, nil
@@ -5879,7 +5880,7 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 		jobID, attemptID, document, encoded, string(request.SkipReason), now.UnixNano()); err != nil {
 		return AttemptResultResponse{}, internalError(err, "store attempt result")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AttemptResultResponse{}, internalError(err, "commit attempt result")
 	}
 	return AttemptResultResponse{SHA256: encoded, Bytes: len(request.Document),

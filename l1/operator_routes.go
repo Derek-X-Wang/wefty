@@ -222,7 +222,7 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 	if err != nil {
 		return Job{}, internalError(err, "read service desired-state result")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit service desired-state mutation")
 	}
 	return job, nil
@@ -331,7 +331,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart result")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, false, internalError(err, "commit service restart")
 	}
 	return job, false, nil

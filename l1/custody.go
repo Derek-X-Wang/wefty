@@ -245,7 +245,7 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	if err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "read recorded Custody export")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "commit Custody export before external bytes")
 	}
 	return export, false, nil
@@ -528,7 +528,7 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 	if err != nil {
 		return ComputerCustodyExport{}, internalError(err, "read completed Custody export")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyExport{}, internalError(err, "commit Custody export acknowledgement")
 	}
 	return export, nil
@@ -776,7 +776,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		OperationRevision:    1,
 		DestinationStorageID: storageID, DestinationName: request.Name, DestinationSize: request.DiskBytes,
 		Status: "reserved", RequestedAt: now, Network: network, NetworkNote: networkNote}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "commit Custody import reservation")
 	}
 	return value, false, nil
@@ -917,7 +917,7 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 			if err != nil {
 				return Computer{}, internalError(err, "read failed Custody import authority")
 			}
-			if err := tx.Commit(); err != nil {
+			if err := write.commit(); err != nil {
 				return Computer{}, internalError(err, "commit failed Custody import preparation")
 			}
 			s.notifyComputerPolicyChanged()
@@ -937,7 +937,7 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 		if err != nil {
 			return Computer{}, internalError(err, "read deferred Custody import authority")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Custody import preparation outcome")
 		}
 		return computer, nil
@@ -981,7 +981,7 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 		if err := deleteServiceRows(ctx, tx, row.JobID); err != nil {
 			return Computer{}, internalError(err, "release failed Custody import Job")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit failed Custody import")
 		}
 		return Computer{}, nil
@@ -1051,7 +1051,7 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 	if err != nil {
 		return Computer{}, internalError(err, "read imported Computer")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit verified Custody import")
 	}
 	s.notifyComputerPolicyChanged()

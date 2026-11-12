@@ -67,7 +67,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 			return Computer{}, false, protocolError(contract.ErrorIdempotencyConflict,
 				"Computer reconfiguration abort idempotency key was reused with different authority")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, false, internalError(err, "commit Computer reconfiguration abort replay")
 		}
 		return computer, true, nil
@@ -192,7 +192,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	if err != nil {
 		return Computer{}, false, internalError(err, "read aborted Computer reconfiguration")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer reconfiguration abort")
 	}
 	s.notifyComputerPolicyChanged()

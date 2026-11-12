@@ -97,7 +97,7 @@ func (s *Store) DeEnrollNodeGeneration(ctx context.Context, identity, nodeID str
 		if _, err = tx.ExecContext(ctx, `INSERT INTO node_generation_promotions(node_id,operation_id,request_json,result_json) VALUES(?,?,?,?)`, nodeID, key, payload, result); err != nil {
 			return NodeGenerationInventory{}, err
 		}
-		if err = tx.Commit(); err != nil {
+		if err = write.commit(); err != nil {
 			return NodeGenerationInventory{}, err
 		}
 		return NodeGenerationInventory{}, &Error{Code: refusal.Code, Message: refusal.Message, Details: refusal.Details}
@@ -159,5 +159,5 @@ func (s *Store) DeEnrollNodeGeneration(ctx context.Context, identity, nodeID str
 	if _, err = tx.ExecContext(ctx, `INSERT INTO node_generation_promotions(node_id,operation_id,request_json,result_json) VALUES(?,?,?,?)`, nodeID, key, payload, result); err != nil {
 		return in, err
 	}
-	return in, tx.Commit()
+	return in, write.commit()
 }

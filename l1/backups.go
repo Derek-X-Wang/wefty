@@ -315,7 +315,7 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 	if err != nil {
 		return Computer{}, false, internalError(err, "read planned Computer Backup")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit planned Computer Backup")
 	}
 	return updated, false, nil
@@ -524,7 +524,7 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 	if err != nil {
 		return Backup{}, Computer{}, internalError(err, "read completed Computer Backup")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Backup{}, Computer{}, internalError(err, "commit Computer Backup acknowledgement")
 	}
 	return backup, computer, nil
@@ -890,7 +890,7 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 	if err != nil {
 		return Backup{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Backup{}, false, internalError(err, "commit Computer Backup prune")
 	}
 	return backup, false, nil
@@ -1058,7 +1058,7 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 				request.IdempotencyKey, bodyHash, now.UnixNano(), computerID, request.Receipt.CopyID); err != nil {
 				return Backup{}, internalError(err, "record superseded restore predecessor Backup absence")
 			}
-			if err := tx.Commit(); err != nil {
+			if err := write.commit(); err != nil {
 				return Backup{}, internalError(err, "commit superseded restore predecessor Backup absence")
 			}
 			return Backup{}, nil
@@ -1103,7 +1103,7 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			operation.OperationRevision); err != nil {
 			return Backup{}, internalError(err, "record superseded Backup copy absence")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Backup{}, internalError(err, "commit superseded Backup copy absence")
 		}
 		return Backup{}, nil
@@ -1158,7 +1158,7 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 	if err != nil {
 		return Backup{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Backup{}, internalError(err, "commit Computer Backup prune acknowledgement")
 	}
 	return backup, nil
