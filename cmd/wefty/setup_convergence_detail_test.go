@@ -10,7 +10,8 @@ import (
 )
 
 // setup-oci names what differs, the step still needed, and the host VM base.
-// The base line is advisory and never names a required step (#1593).
+// The base line is advisory: it names the optional upgrade step, never a
+// required one (#1593).
 func TestSetupOCINamesDifferencesActionAndAdvisoryBase(t *testing.T) {
 	for name, tc := range map[string]struct {
 		response ocicontrol.SetupResponse
@@ -21,7 +22,13 @@ func TestSetupOCINamesDifferencesActionAndAdvisoryBase(t *testing.T) {
 			response: ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceRestartRequired, Differences: []string{"vm_memory", "vm_cpus"},
 				Base: &lima.HostVMBase{Current: "ubuntu-24.04", Desired: lima.TemplateGuestOS, UpgradeAvailable: true}},
 			want: []string{"differs: vm_memory, vm_cpus; to apply, rerun setup-oci with --apply-restart\n",
-				"host VM base upgrade available: current ubuntu-24.04, template " + lima.TemplateGuestOS + ". Staying on the current base is supported.\n"},
+				"host VM base upgrade available: guest_os current ubuntu-24.04, template " + lima.TemplateGuestOS + ". Staying on the current base is supported; to upgrade, rerun setup-oci with --recreate.\n"},
+		},
+		"base upgrade applied": {
+			response: ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceRecreateRequired, RestartApplied: true, RecreateApplied: true, Differences: []string{"guest_os"},
+				Base: &lima.HostVMBase{Current: lima.TemplateGuestOS, Desired: lima.TemplateGuestOS}},
+			want:   []string{"differs: guest_os\n", "host VM base: " + lima.TemplateGuestOS + " (matches the template)\n"},
+			absent: []string{"to apply", "upgrade available"},
 		},
 		"restart applied, unobserved base": {
 			response: ocicontrol.SetupResponse{Convergence: ocicontrol.ConvergenceRestartRequired, RestartApplied: true, Differences: []string{"vm_memory"},

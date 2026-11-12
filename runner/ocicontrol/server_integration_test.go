@@ -57,6 +57,24 @@ func TestRecreateRefusalDetailsOmitEmptyFields(t *testing.T) {
 	}
 }
 
+// An unreadable guest under --recreate is the same typed, non-retryable
+// refusal with its own reason (#1593).
+func TestRecreateRefusalNamesUnreadableGuestOS(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeControlResponse(recorder, nil, fmt.Errorf("setup: %w", &lima.GuestOSUnreadableError{}))
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusConflict || response.Error.Code != ErrorHostVMRecreateBlocked || response.Error.Retryable ||
+		response.Error.Details["reason"] != HostVMBaseUnreadableReason || !strings.Contains(response.Error.Message, "rerun setup-oci --recreate") {
+		t.Fatalf("bad refusal: %s", recorder.Body.String())
+	}
+	if _, ok := response.Error.Details["blockers"]; ok {
+		t.Fatalf("empty blockers must be omitted: %s", recorder.Body.String())
+	}
+}
+
 func TestUnresolvedHostVMConfigReachesTheOperator(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeControlResponse(recorder, nil, fmt.Errorf("setup: %w", &lima.UnresolvedInstanceConfigError{}))

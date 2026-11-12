@@ -1232,7 +1232,7 @@ func buildHostVMBase(ctx context.Context, config DoctorConfig, report *DoctorRes
 	}
 	code, state := "oci_host_vm_base_current", "matches the template"
 	if base.UpgradeAvailable {
-		code, state = "oci_host_vm_base_upgrade_available", "differs from the template: base upgrade available; staying on the current base is supported"
+		code, state = "oci_host_vm_base_upgrade_available", "differs from the template: base upgrade available; staying on the current base is supported; to upgrade, "+ConvergenceAction(ConvergenceRecreateRequired)
 	}
 	report.Findings = append(report.Findings, finding("host-vm-base", diagnosticReceipt{ran: true, passed: true, code: code,
 		detail: fmt.Sprintf("guest_os=%s observed_at=%s template=%s kernel=%s; %s", base.Current, base.ObservedAt.Format(time.RFC3339), base.Desired, kernel, state)}))

@@ -360,6 +360,11 @@ func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, blocked.Error(), details)
 			return
 		}
+		var unreadable *lima.GuestOSUnreadableError
+		if errors.As(err, &unreadable) {
+			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, unreadable.Error(), map[string]any{"reason": HostVMBaseUnreadableReason})
+			return
+		}
 		var unresolved *lima.UnresolvedInstanceConfigError
 		if errors.As(err, &unresolved) {
 			writeControlError(writer, http.StatusPreconditionFailed, ErrorSetupRequired, unresolved.Error())
