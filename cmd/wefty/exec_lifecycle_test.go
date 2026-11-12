@@ -28,9 +28,9 @@ import (
 // read must not share it: restore the production budget before one.
 func shortenExecReadRecovery(t *testing.T) (restore func()) {
 	t.Helper()
-	old := execReadRecoveryBudget
-	execReadRecoveryBudget = 300 * time.Millisecond
-	restore = func() { execReadRecoveryBudget = old }
+	old, oldOverload := execReadRecoveryBudget, execReadOverloadBudget
+	execReadRecoveryBudget, execReadOverloadBudget = 300*time.Millisecond, 300*time.Millisecond
+	restore = func() { execReadRecoveryBudget, execReadOverloadBudget = old, oldOverload }
 	t.Cleanup(restore)
 	shortenExecTimers(t)
 	return restore
