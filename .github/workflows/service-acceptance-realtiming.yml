@@ -29,7 +29,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: service-acceptance-realtiming-${{ github.event.pull_request.number || github.ref }}
+  # A run whose acceptance-image trigger was cancelled (#1603) skips every job;
+  # its own group keeps it from cancelling a newer real run (#1605).
+  group: service-acceptance-realtiming-${{ github.event.workflow_run.conclusion == 'cancelled' && format('cancelled-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
