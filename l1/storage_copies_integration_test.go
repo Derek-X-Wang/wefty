@@ -1211,7 +1211,7 @@ func TestRestorePublicationRequiresDurableRetriedAuthorityRevocation(t *testing.
 	}
 }
 
-func TestRemovingCloneSourceSupersedesReservedForkAndCannotVerifyCustody(t *testing.T) {
+func TestRemovingCloneSourceEndsReservedForkAndCannotVerifyCustody(t *testing.T) {
 	h, node, sourceComputer, sourceBackup, _ := publishedBackupForStorageCopy(t, 2)
 	clone, _, err := h.store.BeginComputerClone(context.Background(), ComputerCloneRequest{
 		ComputerMutationPrecondition: computerPrecondition(sourceComputer, "operator"), BackupID: sourceBackup.BackupID,
@@ -1224,12 +1224,13 @@ func TestRemovingCloneSourceSupersedesReservedForkAndCannotVerifyCustody(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	var status string
-	if err := h.store.db.QueryRow(`SELECT status FROM computer_storage_copy_operations WHERE destination_computer_id=?`, clone.ComputerID).Scan(&status); err != nil {
+	var status, failureCode string
+	if err := h.store.db.QueryRow(`SELECT status, failure_code FROM computer_storage_copy_operations WHERE destination_computer_id=?`, clone.ComputerID).Scan(&status, &failureCode); err != nil {
 		t.Fatal(err)
 	}
-	if status != "superseded" {
-		t.Fatalf("source removal left clone operation %q", status)
+	// The clone ends through the clone end, latched, not bare superseded (#1608).
+	if status != "failed" || failureCode != ComputerCloneFailureSourceRemoved {
+		t.Fatalf("source removal left clone operation %q/%q", status, failureCode)
 	}
 	removals, err := h.store.ListNodeRemovalDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
 	if err != nil || len(removals) != 1 {
