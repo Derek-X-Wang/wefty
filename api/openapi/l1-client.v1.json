@@ -1964,7 +1964,7 @@
       "post": {
         "operationId": "abortComputerReconfiguration",
         "summary": "Release a reconfiguration stranded on a dead bound Node",
-        "description": "Typed escape hatch for a Computer stranded in backing_up, resetting, reimaging, growing, exporting, or importing. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery. Detaching a queued Job retains its terminal predecessor's accepted completion for exact idempotent acknowledgement, including an existing detached replay binding; a later claim replaces the binding.",
+        "description": "Typed escape hatch for a Computer stranded in backing_up, resetting, reimaging, growing, exporting, importing, restoring, or cloning. An aborted restore keeps the generation that is current (the old one before publication, the restored one after) and its revoked tokens stay revoked; an aborted clone destination is renamed aborted-clone-<computer_id> and cannot start, so the owner removes it. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery. Detaching a queued Job retains its terminal predecessor's accepted completion for exact idempotent acknowledgement, including an existing detached replay binding; a later claim replaces the binding.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],

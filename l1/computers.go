@@ -1501,9 +1501,8 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			return Computer{}, internalError(err, "supersede Computer Storage copy for removal")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
-		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, computerID); err != nil {
-		return Computer{}, internalError(err, "supersede clone custody forks sourced by removed Computer")
+	if err := endClonesOfRemovedSource(ctx, tx, computerID, now); err != nil {
+		return Computer{}, err
 	}
 	if computer.ReconfigurationPhase == ComputerReconfigurationGrowing {
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_grows SET status='superseded'
