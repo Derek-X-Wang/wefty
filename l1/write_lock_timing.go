@@ -1,8 +1,10 @@
 package l1
 
 import (
+	"context"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,14 +19,19 @@ const defaultWriteLockLogThreshold = 2 * time.Second
 // checkout included) and the hold runs from BEGIN to commit or rollback,
 // including the commit's fsync. One goroutine owns a transaction, and only
 // its first end is recorded: a deferred rollback after commit is ignored.
+// When the transaction's context ends first, database/sql rolls it back and
+// releases the lock at once; the hold then ends at that moment, not when the
+// owner returns.
 type writeLockTiming struct {
-	store   *Store
-	name    string
-	pool    string
-	started time.Time
-	waited  time.Duration
-	locked  time.Time
-	ended   bool
+	store      *Store
+	name       string
+	pool       string
+	started    time.Time
+	waited     time.Duration
+	locked     time.Time
+	ended      bool
+	canceledAt atomic.Int64
+	stopCancel func() bool
 }
 
 // startWriteLockTiming names the transaction after the function skip frames
@@ -40,9 +47,14 @@ func (s *Store) startWriteLockTiming(pool string, skip int) *writeLockTiming {
 	return &writeLockTiming{store: s, name: name, pool: pool, started: time.Now()}
 }
 
-func (t *writeLockTiming) acquired() {
+// acquired starts the hold. ctx is the transaction's context, or nil when no
+// transaction is bound to one.
+func (t *writeLockTiming) acquired(ctx context.Context) {
 	t.locked = time.Now()
 	t.waited = t.locked.Sub(t.started)
+	if ctx != nil {
+		t.stopCancel = context.AfterFunc(ctx, func() { t.canceledAt.Store(time.Now().UnixNano()) })
+	}
 }
 
 func (t *writeLockTiming) beginFailed() {
@@ -56,7 +68,17 @@ func (t *writeLockTiming) end(outcome string) {
 		return
 	}
 	t.ended = true
-	t.log(outcome, time.Since(t.locked))
+	if t.stopCancel != nil {
+		t.stopCancel()
+	}
+	held := time.Since(t.locked)
+	// A commit that succeeded released the lock itself, even if the context
+	// ended during it.
+	if canceled := t.canceledAt.Load(); canceled != 0 && outcome != "commit" {
+		outcome = "canceled"
+		held = min(held, time.Unix(0, canceled).Sub(t.locked))
+	}
+	t.log(outcome, held)
 }
 
 func (t *writeLockTiming) log(outcome string, held time.Duration) {

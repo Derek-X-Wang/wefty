@@ -653,7 +653,7 @@ func (s *Store) beginWriteOn(ctx context.Context, db *sql.DB, pool string, calle
 		lock.beginFailed()
 		return nil, err
 	}
-	lock.acquired()
+	lock.acquired(ctx)
 	var at time.Time
 	if len(pinned) == 1 {
 		at = canonicalTime(pinned[0])

@@ -139,14 +139,75 @@ func TestWriteLockHoldEndsAtCommit(t *testing.T) {
 	}
 }
 
-// Every function that opens a write transaction ends it through
-// writeTransaction.commit or rollback. A raw Commit or Rollback on its
-// *sql.Tx would leave the hold running until the deferred rollback, charging
-// later work to the lock.
+func holdThenCancelForTest(s *Store, held chan<- struct{}, released <-chan struct{}, hold time.Duration) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		cancel()
+		return err
+	}
+	defer write.rollback()
+	time.Sleep(hold)
+	cancel()
+	close(held)
+	<-released // the owner resumes only after another writer took the lock
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+
+// When the transaction's context ends, database/sql rolls back and releases
+// the lock at once. The owner's later return is not lock hold.
+func TestWriteLockHoldEndsAtCancellation(t *testing.T) {
+	s, _ := snapshotStore(t)
+	log := &writeLockLog{}
+	s.logf = log.logf
+	s.writeLockLogThreshold = 100 * time.Millisecond
+	held, released := make(chan struct{}), make(chan struct{})
+	owner := make(chan error, 1)
+	go func() { owner <- holdThenCancelForTest(s, held, released, 150*time.Millisecond) }()
+	<-held
+	if err := waitWriteLockForTest(s); err != nil {
+		t.Fatalf("lock not released at cancellation: %v", err)
+	}
+	close(released)
+	if err := <-owner; err != nil {
+		t.Fatal(err)
+	}
+	lines := log.slow("l1.holdThenCancelForTest")
+	if len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled ") {
+		t.Fatalf("canceled holder lines = %q (all %q)", lines, log.lines)
+	}
+	if hold := writeLockField(t, lines[0], "hold_ms"); hold < 150*time.Millisecond || hold >= 300*time.Millisecond {
+		t.Fatalf("canceled hold = %s, want the 150ms before cancellation, not the owner's return", hold)
+	}
+}
+
+// Every write transaction ends through writeTransaction.commit or rollback. A
+// raw Commit or Rollback on its *sql.Tx would leave the hold running until the
+// deferred rollback, charging later work to the lock. The guard covers
+// transactions a function opens (through a door or a writeTransactionBegin
+// value), *writeTransaction parameters and their .tx aliases, and helpers
+// that end a *sql.Tx parameter they did not open.
 func TestWriteTransactionsEndThroughTheirTiming(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
+	}
+	typeName := func(expression ast.Expr) string {
+		switch typed := expression.(type) {
+		case *ast.Ident:
+			return typed.Name
+		case *ast.StarExpr:
+			switch inner := typed.X.(type) {
+			case *ast.Ident:
+				return "*" + inner.Name
+			case *ast.SelectorExpr:
+				if pkg, ok := inner.X.(*ast.Ident); ok {
+					return "*" + pkg.Name + "." + inner.Sel.Name
+				}
+			}
+		}
+		return ""
 	}
 	for _, file := range files {
 		if strings.HasSuffix(file, "_test.go") {
@@ -162,28 +223,51 @@ func TestWriteTransactionsEndThroughTheirTiming(t *testing.T) {
 			if !ok || function.Body == nil {
 				continue
 			}
-			writes, aliases := map[string]bool{}, map[string]bool{}
-			ast.Inspect(function.Body, func(n ast.Node) bool {
-				assign, ok := n.(*ast.AssignStmt)
-				if !ok {
-					return true
-				}
-				for i, rhs := range assign.Rhs {
-					if i >= len(assign.Lhs) {
-						break
-					}
-					left, ok := assign.Lhs[i].(*ast.Ident)
-					if !ok {
-						continue
-					}
-					if call, ok := rhs.(*ast.CallExpr); ok {
-						if selector, ok := call.Fun.(*ast.SelectorExpr); ok && (selector.Sel.Name == "beginWriteTransaction" || selector.Sel.Name == "beginSettlementWriteTransaction") {
-							writes[left.Name] = true
+			writes, begins, aliases, rawParams := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
+			parameters := func(fields *ast.FieldList) {
+				for _, field := range fields.List {
+					for _, name := range field.Names {
+						switch typeName(field.Type) {
+						case "*writeTransaction":
+							writes[name.Name] = true
+						case "writeTransactionBegin":
+							begins[name.Name] = true
+						case "*sql.Tx":
+							rawParams[name.Name] = true
 						}
 					}
-					if selector, ok := rhs.(*ast.SelectorExpr); ok && selector.Sel.Name == "tx" {
-						if owner, ok := selector.X.(*ast.Ident); ok && writes[owner.Name] {
-							aliases[left.Name] = true
+				}
+			}
+			parameters(function.Type.Params)
+			ast.Inspect(function.Body, func(n ast.Node) bool {
+				switch node := n.(type) {
+				case *ast.FuncLit:
+					parameters(node.Type.Params)
+				case *ast.AssignStmt:
+					for i, rhs := range node.Rhs {
+						if i >= len(node.Lhs) {
+							break
+						}
+						left, ok := node.Lhs[i].(*ast.Ident)
+						if !ok {
+							continue
+						}
+						if call, ok := rhs.(*ast.CallExpr); ok {
+							switch callee := call.Fun.(type) {
+							case *ast.SelectorExpr:
+								if callee.Sel.Name == "beginWriteTransaction" || callee.Sel.Name == "beginSettlementWriteTransaction" {
+									writes[left.Name] = true
+								}
+							case *ast.Ident:
+								if begins[callee.Name] {
+									writes[left.Name] = true
+								}
+							}
+						}
+						if selector, ok := rhs.(*ast.SelectorExpr); ok && selector.Sel.Name == "tx" {
+							if owner, ok := selector.X.(*ast.Ident); ok && writes[owner.Name] {
+								aliases[left.Name] = true
+							}
 						}
 					}
 				}
@@ -201,7 +285,7 @@ func TestWriteTransactionsEndThroughTheirTiming(t *testing.T) {
 				raw := false
 				switch receiver := selector.X.(type) {
 				case *ast.Ident:
-					raw = aliases[receiver.Name]
+					raw = aliases[receiver.Name] || rawParams[receiver.Name]
 				case *ast.SelectorExpr:
 					owner, ok := receiver.X.(*ast.Ident)
 					raw = ok && receiver.Sel.Name == "tx" && writes[owner.Name]

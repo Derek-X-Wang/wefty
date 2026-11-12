@@ -159,7 +159,7 @@ func (s *Store) checkpointSecretWALOnce(ctx context.Context) (bool, error) {
 	// A TRUNCATE checkpoint holds off writers for its whole run, wait included.
 	// It is named after the sweep or removal that asked for it.
 	lock := s.startWriteLockTiming("checkpoint", 2)
-	lock.acquired()
+	lock.acquired(nil)
 	defer lock.end("checkpoint")
 	var busy, logFrames, checkpointedFrames int
 	err := s.checkpointDB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames)
@@ -218,7 +218,7 @@ func (s *Store) backfillTerminalOneShotSecrets(ctx context.Context) (int64, erro
 		lock.beginFailed()
 		return 0, internalError(err, "begin terminal one-shot secret backfill")
 	}
-	lock.acquired()
+	lock.acquired(ctx)
 	defer func() {
 		_ = tx.Rollback()
 		lock.end("rollback")

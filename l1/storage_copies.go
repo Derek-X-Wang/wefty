@@ -1093,9 +1093,10 @@ func abortComputerRestore(ctx context.Context, tx *sql.Tx, row computerStorageCo
 // is spent (#1591). It aborts the restore. Any other outcome stays rejected,
 // because a restore's predecessor still owns the bytes and a deferral or a
 // runtime loss resolves on a later sweep.
-func acknowledgeComputerRestorePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+func acknowledgeComputerRestorePreparation(ctx context.Context, write *writeTransaction, row computerStorageCopyRow,
 	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
 	now time.Time) (Computer, error) {
+	tx := write.tx
 	if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer restore preparation outcome is mutually exclusive with copy receipts")
 	}
@@ -1135,7 +1136,7 @@ func acknowledgeComputerRestorePreparation(ctx context.Context, tx *sql.Tx, row 
 	if err != nil {
 		return Computer{}, internalError(err, "read aborted Computer restore authority")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit aborted Computer restore")
 	}
 	return computer, nil
@@ -1404,7 +1405,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return Computer{}, err
 	}
 	if request.PreparationOutcome != nil && row.Operation == "restore" {
-		computer, err := acknowledgeComputerRestorePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		computer, err := acknowledgeComputerRestorePreparation(ctx, write, row, destinationComputerID, request, bodyHash, now)
 		if err != nil {
 			return Computer{}, err
 		}
@@ -1412,7 +1413,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return computer, nil
 	}
 	if request.PreparationOutcome != nil {
-		computer, err := acknowledgeComputerClonePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		computer, err := acknowledgeComputerClonePreparation(ctx, write, row, destinationComputerID, request, bodyHash, now)
 		if err != nil {
 			return Computer{}, err
 		}
@@ -1498,9 +1499,10 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 // can never finish; a deferral is recorded as the retryable observation it is,
 // exactly as a Custody import records one, so the operator can see why the
 // clone has not landed yet without the node being told to give up.
-func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+func acknowledgeComputerClonePreparation(ctx context.Context, write *writeTransaction, row computerStorageCopyRow,
 	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
 	now time.Time) (Computer, error) {
+	tx := write.tx
 	if row.Operation != "clone" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "only a Computer clone or Custody import acknowledges a Storage copy preparation outcome")
 	}
@@ -1564,7 +1566,7 @@ func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row co
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer clone preparation authority")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer clone preparation outcome")
 	}
 	return computer, nil
