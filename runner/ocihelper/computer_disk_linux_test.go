@@ -30,6 +30,10 @@ type fakeComputerDiskSystem struct {
 	mounts         map[string]string
 	loops          map[string]string
 	nextLoop       int
+	// mountInspectErr and loopInspectErr make mount or loop inspection fail,
+	// as an unreadable mountinfo or loop listing would.
+	mountInspectErr error
+	loopInspectErr  error
 }
 
 func newFakeComputerDiskSystem() *fakeComputerDiskSystem {
@@ -91,6 +95,9 @@ func (system *fakeComputerDiskSystem) detach(mountPath, loopPath, expectedImageP
 func (system *fakeComputerDiskSystem) mountedSource(path string) (string, bool, error) {
 	system.mu.Lock()
 	defer system.mu.Unlock()
+	if system.mountInspectErr != nil {
+		return "", false, system.mountInspectErr
+	}
 	value, ok := system.mounts[path]
 	return value, ok, nil
 }
@@ -105,6 +112,9 @@ func (system *fakeComputerDiskSystem) loopBackingFile(loop string) (string, bool
 func (system *fakeComputerDiskSystem) loopsForRoot(root string) (map[string]string, error) {
 	system.mu.Lock()
 	defer system.mu.Unlock()
+	if system.loopInspectErr != nil {
+		return nil, system.loopInspectErr
+	}
 	result := make(map[string]string)
 	for loop, path := range system.loops {
 		if strings.HasPrefix(path, root+string(filepath.Separator)) {
@@ -2727,9 +2737,13 @@ func TestComputerDiskRemovalBindsSweepReceiptToNamedPriorJob(t *testing.T) {
 		wantErr       bool
 	}{
 		{name: "same-boot helper sweep", priorJobID: "job-1"},
-		{name: "wrong prior Job", priorJobID: "job-other", wantErr: true},
+		// L1 replaced a stopped Computer's Job: the request names the new Job,
+		// the receipt the Job that last attached (#1607).
+		{name: "rotated prior Job", priorJobID: "job-other"},
 		{name: "unnamed prior Job", wantErr: true},
 		{name: "missing receipt capability", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.ReceiptID = "" }, wantErr: true},
+		{name: "foreign Node", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.NodeID = "node-other" }, wantErr: true},
+		{name: "sweep receipt without epoch", priorJobID: "job-1", mutateReceipt: func(evidence *computerDiskEvidence) { evidence.SweepEpoch = "" }, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine, storage, prior := prepareSameBootSweptComputerDisk(t)

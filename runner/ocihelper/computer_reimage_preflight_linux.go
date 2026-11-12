@@ -75,28 +75,29 @@ type computerReimageDetachmentEvidence struct {
 }
 
 func reimageDetachmentEvidence(manifest computerDiskManifest, request PreflightComputerReimageRequest) (computerReimageDetachmentEvidence, bool) {
-	if evidence := manifest.PreviousDetachment; evidence != nil && evidence.ReceiptID != "" &&
-		evidence.ComputerID == request.Storage.ComputerID && evidence.StorageID == request.Storage.StorageID &&
-		evidence.StorageGeneration == request.Storage.StorageGeneration && evidence.NodeID == request.Authority.NodeID &&
-		evidence.JobID == request.Authority.OldJobID && evidence.AttemptID != "" && evidence.FencingToken != "" &&
-		evidence.BootSessionID != "" && (evidence.Kind == computerDiskReapReceipt || evidence.Kind == computerDiskSweepReceipt) {
+	if evidence := manifest.PreviousDetachment; validComputerDiskConsumerDetachmentEvidence(evidence, request.Storage, computerDiskDetachmentAuthority{
+		NodeID: request.Authority.NodeID, BootSessionID: request.Authority.BootSessionID, PriorJobID: request.Authority.OldJobID,
+	}) {
 		return computerReimageDetachmentEvidence{kind: "computer_reimage_detachment", receiptID: evidence.ReceiptID,
 			attemptID: evidence.AttemptID, fencingToken: evidence.FencingToken}, true
 	}
 	// A newly published reset generation can be reimaged before its first
 	// attachment. Its verified preparation receipt is stronger than a detach
 	// receipt: it proves that this exact generation contains fresh helper-owned
-	// bytes and has never carried an attempt.
+	// bytes and has never carried an attempt. Like detach evidence, it keeps
+	// naming the Job that ran the reset after L1 replaces a stopped Computer's
+	// Job, so it is not compared to OldJobID (#1607); the receipt and its
+	// preparation must still agree with each other.
 	preparation, receipt := manifest.Preparation, manifest.PreparationReceipt
 	if !manifest.Prepared || preparation == nil || receipt == nil || manifest.PreviousDetachment != nil ||
 		receipt.Kind != "computer_storage_reset_verified" || receipt.ReceiptID == "" || receipt.HelperGeneration == 0 ||
 		receipt.ComputerID != request.Storage.ComputerID || receipt.StorageID != request.Storage.StorageID ||
 		receipt.NewGeneration != request.Storage.StorageGeneration || receipt.NewGeneration <= receipt.OldGeneration ||
 		receipt.NodeID != request.Authority.NodeID || receipt.RootInstanceID != request.Authority.RootInstanceID ||
-		receipt.JobID != request.Authority.OldJobID || receipt.IntentRevision != manifest.Storage.IntentRevision ||
+		request.Authority.OldJobID == "" || receipt.JobID == "" || receipt.IntentRevision != manifest.Storage.IntentRevision ||
 		receipt.CleanupFence == "" || preparation.NodeID != receipt.NodeID ||
 		preparation.RootInstanceID != receipt.RootInstanceID || preparation.JobID != receipt.JobID ||
-		preparation.PriorJobID != receipt.JobID || preparation.IntentRevision != receipt.IntentRevision ||
+		preparation.PriorJobID == "" || preparation.IntentRevision != receipt.IntentRevision ||
 		preparation.CleanupFence != receipt.CleanupFence || preparation.HelperGeneration != receipt.HelperGeneration {
 		return computerReimageDetachmentEvidence{}, false
 	}
@@ -394,6 +395,20 @@ func (engine *ContainerdEngine) PreflightComputerReimage(ctx context.Context, re
 	detachment, detached := reimageDetachmentEvidence(manifest, request)
 	if !present || !sameComputerStorageIdentity(manifest.Storage, request.Storage) || manifest.DiskImage != "disk.ext4" ||
 		manifest.MountDirectory != name || manifest.Retirement != nil || manifest.Attached != nil || manifest.Pending != nil || !detached {
+		closeComputerDiskLock(lock)
+		stage, reason, code := preflightFailure(errComputerReimageDetachmentRequired)
+		return failedComputerReimagePreflight(receipt, stage, reason, code), nil
+	}
+	// The manifest says detached; the generation must also be positively
+	// unmounted and loop-free while the flock is held, as every other consumer
+	// of detach evidence requires. An attach that failed after it mounted can
+	// restore the earlier detach record (#1607).
+	if _, mounted, mountErr := engine.computerDiskSystem().mountedSource(filepath.Join(engine.config.RuntimeRoot, "computer-mounts", name)); mountErr != nil || mounted {
+		closeComputerDiskLock(lock)
+		stage, reason, code := preflightFailure(errComputerReimageDetachmentRequired)
+		return failedComputerReimagePreflight(receipt, stage, reason, code), nil
+	}
+	if loops, loopErr := engine.computerDiskSystem().loopsForRoot(diskRoot); loopErr != nil || len(loops) != 0 {
 		closeComputerDiskLock(lock)
 		stage, reason, code := preflightFailure(errComputerReimageDetachmentRequired)
 		return failedComputerReimagePreflight(receipt, stage, reason, code), nil

@@ -2286,6 +2286,46 @@ func TestAdapterReleasesAttachedAttemptPinAfterPreRunAbandonment(t *testing.T) {
 	}
 }
 
+// A pre-Run attempt pin whose release fails is that attempt's unfinished
+// cleanup, not runtime loss: the attempt never ran, and the helper keeps the
+// pin for a retry. The session, and every other attempt on it, stays up, and
+// the next reap releases the pin (#1606).
+func TestAdapterFailedPreRunPinReleaseKeepsTheSession(t *testing.T) {
+	engine := &adapterTestEngine{attemptPinReleaseErrors: []error{errors.New("lease delete failed")}}
+	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	defer closeAdapter()
+	request := adapterTestRequest()
+	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error {
+		return &workloadrunner.OCIObservationRefusal{Err: errors.New("stale fence")}
+	}
+	if _, err := adapter.Run(t.Context(), request, nil); err == nil {
+		t.Fatal("observation refusal unexpectedly ran")
+	}
+	session, err := adapter.sessions.Session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	var loss *workloadrunner.RuntimeLossError
+	var rpcErr *ocihelper.RPCError
+	if err == nil || errors.As(err, &loss) || !errors.As(err, &rpcErr) || rpcErr.Code != ocihelper.CodeEngineFailure {
+		t.Fatalf("failed pre-Run pin release reap = %v, want the scoped engine_failure", err)
+	}
+	if healthErr := session.HealthError(); healthErr != nil {
+		t.Fatalf("failed pre-Run pin release closed the shared helper session: %v", healthErr)
+	}
+	receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
+	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
+		t.Fatalf("retried pre-Run pin reap = (%+v, %v)", receipt, err)
+	}
+	if engine.deletes != 2 {
+		t.Fatalf("pre-Run attached pin release calls = %d, want 2", engine.deletes)
+	}
+	if again, err := adapter.sessions.Session(); err != nil || again != session {
+		t.Fatalf("session after retry = (%p, %v), want the original %p", again, err, session)
+	}
+}
+
 func TestReleaseBindingPinWithoutLedgerRowDoesNotAcquireHelper(t *testing.T) {
 	adapter := NewAdapter(&failingSessionSource{})
 	if err := adapter.ReleaseOCIImageBindingPin(t.Context(), "process-job"); err != nil {
@@ -2400,6 +2440,7 @@ type adapterTestEngine struct {
 	mu                            sync.Mutex
 	watch                         ocihelper.WatchResponse
 	deletes                       int
+	attemptPinReleaseErrors       []error
 	runtimeDeletes                int
 	refuseDelete                  bool
 	runErr                        error
@@ -2491,8 +2532,13 @@ func (*adapterTestEngine) ReleaseImagePin(context.Context, ocihelper.ReleaseImag
 
 func (engine *adapterTestEngine) ReleaseAttemptImagePin(context.Context, ocihelper.ReleaseAttemptImagePinRequest) error {
 	engine.mu.Lock()
+	defer engine.mu.Unlock()
 	engine.deletes++
-	engine.mu.Unlock()
+	if len(engine.attemptPinReleaseErrors) > 0 {
+		err := engine.attemptPinReleaseErrors[0]
+		engine.attemptPinReleaseErrors = engine.attemptPinReleaseErrors[1:]
+		return err
+	}
 	return nil
 }
 
@@ -2875,6 +2921,17 @@ func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t
 	if !attempts[0].StorageOnly || attempts[0].ComputerStorage == nil || len(attempts[0].RemovalResources()) != 9 {
 		t.Fatalf("prepared Computer reconstruction invented runtime rows: %+v", attempts[0])
 	}
+	// The witness names the Job that prepared the Storage; after L1 replaced
+	// the stopped Computer's Job, the removal names another (#1607).
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.JobID = "job-that-prepared"
+	if attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err != nil || len(attempts) != 1 {
+		t.Fatalf("prepared Computer reconstruction after a Job rotation = %+v err=%v", attempts, err)
+	}
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.NodeID = "node-other"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted a witness from another Node")
+	}
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.NodeID = "node"
 	engine.inventoryRemoval.Attempts[0].Authority.FencingToken = "stale-cleanup"
 	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
 		t.Fatal("prepared Computer reconstruction accepted stale cleanup authority")

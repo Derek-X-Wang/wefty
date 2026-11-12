@@ -33,8 +33,7 @@ func TestPerResourceRefusalsAreNotRuntimeLoss(t *testing.T) {
 		}
 	}
 
-	// The default stands: an engine failure that names no independently
-	// verified per-resource operation is still runtime-loss evidence.
+	// A whole-namespace operation stays on the runtime-loss allow-list (#1606).
 	wholeNamespace := &RPCError{
 		Code: CodeEngineFailure, Message: "OCI engine operation failed",
 		EngineFailure: &EngineFailureFact{Operation: MethodSweep, Reason: EngineFailureOperationFailed},

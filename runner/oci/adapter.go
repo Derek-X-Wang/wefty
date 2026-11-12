@@ -549,7 +549,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		}
 		if helperAttempt.StorageOnly && !helperAttempt.StorageAbsent && (helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
 			helperAttempt.StoragePreparation.NodeID != request.NodeID || helperAttempt.StoragePreparation.RootInstanceID != request.RootInstanceID ||
-			helperAttempt.StoragePreparation.JobID != request.JobID || helperAttempt.StoragePreparation.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
+			helperAttempt.StoragePreparation.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
 			helperAttempt.StoragePreparation.StorageID != helperAttempt.ComputerStorage.StorageID ||
 			helperAttempt.StoragePreparation.StorageGeneration != helperAttempt.ComputerStorage.StorageGeneration) {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without a matching durable preparation witness")

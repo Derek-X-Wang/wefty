@@ -154,7 +154,7 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 			}
 		} else if manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() ||
 			!contract.ValidStorageOnlyRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) ||
-			manifest.StoragePreparation.NodeID != manifest.NodeID || manifest.StoragePreparation.JobID != manifest.JobID ||
+			manifest.StoragePreparation.NodeID != manifest.NodeID ||
 			manifest.StoragePreparation.ComputerID != manifest.ComputerStorage.ComputerID ||
 			manifest.StoragePreparation.StorageID != manifest.ComputerStorage.StorageID ||
 			manifest.StoragePreparation.StorageGeneration != manifest.ComputerStorage.StorageGeneration {
