@@ -1724,17 +1724,22 @@ the copy's integrity in doubt: an engine failure, a deferred resume, or a
 quarantined generation, which is reserved for a copy whose bytes cannot be
 trusted. None of them is an absence receipt, so none authorizes deletion.
 
-For a Custody import or a clone, the agent writes an exact-generation
-`computer_storage_preparation_interrupted` observation in two cases, told apart
-by its reason:
+The agent reports every failed copy attempt of an import, a clone or a
+restore to L1's Storage operation failure budget (state-machines.md, "Storage
+operation failure budget", #1608), and L1 decides when the copy ends: a
+quarantine at once, an engine failure or a runtime loss after 5 counted
+failures and 10 minutes, a deferral never. The report carries the helper's
+generation-bound outcome as its `preparation_outcome`. An exact-generation
+`computer_storage_preparation_interrupted` outcome is built in two cases, told
+apart by its reason:
 
 - `runtime_loss`: typed helper runtime loss during `CopyComputerStorage`
   (transport loss or `session_stale`), bound to the lost helper generation.
 - `engine_failure`: a typed `engine_failure` for `CopyComputerStorage` that the
   live session answered, bound to that live helper generation. It is not
   runtime loss: the session and every other attempt on the Node stay up, and
-  only this copy ends. There is no retry, because the same call on the same
-  session fails the same way (#1581).
+  only this copy is charged. L1 counts it, so a call that fails the same way
+  on every attempt ends the copy (#1581, #1608).
 
 Startup recovery also carries exact-generation
 `computer_storage_resume_deferred` or `computer_storage_quarantined` results.
@@ -1743,11 +1748,14 @@ attempt count, and deferral timestamps. All outcomes bind Computer ID, Storage
 ID, generation, intent revision, disk bytes, helper generation, and observation
 time; an identity mismatch never attaches to the copy it claims. L1 records the
 preparation idempotency key and body hash, accepts identical replay, and rejects
-an older helper generation or timestamp. Restore has no such path at all: its
-destination is a live Computer whose predecessor still owns the bytes, so it
-holds no never-attached generation that a preparation outcome could close.
+an older helper generation or timestamp. A restore reports the same outcomes;
+the budget ends it with its old generation still current, because its
+predecessor still owns the bytes.
 
-For an import this evidence grants no publication
+The rest of this section is the per-verb rule an agent of the previous
+release still triggers for one release, by sending these outcomes on the copy
+acknowledgement instead of reporting them; L1 keeps it unchanged until it is
+removed (#1627). A current agent never takes it. For an import this evidence grants no publication
 or cleanup authority. A deferral, a quarantine, or a `runtime_loss`
 interruption leaves the reserved directive retryable, because the next
 session's startup sweep rolls a lost copy back or completes it; the evidence is
@@ -1804,10 +1812,10 @@ root and Job (or prior Job) and the destination is neither mounted nor
 loop-attached: before `manifest_written` the rollback leaves a lock-only root
 that removal proves absent, and from there on the local publication gives
 removal its verified receipt. A deferral record, or a failed recovery, is left
-for the sweep. The agent holds the terminal outcome until L1 accepts it and
-resends only the acknowledgement, never the copy; after an agent restart the
-new session's sweep runs first, as after runtime loss, so that is the one case
-in which the copy can run again.
+for the sweep. An agent of the previous release holds the terminal outcome
+until L1 accepts it and resends only the acknowledgement, never the copy. A
+current agent holds nothing: until L1's budget ends the copy, the next attempt
+calls the copy again after L1's `retry_after_seconds`.
 
 The acknowledgement itself deletes nothing: whatever the helper kept -- the
 quarantined generation, the retained root and its receipt, or the lock-only
