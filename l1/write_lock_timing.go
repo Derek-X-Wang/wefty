@@ -20,10 +20,11 @@ const defaultWriteLockLogThreshold = 2 * time.Second
 // including the commit's fsync. One goroutine owns a transaction, and only
 // its first end is recorded: a deferred rollback after commit is ignored.
 // When the transaction's context ends first, database/sql rolls it back on its
-// own, after any in-flight statement returns. The owner cannot see when that
-// rollback finished, so such a line says outcome=canceled, keeps hold_ms as
-// the upper bound (up to the owner's end), and adds canceled_after_ms, when
-// the context ended. A slow holder is never hidden by an early cancellation.
+// own, after any in-flight statement returns, and may finish after the owner
+// has returned. Nothing here can observe that completion, so every canceled
+// write transaction is logged, whatever its timing: outcome=canceled with
+// hold_ms up to the owner's end, canceled_after_ms, and release=unknown.
+// Canceled writes are rare outside a stall, and a stall is when they matter.
 type writeLockTiming struct {
 	store      *Store
 	name       string
@@ -99,11 +100,10 @@ func (t *writeLockTiming) log(outcome string, held time.Duration) {
 		t.name, t.pool, outcome, t.waited.Milliseconds(), held.Milliseconds(), threshold.Milliseconds())
 }
 
-func (t *writeLockTiming) logCanceled(heldAtMost, canceledAfter time.Duration) {
-	threshold := t.threshold()
-	if t.store.logf == nil || t.waited < threshold && heldAtMost < threshold {
+func (t *writeLockTiming) logCanceled(heldToOwnerEnd, canceledAfter time.Duration) {
+	if t.store.logf == nil {
 		return
 	}
-	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=canceled wait_ms=%d hold_ms=%d canceled_after_ms=%d threshold_ms=%d",
-		t.name, t.pool, t.waited.Milliseconds(), heldAtMost.Milliseconds(), canceledAfter.Milliseconds(), threshold.Milliseconds())
+	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=canceled release=unknown wait_ms=%d hold_ms=%d canceled_after_ms=%d threshold_ms=%d",
+		t.name, t.pool, t.waited.Milliseconds(), heldToOwnerEnd.Milliseconds(), canceledAfter.Milliseconds(), t.threshold().Milliseconds())
 }

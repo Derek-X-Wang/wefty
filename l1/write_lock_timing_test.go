@@ -157,8 +157,9 @@ func holdThenCancelForTest(s *Store, held chan<- struct{}, released <-chan struc
 
 // When the transaction's context ends, database/sql rolls back on its own and
 // another writer can take the lock. The owner cannot see when that finished,
-// so the line keeps the upper bound and says when the context ended.
-func TestWriteLockCancellationKeepsUpperBoundAndMarksIt(t *testing.T) {
+// so every canceled write is logged: the hold up to the owner's end, when the
+// context ended, and release=unknown.
+func TestWriteLockCancellationIsAlwaysReported(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
 	s.logf = log.logf
@@ -175,7 +176,7 @@ func TestWriteLockCancellationKeepsUpperBoundAndMarksIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := log.slow("l1.holdThenCancelForTest")
-	if len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled ") {
+	if len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled release=unknown ") {
 		t.Fatalf("canceled holder lines = %q (all %q)", lines, log.lines)
 	}
 	if canceled := writeLockField(t, lines[0], "canceled_after_ms"); canceled < 150*time.Millisecond || canceled >= 300*time.Millisecond {
@@ -183,6 +184,33 @@ func TestWriteLockCancellationKeepsUpperBoundAndMarksIt(t *testing.T) {
 	}
 	if hold := writeLockField(t, lines[0], "hold_ms"); hold < 450*time.Millisecond {
 		t.Fatalf("hold upper bound = %s, want it to include the owner's 300ms return", hold)
+	}
+}
+
+func cancelQuicklyForTest(s *Store) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		cancel()
+		return err
+	}
+	defer write.rollback()
+	cancel()
+	for ctx.Err() == nil {
+	}
+	time.Sleep(10 * time.Millisecond) // let the cancellation callback record
+	return nil
+}
+
+func TestQuickCanceledWriteIsStillReported(t *testing.T) {
+	s, _ := snapshotStore(t)
+	log := &writeLockLog{}
+	s.logf = log.logf
+	if err := cancelQuicklyForTest(s); err != nil {
+		t.Fatal(err)
+	}
+	if lines := log.slow("l1.cancelQuicklyForTest"); len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled release=unknown ") {
+		t.Fatalf("quick canceled write lines = %q (all %q)", lines, log.lines)
 	}
 }
 
