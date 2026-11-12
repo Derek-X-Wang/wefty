@@ -69,7 +69,7 @@ func TestSeatIdleBrokenRemovalDoesNotBlockOtherComputer(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs []string
-	f.store.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	f.store.setLogf(func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) })
 	f.clock.Advance(10 * time.Minute)
 	for range 2 {
 		if err := f.store.CheckSeatLife(t.Context()); err != nil {

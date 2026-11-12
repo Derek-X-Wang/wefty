@@ -492,9 +492,7 @@ func (s *Store) recordPersonFallbackWrite() {
 	if now-prior < int64(time.Second) || !s.personObservationFallbackLastLog.CompareAndSwap(prior, now) {
 		return
 	}
-	if s.logf != nil {
-		s.logf("event=l1_person_observation_fallback count=%d", s.personObservationFallbacks.Load())
-	}
+	s.logf("event=l1_person_observation_fallback count=%d", s.personObservationFallbacks.Load())
 }
 
 func (s *Store) personObservationFallbackCount() uint64 {
@@ -576,9 +574,7 @@ func (s *Store) recordReadSnapshotOverrun(elapsed time.Duration) {
 	if now-prior < int64(time.Second) || !s.readSnapshotLastLog.CompareAndSwap(prior, now) {
 		return
 	}
-	if s.logf != nil {
-		s.logf("event=l1_read_snapshot_target_overrun elapsed_ms=%d target_ms=%d count=%d", elapsed.Milliseconds(), readSnapshotBudget.Milliseconds(), s.readSnapshotOverruns.Load())
-	}
+	s.logf("event=l1_read_snapshot_target_overrun elapsed_ms=%d target_ms=%d count=%d", elapsed.Milliseconds(), readSnapshotBudget.Milliseconds(), s.readSnapshotOverruns.Load())
 }
 
 var _ readModel = (*databaseReads)(nil)
