@@ -1078,18 +1078,12 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 						response.Runbook = ocicontrol.RunbookPath
 						return response, nil
 					}
-					// The base is advisory: an unobserved or unreadable record
-					// reports no current value and never blocks this run.
 					var err error
-					observationPath, err = limarunner.GuestOSObservationPath(limaHome, *ociLimaInstance)
+					observationPath, err = setupHostVMBaseAndSizing(setupContext, &response, request, limaHome, *ociLimaInstance,
+						func(ctx context.Context) (limarunner.GuestOSObservation, error) {
+							return limarunner.ObserveGuestOS(ctx, limaHome, *ociLimaInstance, "", time.Now())
+						})
 					if err != nil {
-						return response, err
-					}
-					observation, observeErr := limarunner.ReadGuestOSObservation(observationPath)
-					base := limarunner.NewHostVMBase(observation, observeErr == nil)
-					response.Base = &base
-					if err := limarunner.UpdateInstanceSizing(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"),
-						limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}); err != nil {
 						return response, err
 					}
 				}
@@ -1097,13 +1091,6 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					return response, err
 				}
 				response.Configured = true
-				if request.Recreate && runtime.GOOS == "darwin" {
-					if err := recreateHostVMBase(setupContext, &response, func(ctx context.Context) (limarunner.GuestOSObservation, error) {
-						return limarunner.ObserveGuestOS(ctx, limaHome, *ociLimaInstance, "", time.Now())
-					}); err != nil {
-						return response, err
-					}
-				}
 				if response.Convergence == ocicontrol.ConvergenceRestartRequired && !request.ApplyRestart {
 					response.ReasonCode = contract.CapabilityReasonTemplateRestartRequired
 					return response, nil

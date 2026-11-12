@@ -497,16 +497,16 @@ current base is supported. An unobserved or unreadable record is unknown: it
 is never treated as a difference. The setup result's base line and the doctor
 finding name the field (`guest_os`) and the action: rerun `setup-oci --recreate`.
 
-Only `setup-oci --recreate` applies a base upgrade. When the setup state alone
-does not already require a recreate, it reads the running guest's
-`/etc/os-release` with the same bound, records the result, and never decides
-from an older record. A base that differs from the template makes the run
+Only `setup-oci --recreate` applies a base upgrade. Every `--recreate` first
+reads the running guest's `/etc/os-release` with the same bound, records the
+result, and never decides from an older record, so no host VM is deleted while
+its base is unknown. A base that differs from the template makes the run
 recreate-required, adds `guest_os` to the setup result's differences, and goes
 through the unchanged recreate guard (zero live OCI attempts and the inventory
-absence proof). A recreate already required by the setup state installs the
-template's base anyway, so it does not read the guest. A matching base changes
-nothing. A guest that cannot be read, or whose release cannot be parsed,
-refuses before any class change or host VM action: HTTP 409
+absence proof). A matching base changes nothing. A guest that cannot be read,
+or whose release cannot be parsed, refuses before `lima.yaml`, the desired
+setup state or the host VM changes, also when the setup state already requires
+a recreate: HTTP 409
 `host_vm_recreate_blocked`, CLI exit 5, `retryable=false`,
 `details.reason = "guest_os_unreadable"`. After an applied recreate the setup
 result reports the base recorded for the new guest, or not observed when that
