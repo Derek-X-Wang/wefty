@@ -42,6 +42,10 @@ import (
 // #1144 adds the approval-based potential host VM wait deadline.
 // #1333 adds the boot-scoped interval lease_sleep_clock anchor and private Node
 // heartbeat sleep credit, reset by a trigger on real heartbeat writes.
+// #1608 adds the Storage operation failure budget and its report ledger, and
+// widens the reset, Storage copy and abort CHECKs (reset failed/cleanup_owed
+// with failure_code and completed_ns, copy cleanup_owed, abort restoring and
+// cloning), rebuilding the active-reset index over live statuses only.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -61,8 +65,8 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "b685d3fdd68c3c33d0c1729e1229df24af9e67326149b9487d275601080c0f81"
+	// The Storage operation failure budget (#1608).
+	const mainFingerprint = "19a26014c4ddb27a3c405ff05964240f85245383335f6c55b2c2066d04715432"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
