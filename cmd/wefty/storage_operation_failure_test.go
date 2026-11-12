@@ -45,7 +45,8 @@ func TestRestoreWaitEndsOnCleanupOwedWithAWarning(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	warnComputerRestoreCleanupOwed(&stderr, observed)
-	if warning := stderr.String(); !strings.Contains(warning, "restore 4 applied") || !strings.Contains(warning, "engine_failure") {
+	if warning := stderr.String(); !strings.Contains(warning, "restore 4 applied") || !strings.Contains(warning, "engine_failure") ||
+		strings.Contains(warning, "stopped") {
 		t.Fatalf("warning = %q", warning)
 	}
 }

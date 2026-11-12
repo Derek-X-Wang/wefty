@@ -134,7 +134,9 @@ func (reporter *storageFailureReporter) settle(ctx context.Context, ref storageO
 			HelperGeneration: failure.helperGeneration, PreparationOutcome: failure.preparation})
 	if reportErr != nil {
 		reporter.paceLocally(ref)
-		return errors.Join(err, fmt.Errorf("report Computer %s failure: %w", ref.verb, reportErr))
+		// The report's own error leads, so an L1 answer about the node
+		// session on the report routes the pass the way it routes any other.
+		return errors.Join(fmt.Errorf("report Computer %s failure: %w", ref.verb, reportErr), err)
 	}
 	reporter.mu.Lock()
 	if response.RetryAfterSeconds > 0 {
@@ -222,12 +224,13 @@ func classifyStorageOperationFailure(err error) (storageOperationFailure, bool) 
 	var rpc *ocihelper.RPCError
 	if errors.As(err, &rpc) {
 		switch rpc.Code {
-		case ocihelper.CodeSessionBusy, ocihelper.CodeSessionStale, ocihelper.CodeSweepRequired,
+		case ocihelper.CodeSessionBusy, ocihelper.CodeSessionStale, ocihelper.CodeSweepRequired, ocihelper.CodeComputerStorageBusy,
 			ocihelper.CodeConnectionLimit, ocihelper.CodeStartupBoundTripped, ocihelper.CodeDiagnosticFailure,
 			ocihelper.CodePeerUnauthenticated, ocihelper.CodeVersionMismatch, ocihelper.CodeChecksumMismatch:
-			// The helper answered about its session, not about this
+			// The helper answered about availability, not about this
 			// operation: a busy or unswept session, a connection slot, a
-			// handshake. The same call succeeds once the session is ready.
+			// handshake, or Storage another attempt still holds. The same
+			// call succeeds once that clears.
 			return storageOperationFailure{}, false
 		case ocihelper.CodeComputerStorageQuarantined:
 			return storageOperationFailure{class: l1.ComputerStorageOperationFailureQuarantined, code: string(rpc.Code)}, true

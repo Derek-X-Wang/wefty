@@ -39,17 +39,43 @@ func storageGrowOperation(directive l1.ComputerStorageGrowDirective) storageOper
 		revision: directive.OperationRevision, stage: l1.ComputerStorageOperationPrepare, fence: directive.OperationFence}
 }
 
+// process runs one directive from a recovery pass. It takes the same
+// in-flight reservation and pace as a heartbeat's enqueue, so the two paths
+// never run one operation twice at once or ahead of L1's retry_after.
 func (controller *storageGrowController) process(ctx context.Context, directive l1.ComputerStorageGrowDirective) error {
+	key, reserved := controller.reserve(directive)
+	if !reserved {
+		return nil
+	}
+	defer controller.release(key)
+	return controller.run(ctx, directive)
+}
+
+func (controller *storageGrowController) run(ctx context.Context, directive l1.ComputerStorageGrowDirective) error {
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("Computer grow authority belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 	}
-	// Recovery passes call process directly, so the pace L1 answered is
-	// honoured here as well as at the in-flight reservation.
-	operation := storageGrowOperation(directive)
-	if !controller.failures.due(operation) {
-		return nil
+	return controller.failures.settle(ctx, storageGrowOperation(directive), controller.attempt(ctx, directive))
+}
+
+// reserve claims the directive unless it is already in flight or L1's pace
+// says it is not yet due; both are read under the one lock, so a failing
+// attempt records its pace before it releases the reservation.
+func (controller *storageGrowController) reserve(directive l1.ComputerStorageGrowDirective) (string, bool) {
+	key := fmt.Sprintf("%s\x00%d", directive.ComputerID, directive.OperationRevision)
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if _, exists := controller.inflight[key]; exists || !controller.failures.due(storageGrowOperation(directive)) {
+		return "", false
 	}
-	return controller.failures.settle(ctx, operation, controller.attempt(ctx, directive))
+	controller.inflight[key] = struct{}{}
+	return key, true
+}
+
+func (controller *storageGrowController) release(key string) {
+	controller.mu.Lock()
+	delete(controller.inflight, key)
+	controller.mu.Unlock()
 }
 
 func (controller *storageGrowController) attempt(ctx context.Context, directive l1.ComputerStorageGrowDirective) error {
@@ -75,19 +101,15 @@ func (controller *storageGrowController) attempt(ctx context.Context, directive 
 }
 
 func (controller *storageGrowController) enqueue(ctx context.Context, directive l1.ComputerStorageGrowDirective, failures chan<- destinationError) {
-	key := fmt.Sprintf("%s\x00%d", directive.ComputerID, directive.OperationRevision)
-	controller.mu.Lock()
-	if _, exists := controller.inflight[key]; exists || !controller.failures.due(storageGrowOperation(directive)) {
-		controller.mu.Unlock()
+	key, reserved := controller.reserve(directive)
+	if !reserved {
 		return
 	}
-	controller.inflight[key] = struct{}{}
 	controller.wg.Add(1)
-	controller.mu.Unlock()
 	go func() {
 		defer controller.wg.Done()
-		defer func() { controller.mu.Lock(); delete(controller.inflight, key); controller.mu.Unlock() }()
-		if err := controller.process(ctx, directive); err != nil && ctx.Err() == nil {
+		defer controller.release(key)
+		if err := controller.run(ctx, directive); err != nil && ctx.Err() == nil {
 			classification := classifyAgentProtocolError(err)
 			if classification.destination == errorDestinationNodeSession {
 				select {

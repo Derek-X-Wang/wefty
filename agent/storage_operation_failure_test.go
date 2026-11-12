@@ -267,6 +267,7 @@ func TestStorageOperationFailureClassification(t *testing.T) {
 		{"helper connection limit", &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit}},
 		{"helper sweep required", fmt.Errorf("copy: %w", &ocihelper.RPCError{Code: ocihelper.CodeSweepRequired})},
 		{"helper session busy", &ocihelper.RPCError{Code: ocihelper.CodeSessionBusy}},
+		{"Storage held by another attempt", &ocihelper.RPCError{Code: ocihelper.CodeComputerStorageBusy, Detail: "admission_contention"}},
 		{"cleanup quarantine", errors.Join(errors.New("delete"), &workloadrunner.ManagedVolumeCleanupQuarantinedError{})},
 	} {
 		t.Run("not reported/"+row.name, func(t *testing.T) {
@@ -706,5 +707,60 @@ func TestPreparationOutcomeMapsEveryField(t *testing.T) {
 		got.PayloadDroppedAt == nil || !got.PayloadDroppedAt.Equal(*outcome.PayloadDroppedAt) ||
 		got.RecordedAt == nil || !got.RecordedAt.Equal(outcome.RecordedAt) {
 		t.Fatalf("mapped preparation outcome = %#v, want %#v", got, outcome)
+	}
+}
+
+// A recovery pass and a heartbeat share one reservation: while a heartbeat's
+// attempt is in flight, a direct recovery call runs nothing.
+func TestRecoveryCallWaitsForTheInFlightAttempt(t *testing.T) {
+	fake, client := newFailureBudgetL1(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	controller := newStorageResetController(client, nil, blockingResetter{entered: entered, release: release}, "node-1", "boot-1", t.Logf)
+	directive := l1.ComputerStorageResetDirective{ComputerID: "computer-reset", BoundNodeID: "node-1",
+		IntentRevision: 5, CleanupFence: "reset-fence"}
+	controller.enqueue(t.Context(), directive, make(chan destinationError, 1))
+	<-entered
+	if err := controller.process(t.Context(), directive); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	controller.wait()
+	if reports, _, _ := fake.sent(); len(reports) != 1 {
+		t.Fatalf("reports = %d, want 1: the recovery call ran beside the heartbeat's attempt", len(reports))
+	}
+}
+
+type blockingResetter struct{ entered, release chan struct{} }
+
+func (resetter blockingResetter) ResetComputerStorage(context.Context, workloadrunner.ComputerStorageResetRequest) (workloadrunner.ComputerStorageResetReceipt, error) {
+	close(resetter.entered)
+	<-resetter.release
+	return workloadrunner.ComputerStorageResetReceipt{}, helperEngineFailure()
+}
+
+// When the report itself is answered with a node-session error, that answer
+// routes the pass, not the operation's own failure.
+func TestReportNodeSessionErrorRoutesThePass(t *testing.T) {
+	fake, client := newFailureBudgetL1(t)
+	fake.answer = func(l1.ComputerStorageOperationFailureRequest, int) (int, string) {
+		return http.StatusConflict, `{"error":{"code":"node_session_replaced","message":"replaced","retryable":false}}`
+	}
+	fake.ackError = func(string) (int, string) {
+		return http.StatusConflict, `{"error":{"code":"storage_reference_conflict","message":"other generation","retryable":false}}`
+	}
+	controller := newStorageResetController(client, nil, resetReceiptFunc(func() workloadrunner.ComputerStorageResetReceipt {
+		return workloadrunner.ComputerStorageResetReceipt{Kind: "computer_storage_reset_prepared", ReceiptID: "reset-receipt"}
+	}), "node-1", "boot-1", t.Logf)
+	failures := make(chan destinationError, 1)
+	controller.enqueue(t.Context(), l1.ComputerStorageResetDirective{ComputerID: "computer-reset", BoundNodeID: "node-1",
+		IntentRevision: 5, CleanupFence: "reset-fence"}, failures)
+	controller.wait()
+	select {
+	case routed := <-failures:
+		if routed.destination != errorDestinationNodeSession {
+			t.Fatalf("routed to %v", routed.destination)
+		}
+	default:
+		t.Fatal("the report's node_session_replaced did not reach the node session")
 	}
 }

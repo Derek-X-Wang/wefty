@@ -600,15 +600,16 @@ func awaitedComputerRestoreFailure(computer l1.Computer) error {
 
 // warnComputerRestoreCleanupOwed reports a restore that switched the data and
 // then could not delete its predecessor within the failure budget (#1608).
-// The restore is done: the Computer runs on the restored generation once it
-// is started. Only the old bytes stay owed to the Computer's removal.
+// The restore is done. It says nothing about the Computer's current power
+// state, which may have changed since: only the old bytes stay owed to the
+// Computer's removal.
 func warnComputerRestoreCleanupOwed(stderr io.Writer, computer l1.Computer) {
 	outcome := computer.RestoreOperation
 	if outcome == nil || outcome.Status != "cleanup_owed" {
 		return
 	}
 	_, _ = fmt.Fprintf(stderr, "warning: Computer %s restore %d applied, but its old generation could not be deleted (%s); "+
-		"the Computer stays stopped until you start it, and removing it deletes the old bytes\n",
+		"the old bytes stay on the Node until the Computer is removed\n",
 		computer.ComputerID, outcome.OperationRevision, outcome.FailureCode)
 }
 
