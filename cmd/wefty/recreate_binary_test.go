@@ -25,9 +25,9 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	socket := filepath.Join(root, "control.sock")
-	var refusal atomic.Pointer[lima.RecreateBlockedError]
+	var refusal atomic.Pointer[error]
 	server, err := ocicontrol.NewServer(socket, ocicontrol.ServiceFuncs{SetupFunc: func(context.Context, ocicontrol.SetupRequest) (ocicontrol.SetupResponse, error) {
-		return ocicontrol.SetupResponse{}, refusal.Load()
+		return ocicontrol.SetupResponse{}, *refusal.Load()
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -57,16 +57,17 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name    string
-		failure *lima.RecreateBlockedError
+		failure error
 		want    string
 	}{
 		{"retained", &lima.RecreateBlockedError{Blockers: []string{"Computer Storage generation stopped-generation", "Backup copy kept-copy"}}, "stopped-generation"},
 		{"service", &lima.RecreateBlockedError{Blockers: []string{"service data for job job_stopped_service"}}, "job_stopped_service"},
 		{"Custody", &lima.RecreateBlockedError{Blockers: []string{"Custody write record for Computer computer_exporting, export export_kept (started)"}}, "computer_exporting"},
 		{"unknown", &lima.RecreateBlockedError{Reason: "host VM is stopped; durable inventory unavailable"}, "durable inventory unavailable"},
+		{"base unreadable", &lima.GuestOSUnreadableError{}, "guest OS release could not be read"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			refusal.Store(test.failure)
+			refusal.Store(&test.failure)
 			for _, jsonOutput := range []bool{true, false} {
 				args := []string{"--node-config=" + config, "node", "setup-oci", "--recreate"}
 				if jsonOutput {
@@ -83,21 +84,27 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 				if err := json.Unmarshal([]byte(output), &response); err != nil || response.Error.Code != "host_vm_recreate_blocked" || response.Error.Retryable {
 					t.Fatalf("output=%s decode=%v", output, err)
 				}
-				if len(test.failure.Blockers) != 0 {
+				failure, inventory := test.failure.(*lima.RecreateBlockedError)
+				switch {
+				case !inventory:
+					if response.Error.Details["reason"] != ocicontrol.HostVMBaseUnreadableReason {
+						t.Fatalf("lost base-unreadable reason: %s", output)
+					}
+				case len(failure.Blockers) != 0:
 					if _, ok := response.Error.Details["reason"]; ok {
 						t.Fatalf("empty reason: %s", output)
 					}
 					blockers, ok := response.Error.Details["blockers"].([]any)
-					if !ok || len(blockers) != len(test.failure.Blockers) {
+					if !ok || len(blockers) != len(failure.Blockers) {
 						t.Fatalf("lost blockers: %s", output)
 					}
-					for i, want := range test.failure.Blockers {
+					for i, want := range failure.Blockers {
 						if blockers[i] != want || !strings.Contains(response.Error.Message, want) {
 							t.Fatalf("lost blocker %q: %s", want, output)
 						}
 					}
-				} else {
-					if response.Error.Details["reason"] != test.failure.Reason {
+				default:
+					if response.Error.Details["reason"] != failure.Reason {
 						t.Fatalf("lost unknown-inventory reason: %s", output)
 					}
 					if _, ok := response.Error.Details["blockers"]; ok {

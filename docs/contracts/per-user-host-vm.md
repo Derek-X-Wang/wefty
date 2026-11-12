@@ -51,7 +51,8 @@ node-agent start.
 After the helper install, preparation reads the guest's `/etc/os-release` and
 records the guest OS release in the instance directory (`wefty-guest-os.json`).
 An existing host VM keeps the base it was created from; a newer template base
-is reported as an advisory "base upgrade available" (see
+is reported as an advisory "base upgrade available". Only `setup-oci --recreate`
+applies it, after a fresh read of the running guest (see
 `agent-local-lifecycle.md`).
 
 A repeated setup uses the saved assets and fixed sizing without requiring the

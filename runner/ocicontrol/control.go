@@ -188,6 +188,14 @@ const (
 	ErrorInternal                 contract.ErrorCode = contract.ErrorInternal
 )
 
+// HostVMBaseUnreadableReason is details.reason on a host_vm_recreate_blocked
+// refusal when --recreate cannot read the guest OS release (#1593).
+const HostVMBaseUnreadableReason = "guest_os_unreadable"
+
+// HostVMBaseField names the host VM base in SetupResponse.Differences when
+// `setup-oci --recreate` applies a base upgrade. It is not a SetupState field.
+const HostVMBaseField = "guest_os"
+
 type ControlError struct {
 	Code    contract.ErrorCode
 	Status  int

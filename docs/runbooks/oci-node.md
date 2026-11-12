@@ -71,7 +71,7 @@ wefty node oci off
 
 `oci always-on` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci off` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
-An unchanged setup rerun causes no restart, intent revision, or capability revision. On a Mac, setup also prints the host VM base: the observed guest OS against the template's. A difference reads "base upgrade available" and is advisory; it never blocks setup, and staying on the current base is supported. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation, Backup copy, service data or Custody write record remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
+An unchanged setup rerun causes no restart, intent revision, or capability revision. On a Mac, setup also prints the host VM base: the observed guest OS against the template's. A difference reads "base upgrade available" and is advisory; it never blocks setup, and staying on the current base is supported. Only `--recreate` applies it: setup then reads the running guest, and a different base makes the run a recreate under the guard below, listed as `guest_os` in the differences. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation, Backup copy, service data or Custody write record remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
 Stopped Computers keep their Storage and therefore block recreation too.
 Stopped service data and owner records also block. For a known job with a valid
@@ -470,7 +470,7 @@ Meaning: the observed guest OS matches the base the setup template boots. The de
 
 ## doctor-code-oci-host-vm-base-upgrade-available
 
-Meaning: the observed guest OS is older or different from the template's base, for example `ubuntu-24.04` against `ubuntu-26.04`. This is advisory and the finding passes: staying on the current base is supported, and a plain `setup-oci` still applies sizing and probe changes. Kernel-gated features fall back on an older guest kernel. First action: none required.
+Meaning: the observed guest OS is older or different from the template's base, for example `ubuntu-24.04` against `ubuntu-26.04`. This is advisory and the finding passes: staying on the current base is supported, and a plain `setup-oci` still applies sizing and probe changes. Kernel-gated features fall back on an older guest kernel. First action: none required. To upgrade, rerun setup with `--recreate`: it reads the running guest again, then recreates the host VM under the same guard as any recreate (zero live OCI attempts and a positive absence proof for Computer Storage, Backup copies, service data and Custody write records). A node that holds any of those cannot upgrade its base this way yet.
 
 ## doctor-code-oci-boot-sweep-not-recorded
 
@@ -634,6 +634,9 @@ Meaning: topology or mount-root change requires instance recreation. Evidence: r
 with `retryable=false`. In JSON, nonempty `details.blockers` names Computer,
 Storage, Backup, copy, service/job and Custody export identities and gives each
 blocker's action. `details.reason` explains an unavailable or invalid inventory.
+`details.reason = "guest_os_unreadable"` means `--recreate` could not read the
+running guest's OS release, so it did not decide the base upgrade and changed
+nothing: start OCI so the host VM runs, then rerun setup with `--recreate`.
 Human output carries the same explanation.
 
 - Service data with a known job and a valid owner record: save any data you need,
