@@ -26,7 +26,7 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     "linux.removal"
   ];
   . as $root |
-  .version == 5 and
+  .version == 6 and
   .platform == "linux/amd64" and
   .candidate_sha == $candidate and
   .image.variant == $image and
@@ -45,6 +45,8 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
   (.resource_caps.memory_bytes > 0 and .resource_caps.disk_bytes > 0 and .resource_caps.backup_cap == 4 and .resource_caps.submit_max_inflight == 20) and
   (.timings.l1_lease != "" and .timings.l1_node_dead != "" and .timings.l3_reconcile == "production-default") and
   (.deviations | any(.id == "dev.plain_fabric_identity" and .status == "DEVIATION")) and
+  (.deviations | any(.id == "dev.short_storage_failure_budget" and .status == "DEVIATION")) and
+  (.timings.l1_storage_failure_count == "5" and .timings.l1_storage_failure_window == "30s") and
   ((.rows | keys) == (required_rows | sort)) and
   ([.rows[] | select(.status == "MISSING")] | length == 0) and
   ([.rows[] | select(.started_at == null or .completed_at == null or (.assertions | length) == 0)] | length == 0) and
@@ -198,7 +200,30 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
     .rows["linux.storage_provenance"].status == "FAIL"
    else
     .rows["linux.storage_provenance"].status == "PASS" and
-    (.rows["linux.storage_provenance"].evidence.restore_token_revocation_receipt | contains("revoke_all=true"))
+    (.rows["linux.storage_provenance"].evidence.restore_token_revocation_receipt | contains("revoke_all=true")) and
+    .rows["linux.storage_provenance"].assertions.backup_budget_failed_live and
+    .rows["linux.storage_provenance"].assertions.restore_quarantine_failed_live and
+    .rows["linux.storage_provenance"].assertions.clone_budget_failed_live and
+    .rows["linux.storage_provenance"].assertions.import_budget_failed_live and
+    .rows["linux.storage_provenance"].assertions.restore_cleanup_owed_live
+   end) and
+  (if $mutated == "linux.reconfiguration" then
+    .rows["linux.reconfiguration"].status == "FAIL"
+   else
+    .rows["linux.reconfiguration"].status == "PASS" and
+    .rows["linux.reconfiguration"].assertions.grow_budget_failed_live and
+    .rows["linux.reconfiguration"].assertions.reset_budget_counted_live
+   end) and
+  (if $mutated == "linux.removal" then
+    .rows["linux.removal"].status == "FAIL"
+   else
+    .rows["linux.removal"].status == "PASS" and
+    .rows["linux.removal"].assertions.stop_reimage_remove_verified_live and
+    .rows["linux.removal"].assertions.rotated_job_never_ran_live and
+    .rows["linux.removal"].assertions.rotated_removal_residue_absent_live and
+    .rows["linux.removal"].assertions.rotated_removal_not_pending_live and
+    .rows["linux.removal"].assertions.rotated_removal_helper_session_kept_live and
+    .rows["linux.removal"].evidence.rotated_removal_outcome == "removed_verified"
    end) and
   (if $mutated == "linux.guest_authority" then
     .rows["linux.guest_authority"].status == "FAIL"

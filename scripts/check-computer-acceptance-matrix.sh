@@ -44,7 +44,22 @@ required_rows='[
   "mac.reference_image_narrowness"
 ]'
 
-verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_sha" \
+# The named assertions a Linux row must carry before it may claim PASS: the
+# Computer Storage liveness proofs (#1624, #1634). A row that passes on other
+# assertions alone has not run them.
+required_assertions='{
+  "linux.reconfiguration": ["grow_budget_failed_live","reset_budget_counted_live"],
+  "linux.storage_provenance": [
+    "backup_budget_failed_live","restore_quarantine_failed_live","clone_budget_failed_live",
+    "import_budget_failed_live","restore_cleanup_owed_live"
+  ],
+  "linux.removal": [
+    "stop_reimage_remove_verified_live","rotated_job_never_ran_live","rotated_removal_residue_absent_live",
+    "rotated_removal_not_pending_live","rotated_removal_helper_session_kept_live"
+  ]
+}'
+
+verdict=$(jq -r --argjson required "$required_rows" --argjson assertions "$required_assertions" --arg candidate "$candidate_sha" \
   --arg source "$evidence_source" --arg environment "$runner_environment" \
   --arg mutated "$mutated_row" '
   def names(predicate): [.rows // {} | .[] | select(predicate) | .id] | join(", ");
@@ -81,6 +96,9 @@ verdict=$(jq -r --argjson required "$required_rows" --arg candidate "$candidate_
         | if length > 0 then "untyped skips without an owning ticket and reason: \(.)" else empty end),
       (names(.status == "PASS" and (((.assertions | length) + (.attested | length)) == 0 or ([.assertions[] | select(. == false)] | length) > 0))
         | if length > 0 then "rows claim PASS without earning it: \(.)" else empty end),
+      (names(.status == "PASS" and ((.id // "") as $id | (.assertions // {}) as $carried
+          | [($assertions[$id] // [])[] | select($carried[.] != true)] | length > 0))
+        | if length > 0 then "rows claim PASS without their Storage liveness assertions: \(.)" else empty end),
       (names(.status == "PASS" and (.gaps | length) > 0)
         | if length > 0 then "rows claim PASS while declaring a gap: \(.)" else empty end),
 

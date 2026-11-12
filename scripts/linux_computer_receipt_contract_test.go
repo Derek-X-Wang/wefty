@@ -87,6 +87,45 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"guest authority skip names the closed M3 OCI matrix": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.guest_authority"].(map[string]any)["not_run_issue"] = 157
 		},
+		"previous receipt version": func(receipt map[string]any) {
+			receipt["version"] = 5
+		},
+		"short Storage failure budget not declared as a deviation": func(receipt map[string]any) {
+			receipt["deviations"] = []map[string]string{{"id": "dev.plain_fabric_identity", "status": "DEVIATION"}}
+		},
+		"Storage failure budget window not recorded": func(receipt map[string]any) {
+			delete(receipt["timings"].(map[string]string), "l1_storage_failure_window")
+		},
+		"missing Backup budget assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]bool), "backup_budget_failed_live")
+		},
+		"missing restore quarantine assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]bool), "restore_quarantine_failed_live")
+		},
+		"missing clone budget assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]bool), "clone_budget_failed_live")
+		},
+		"missing import budget assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]bool), "import_budget_failed_live")
+		},
+		"missing restore cleanup-owed assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]bool), "restore_cleanup_owed_live")
+		},
+		"missing grow budget assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.reconfiguration"].(map[string]any)["assertions"].(map[string]bool), "grow_budget_failed_live")
+		},
+		"missing reset budget assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.reconfiguration"].(map[string]any)["assertions"].(map[string]bool), "reset_budget_counted_live")
+		},
+		"missing stop, reimage, remove assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.removal"].(map[string]any)["assertions"].(map[string]bool), "stop_reimage_remove_verified_live")
+		},
+		"rotated removal did not keep the helper session": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.removal"].(map[string]any)["assertions"].(map[string]bool), "rotated_removal_helper_session_kept_live")
+		},
+		"rotated removal outcome is reduced": func(receipt map[string]any) {
+			receipt["rows"].(map[string]any)["linux.removal"].(map[string]any)["evidence"].(map[string]string)["rotated_removal_outcome"] = "removed_reduced"
+		},
 		"missing restore token revocation evidence": func(receipt map[string]any) {
 			receipt["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["evidence"] = map[string]string{}
 		},
@@ -309,6 +348,15 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 	guest["evidence"] = map[string]string{"blocked_assertion": "candidate-bound root Run execution result"}
 	storage := rows["linux.storage_provenance"].(map[string]any)
 	storage["evidence"] = map[string]string{"restore_token_revocation_receipt": "operation_revision=9 revoke_all=true computer_id=computer-1"}
+	storage["assertions"] = map[string]bool{"live_product_path": true, "backup_budget_failed_live": true,
+		"restore_quarantine_failed_live": true, "clone_budget_failed_live": true, "import_budget_failed_live": true,
+		"restore_cleanup_owed_live": true}
+	rows["linux.reconfiguration"].(map[string]any)["assertions"] = map[string]bool{"live_product_path": true,
+		"grow_budget_failed_live": true, "reset_budget_counted_live": true}
+	rows["linux.removal"].(map[string]any)["assertions"] = map[string]bool{"live_product_path": true,
+		"stop_reimage_remove_verified_live": true, "rotated_job_never_ran_live": true,
+		"rotated_removal_residue_absent_live": true, "rotated_removal_not_pending_live": true,
+		"rotated_removal_helper_session_kept_live": true}
 	crossover := rows["linux.screen_crossover_refused"].(map[string]any)
 	crossover["assertions"] = map[string]bool{"crossover_refused": true}
 	crossoverEvidence := map[string]string{
@@ -360,10 +408,11 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"helper_http_body": "wefty-computer-egress-v1", "node_listener_ipv4_address": "198.18.0.1:45000", "node_listener_ipv4_outcome": "refused", "node_listener_ipv4_errno": "ECONNREFUSED",
 		"node_listener_ipv6_address": "[fe80::1%eth0]:45000", "node_listener_ipv6_outcome": "refused", "node_listener_ipv6_errno": "EADDRNOTAVAIL",
 	}
-	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route"}
+	rows["linux.removal"].(map[string]any)["evidence"] = map[string]string{"inventory_source": "helper VerifyNamespaceReadOnly route",
+		"rotated_removal_outcome": "removed_verified"}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	return map[string]any{
-		"version":       5,
+		"version":       6,
 		"status":        "NOT-RUN",
 		"not_run_issue": 196,
 		"candidate_sha": candidate,
@@ -385,9 +434,11 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"resource_caps": map[string]any{
 			"memory_bytes": 1073741824, "disk_bytes": 134217728, "backup_cap": 4, "submit_max_inflight": 20,
 		},
-		"timings":    map[string]string{"l1_lease": "30s", "l1_node_dead": "2m", "l3_reconcile": "production-default"},
-		"deviations": []map[string]string{{"id": "dev.plain_fabric_identity", "status": "DEVIATION"}},
-		"rows":       rows,
+		"timings": map[string]string{"l1_lease": "30s", "l1_node_dead": "2m", "l3_reconcile": "production-default",
+			"l1_storage_failure_count": "5", "l1_storage_failure_window": "30s"},
+		"deviations": []map[string]string{{"id": "dev.plain_fabric_identity", "status": "DEVIATION"},
+			{"id": "dev.short_storage_failure_budget", "status": "DEVIATION"}},
+		"rows": rows,
 		"residue_inventories": map[string]any{
 			"post_removal_helper_namespace": map[string]any{},
 		},

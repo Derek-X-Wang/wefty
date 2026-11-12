@@ -664,6 +664,10 @@ whose revision the Computer no longer holds writes nothing and is answered
 `attempt_not_owned`; another fence is `stale_fence`. Each answer carries a
 `retry_after_seconds` pacing hint (15 seconds doubling to 5 minutes), so an
 operation that cannot succeed ends 10 to 15 minutes after its first failure.
+The window and the pace are compile-time constants of L1. The acceptance lane
+builds its own L1 with the `acceptance_short_storage_budget` tag (30 seconds;
+2 to 8 seconds), keeping the rule and the count; no product binary reads either
+value from a flag or the environment.
 
 Ending an operation deletes nothing on the Node. It releases L1 orchestration,
 retires never-published staging rows as other exits already do, and leaves the

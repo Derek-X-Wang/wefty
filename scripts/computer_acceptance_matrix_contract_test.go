@@ -67,8 +67,8 @@ func TestComputerAcceptanceMatrixCoversEverySpecCell(t *testing.T) {
 			if got := rows["mac.reference_image_narrowness"].(map[string]any)["spec_refs"]; got != "11 item 4" {
 				t.Fatalf("the narrowness row cites %v, want the section 11 item 4 amendment", got)
 			}
-			if got := int(matrix["linux_evidence"].(map[string]any)["receipt_version"].(float64)); got != 5 {
-				t.Fatalf("linux receipt_version = %d, want the unbumped 5", got)
+			if got := int(matrix["linux_evidence"].(map[string]any)["receipt_version"].(float64)); got != 6 {
+				t.Fatalf("linux receipt_version = %d, want the receipt's own 6", got)
 			}
 		})
 	}
@@ -239,6 +239,12 @@ func TestComputerAcceptanceMatrixGate(t *testing.T) {
 					matrix["rows"].(map[string]any)["mac.service_missing"] = nil
 					delete(matrix["rows"].(map[string]any), "mac.service_missing")
 					matrix["rows"].(map[string]any)["mac.storage_provenance"].(map[string]any)["status"] = "MISSING"
+				},
+				"Linux row passing without a Storage liveness assertion": func(matrix map[string]any) {
+					delete(matrix["rows"].(map[string]any)["linux.removal"].(map[string]any)["assertions"].(map[string]any), "stop_reimage_remove_verified_live")
+				},
+				"Linux row passing with a missing budget assertion": func(matrix map[string]any) {
+					delete(matrix["rows"].(map[string]any)["linux.storage_provenance"].(map[string]any)["assertions"].(map[string]any), "restore_cleanup_owed_live")
 				},
 				"Linux evidence bound to another commit": func(matrix map[string]any) {
 					matrix["linux_evidence"].(map[string]any)["commit"] = strings.Repeat("d", 40)
@@ -475,8 +481,18 @@ func copyComputerMatrix(t *testing.T, matrix map[string]any) map[string]any {
 	return copied
 }
 
+// computerMatrixLinuxLivenessAssertions are the Computer Storage liveness
+// assertions the matrix gate requires of a passing Linux row (#1624, #1634).
+var computerMatrixLinuxLivenessAssertions = map[string][]string{
+	"linux.reconfiguration": {"grow_budget_failed_live", "reset_budget_counted_live"},
+	"linux.storage_provenance": {"backup_budget_failed_live", "restore_quarantine_failed_live", "clone_budget_failed_live",
+		"import_budget_failed_live", "restore_cleanup_owed_live"},
+	"linux.removal": {"stop_reimage_remove_verified_live", "rotated_job_never_ran_live", "rotated_removal_residue_absent_live",
+		"rotated_removal_not_pending_live", "rotated_removal_helper_session_kept_live"},
+}
+
 // conformantLinuxComputerEvidence mirrors the realtiming evidence directory the
-// Linux Computer lane uploads: the version-5 typed receipt plus its provenance.
+// Linux Computer lane uploads: the version-6 typed receipt plus its provenance.
 func conformantLinuxComputerEvidence(t *testing.T) string {
 	t.Helper()
 	return writeLinuxComputerEvidence(t, func(rows map[string]any) {
@@ -510,9 +526,13 @@ func writeLinuxComputerEvidence(t *testing.T, mutate func(map[string]any)) strin
 		if !strings.HasPrefix(id, "linux.") {
 			continue
 		}
+		assertions := map[string]any{"live_product_path": true}
+		for _, name := range computerMatrixLinuxLivenessAssertions[id] {
+			assertions[name] = true
+		}
 		rows[id] = map[string]any{
 			"id": id, "proof": "live product path", "status": "PASS",
-			"assertions":   map[string]any{"live_product_path": true},
+			"assertions":   assertions,
 			"evidence":     map[string]any{"computer_id": "computer-1"},
 			"started_at":   "2026-08-29T00:00:00Z",
 			"completed_at": "2026-08-29T00:01:00Z",
@@ -520,7 +540,7 @@ func writeLinuxComputerEvidence(t *testing.T, mutate func(map[string]any)) strin
 	}
 	mutate(rows)
 	receipt := map[string]any{
-		"version": 5, "status": "NOT-RUN", "not_run_issue": computerMatrixLinuxSkipIssue,
+		"version": 6, "status": "NOT-RUN", "not_run_issue": computerMatrixLinuxSkipIssue,
 		"candidate_sha": computerMatrixCandidate, "platform": "linux/amd64",
 		"image": map[string]any{"variant": "xfce"}, "rows": rows,
 	}
