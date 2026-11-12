@@ -2921,6 +2921,17 @@ func TestLegacyComputerRemovalReconstructsPreparedStorageWithoutRuntimeAttempt(t
 	if !attempts[0].StorageOnly || attempts[0].ComputerStorage == nil || len(attempts[0].RemovalResources()) != 9 {
 		t.Fatalf("prepared Computer reconstruction invented runtime rows: %+v", attempts[0])
 	}
+	// The witness names the Job that prepared the Storage; after L1 replaced
+	// the stopped Computer's Job, the removal names another (#1607).
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.JobID = "job-that-prepared"
+	if attempts, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err != nil || len(attempts) != 1 {
+		t.Fatalf("prepared Computer reconstruction after a Job rotation = %+v err=%v", attempts, err)
+	}
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.NodeID = "node-other"
+	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
+		t.Fatal("prepared Computer reconstruction accepted a witness from another Node")
+	}
+	engine.inventoryRemoval.Attempts[0].StoragePreparation.NodeID = "node"
 	engine.inventoryRemoval.Attempts[0].Authority.FencingToken = "stale-cleanup"
 	if _, err := adapter.ReconstructRuntimeRemoval(t.Context(), request); err == nil {
 		t.Fatal("prepared Computer reconstruction accepted stale cleanup authority")

@@ -44,9 +44,31 @@ func TestReimageAcceptsVerifiedNeverAttachedResetSuccessor(t *testing.T) {
 		evidence.resetPreparationReceiptID != receipt.ReceiptID || evidence.attemptID != "" || evidence.fencingToken != "" {
 		t.Fatalf("reset-successor reimage evidence = %+v ok=%t", evidence, ok)
 	}
-	request.Authority.OldJobID = "different-job"
+	// After L1 replaced the stopped Computer's Job, possibly more than once,
+	// the receipt still names the Job that ran the reset (#1607).
+	for _, oldJobID := range []string{"rotated-job", "rotated-again-job"} {
+		request.Authority.OldJobID = oldJobID
+		if _, ok := reimageDetachmentEvidence(manifest, request); !ok {
+			t.Fatalf("reset-successor preparation refused rotated Job %q", oldJobID)
+		}
+	}
+	request.Authority.OldJobID = ""
 	if _, ok := reimageDetachmentEvidence(manifest, request); ok {
-		t.Fatal("reset-successor preparation authorized a different prior Job")
+		t.Fatal("reset-successor preparation authorized an unnamed prior Job")
+	}
+	for _, mutate := range []func(*ComputerStorageResetReceipt){
+		func(r *ComputerStorageResetReceipt) { r.JobID = "" },
+		func(r *ComputerStorageResetReceipt) { r.NodeID = "node-other" },
+		func(r *ComputerStorageResetReceipt) { r.StorageID = "storage-other" },
+	} {
+		changed := receipt
+		mutate(&changed)
+		broken := manifest
+		broken.PreparationReceipt = &changed
+		request.Authority.OldJobID = "rotated-job"
+		if _, ok := reimageDetachmentEvidence(broken, request); ok {
+			t.Fatalf("reset-successor preparation accepted an incomplete or foreign receipt %+v", changed)
+		}
 	}
 	request.Authority.OldJobID = preparation.JobID
 
