@@ -48,6 +48,12 @@ helper and probe in the new host VM before recovery. A recreate removes the
 prepared receipt first, so an interrupted cycle is prepared again at the next
 node-agent start.
 
+After the helper install, preparation reads the guest's `/etc/os-release` and
+records the guest OS release in the instance directory (`wefty-guest-os.json`).
+An existing host VM keeps the base it was created from; a newer template base
+is reported as an advisory "base upgrade available" (see
+`agent-local-lifecycle.md`).
+
 A repeated setup uses the saved assets and fixed sizing without requiring the
 input flag again. It does not reload unchanged services. Node-agent startup
 checks that `LIMA_HOME` agrees with its saved configuration. Guest installation

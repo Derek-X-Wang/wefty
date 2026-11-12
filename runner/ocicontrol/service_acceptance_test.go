@@ -16,8 +16,10 @@ func TestServiceAcceptanceNodeDoctorIsFactsOnly(t *testing.T) {
 	if err := report.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// The healthy config has no Lima host VM, so the lima check and the host
+	// VM base built on it are not applicable rather than skipped (#1593).
 	for _, item := range report.Findings {
-		if item.Outcome == DiagnosticNotRun && item.Check != "lima" {
+		if item.Outcome == DiagnosticNotRun && item.Check != "lima" && !(item.Check == "host-vm-base" && item.NotRunCause == NotRunNotApplicable) {
 			t.Fatalf("configured doctor check did not run: %+v", item)
 		}
 	}

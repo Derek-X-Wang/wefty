@@ -479,7 +479,25 @@ Configure-only setup writes a separate desired-state receipt before returning
 a restart/recreate refusal. The applied receipt advances only after authorized
 convergence, so doctor derives unchanged, live-safe, restart-required, or
 recreate-required by comparing current with desired rather than echoing the
-last probe reason.
+last probe reason. The setup result and the doctor convergence finding name
+each differing setup-state field and the flag that applies it.
+
+The host VM base is not part of that comparison (#1593). The node agent reads
+the guest OS release (`ID-VERSION_ID` from the guest's `/etc/os-release`) when
+it prepares a Lima host VM, and records it in the instance directory as
+`wefty-guest-os.json`. A failed or stuck read leaves the base unknown and is
+logged; it never stops the node agent. The record is written only from that observation, never
+from the template or the desired state, and a recreate's `limactl delete`
+removes it with the VM it describes. The setup state format does not change,
+so an older build never meets the record. The desired base is the release the
+rendered template boots. A plain `setup-oci` run reports the current and
+desired base and never blocks on a difference. A difference is advisory: doctor's
+`host-vm-base` finding passes with "base upgrade available", and staying on the
+current base is supported. An unobserved or unreadable record is unknown: it
+is never treated as a difference. Doctor also shows the guest kernel, read live
+when the host VM answers; the kernel is not converged on, because it changes
+inside the guest. This is macOS only. A Linux node has no host VM: setup
+reports no base and doctor reports `host-vm-base` as not applicable.
 
 Every host VM recreate, including a per-user installation's recreate, passes
 the same guard immediately before Lima deletion, under the Lima lifecycle
