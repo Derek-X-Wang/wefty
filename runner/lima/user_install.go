@@ -184,6 +184,15 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 	if err := ops.install(ctx, helper); err != nil {
 		return err
 	}
+	if err := recordGuestOSAdvisory(ctx, func() ([]byte, error) {
+		release, err := guest("cat", "/etc/os-release")
+		if err != nil {
+			return nil, errors.New("cannot read Lima guest /etc/os-release")
+		}
+		return release, nil
+	}, c.LimaHome, c.Instance, time.Now()); err != nil {
+		return err
+	}
 	if c.Instance == "wefty-proof" {
 		var start *time.Time
 		if !hostStarted.IsZero() {

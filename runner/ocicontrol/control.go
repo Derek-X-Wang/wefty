@@ -57,12 +57,18 @@ type SetupRequest struct {
 }
 
 type SetupResponse struct {
-	Configured        bool                          `json:"configured"`
-	Intent            lima.OCIIntent                `json:"intent"`
-	Convergence       ConvergenceClass              `json:"convergence"`
-	ProbePreloaded    bool                          `json:"probe_preloaded"`
-	RestartApplied    bool                          `json:"restart_applied,omitempty"`
-	RecreateApplied   bool                          `json:"recreate_applied,omitempty"`
+	Configured      bool             `json:"configured"`
+	Intent          lima.OCIIntent   `json:"intent"`
+	Convergence     ConvergenceClass `json:"convergence"`
+	ProbePreloaded  bool             `json:"probe_preloaded"`
+	RestartApplied  bool             `json:"restart_applied,omitempty"`
+	RecreateApplied bool             `json:"recreate_applied,omitempty"`
+	// Differences names the setup-state fields that differ from the applied
+	// state when this request was classified.
+	Differences []string `json:"differences,omitempty"`
+	// Base reports the host VM guest OS against the template's. It is
+	// advisory: a plain run never blocks on it (#1593). Absent off Lima.
+	Base              *lima.HostVMBase              `json:"base,omitempty"`
 	ReasonCode        contract.CapabilityReasonCode `json:"reason_code,omitempty"`
 	MissingCapability string                        `json:"missing_capability,omitempty"`
 	Runbook           string                        `json:"runbook,omitempty"`

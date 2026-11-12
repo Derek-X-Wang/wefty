@@ -44,6 +44,12 @@ serialized, inventory-guarded delete in `runner/lima/supervisor.go`. It refuses
 while Computer Storage, Backup copies, service data or Custody write records
 remain, or their absence cannot be proved (see `agent-local-lifecycle.md`).
 
+After the helper install, preparation reads the guest's `/etc/os-release` and
+records the guest OS release in the instance directory (`wefty-guest-os.json`).
+An existing host VM keeps the base it was created from; a newer template base
+is reported as an advisory "base upgrade available" (see
+`agent-local-lifecycle.md`).
+
 A repeated setup uses the saved assets and fixed sizing without requiring the
 input flag again. It does not reload unchanged services. Node-agent startup
 checks that `LIMA_HOME` agrees with its saved configuration. Guest installation
