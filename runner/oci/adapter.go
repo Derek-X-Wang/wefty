@@ -451,6 +451,7 @@ func (adapter *Adapter) AttestRuntimeRemoval(ctx context.Context, request worklo
 			StorageOnly:        attempt.StorageOnly,
 			StorageAbsent:      attempt.StorageAbsent,
 			StoragePreparation: attempt.StoragePreparation,
+			StorageDetachment:  attempt.StorageDetachment,
 			Resources:          helperResources,
 		})
 	}
@@ -538,16 +539,35 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 		if request.ComputerStorage != nil && !helperAttempt.StorageOnly {
 			return nil, errors.New("legacy OCI per-generation inventory returned runtime attempt evidence")
 		}
+		if !helperAttempt.StorageOnly && helperAttempt.StorageDetachment != nil {
+			return nil, errors.New("legacy OCI removal inventory returned runtime attempt evidence with Storage detachment evidence")
+		}
+		// Three closed Storage-only arms: absent, prepared (never attached),
+		// and detached (once attached, positively detached; #1611).
+		detachedArm := helperAttempt.StorageOnly && !helperAttempt.StorageAbsent &&
+			contract.ValidStorageDetachedRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)
 		validStorageAttempt := helperAttempt.StorageOnly &&
 			((helperAttempt.StorageAbsent && contract.ValidStorageAbsentRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)) ||
-				(!helperAttempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)))
+				(!helperAttempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, helperAttempt.ComputerStorage.StorageGeneration)) ||
+				detachedArm)
 		if helperAttempt.StorageOnly && (authority.BootSessionID != request.BootSessionID || authority.FencingToken != request.CleanupFence || !validStorageAttempt) {
 			return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without current cleanup authority")
 		}
-		if helperAttempt.StorageOnly && helperAttempt.StorageAbsent && helperAttempt.StoragePreparation != nil {
+		if helperAttempt.StorageOnly && helperAttempt.StorageAbsent && (helperAttempt.StoragePreparation != nil || helperAttempt.StorageDetachment != nil) {
 			return nil, errors.New("legacy OCI removal inventory returned already-absent Storage with preparation evidence")
 		}
-		if helperAttempt.StorageOnly && !helperAttempt.StorageAbsent && (helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
+		if detachedArm {
+			witness := helperAttempt.StorageDetachment
+			if helperAttempt.StoragePreparation != nil || witness == nil || !witness.Valid() ||
+				witness.NodeID != request.NodeID || witness.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
+				witness.StorageID != helperAttempt.ComputerStorage.StorageID ||
+				witness.StorageGeneration != helperAttempt.ComputerStorage.StorageGeneration ||
+				witness.HelperGeneration != response.HelperSession.SessionGeneration ||
+				(witness.EvidenceKind == contract.ComputerStorageDetachSameBootReap && witness.AttachedBootSessionID != request.BootSessionID) {
+				return nil, errors.New("legacy OCI removal inventory returned Storage-only evidence without a matching current detachment witness")
+			}
+		}
+		if helperAttempt.StorageOnly && !helperAttempt.StorageAbsent && !detachedArm && (helperAttempt.StorageDetachment != nil || helperAttempt.StoragePreparation == nil || !helperAttempt.StoragePreparation.Valid() ||
 			helperAttempt.StoragePreparation.NodeID != request.NodeID || helperAttempt.StoragePreparation.RootInstanceID != request.RootInstanceID ||
 			helperAttempt.StoragePreparation.ComputerID != helperAttempt.ComputerStorage.ComputerID ||
 			helperAttempt.StoragePreparation.StorageID != helperAttempt.ComputerStorage.StorageID ||
@@ -565,7 +585,7 @@ func (adapter *Adapter) ReconstructRuntimeRemoval(ctx context.Context, request w
 			AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
 			WorkloadClass: authority.Class, RemovalGeneration: authority.RemovalGeneration,
 			HandoffVolume: helperAttempt.HandoffVolume, StorageOnly: helperAttempt.StorageOnly, StorageAbsent: helperAttempt.StorageAbsent,
-			StoragePreparation: helperAttempt.StoragePreparation,
+			StoragePreparation: helperAttempt.StoragePreparation, StorageDetachment: helperAttempt.StorageDetachment,
 		}
 		if !helperAttempt.StorageOnly {
 			identity, identityErr := ocihelper.DeterministicResourceIdentity(authority)

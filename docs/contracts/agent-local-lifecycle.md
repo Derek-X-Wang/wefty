@@ -1047,7 +1047,14 @@ exact helper manifest is prepared by a durable reset/copy receipt, unattached,
 has no loop or mount, and has no prior attachment or retirement evidence is
 frozen as prepared Storage-only evidence. A generation whose exact managed
 disk root is already absent is frozen as distinct typed absent-Storage
-evidence; the helper never creates the missing root to prove that fact. Legacy
+evidence; the helper never creates the missing root to prove that fact. A
+once-attached generation whose latest attach/detach record is a detach, with
+no mount or loop, is frozen as detached Storage-only evidence (#1611). Its
+witness names the last attachment, which may belong to a Job L1 has since
+replaced. A refresh may restamp it only with the same last attachment; a
+changed last attachment, or a change between detached and prepared, refuses
+the refresh. Any arm may refresh to absent. A detached generation is deleted
+with the full helper check, never as already absent. Legacy
 reconstruction scans the Job's runtime authorities once and each L1-claimed
 Storage generation once, then deduplicates only byte-identical authorities.
 The session still passes the complete generation inventory through the
@@ -1059,8 +1066,8 @@ receipt covers the Job while the helper independently finalizes every Storage
 generation claimed by L1; historical generations do not need to be relabelled
 as members of the current runtime attempt.
 The frozen manifest contains empty runtime identifiers and does not manufacture
-lease, task, container, or other attempt rows. After a reboot, prepared
-Storage-only evidence is re-inventoried and refreshed under the current helper
+lease, task, container, or other attempt rows. After a reboot, prepared and
+detached Storage-only evidence is re-inventoried and refreshed under the current helper
 session before it can produce a no-runtime receipt.
 
 Only that durable `no_runtime_resources` receipt permits the local managed

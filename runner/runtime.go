@@ -275,6 +275,10 @@ type RuntimeResourceManifest struct {
 	ServiceDataOwnerRecord string                                      `json:"service_data_owner_record,omitempty"`
 	ComputerStorage        *ComputerStorage                            `json:"computer_storage,omitempty"`
 	StoragePreparation     *contract.ComputerStoragePreparationWitness `json:"storage_preparation,omitempty"`
+	// StorageDetachment is helper evidence that a once-attached generation is
+	// positively detached (#1611); with StorageOnly it is the third arm, beside
+	// StoragePreparation (never attached) and StorageAbsent (already deleted).
+	StorageDetachment *contract.ComputerStorageDetachmentWitness `json:"storage_detachment,omitempty"`
 	// StorageOnly reuses the shared removal manifest for a reset predecessor
 	// after successor publication. No synthetic runtime rows are invented.
 	StorageOnly bool `json:"storage_only,omitempty"`
