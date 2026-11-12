@@ -4,7 +4,6 @@ import (
 	"context"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -19,22 +18,21 @@ const defaultWriteLockLogThreshold = 2 * time.Second
 // checkout included) and the hold runs from BEGIN to commit or rollback,
 // including the commit's fsync. One goroutine owns a transaction, and only
 // its first end is recorded: a deferred rollback after commit is ignored.
-// When the transaction's context ends first, database/sql rolls it back on its
-// own, after any in-flight statement returns, and may finish after the owner
-// has returned. Nothing here can observe that completion, so every canceled
-// write transaction is logged, whatever its timing: outcome=canceled with
-// hold_ms up to the owner's end, canceled_after_ms, and release=unknown.
-// Canceled writes are rare outside a stall, and a stall is when they matter.
+// When the transaction's context has ended and it did not commit,
+// database/sql may have rolled it back on its own, possibly finishing after the
+// owner returns. Nothing here observes that release, so every such transaction
+// is logged as event=l1_write_lock_canceled with release=unknown and the hold
+// up to the owner's end, whatever its timing. The check reads the context at
+// the end, so it cannot race a callback.
 type writeLockTiming struct {
-	store      *Store
-	name       string
-	pool       string
-	started    time.Time
-	waited     time.Duration
-	locked     time.Time
-	ended      bool
-	canceledAt atomic.Int64
-	stopCancel func() bool
+	store   *Store
+	name    string
+	pool    string
+	started time.Time
+	waited  time.Duration
+	locked  time.Time
+	ended   bool
+	ctx     context.Context
 }
 
 // startWriteLockTiming names the transaction after the function skip frames
@@ -55,9 +53,7 @@ func (s *Store) startWriteLockTiming(pool string, skip int) *writeLockTiming {
 func (t *writeLockTiming) acquired(ctx context.Context) {
 	t.locked = time.Now()
 	t.waited = t.locked.Sub(t.started)
-	if ctx != nil {
-		t.stopCancel = context.AfterFunc(ctx, func() { t.canceledAt.Store(time.Now().UnixNano()) })
-	}
+	t.ctx = ctx
 }
 
 func (t *writeLockTiming) beginFailed() {
@@ -71,14 +67,11 @@ func (t *writeLockTiming) end(outcome string) {
 		return
 	}
 	t.ended = true
-	if t.stopCancel != nil {
-		t.stopCancel()
-	}
 	held := time.Since(t.locked)
 	// A commit that succeeded released the lock itself, even if the context
 	// ended during it.
-	if canceled := t.canceledAt.Load(); canceled != 0 && outcome != "commit" {
-		t.logCanceled(held, time.Unix(0, canceled).Sub(t.locked))
+	if t.ctx != nil && t.ctx.Err() != nil && outcome != "commit" {
+		t.logCanceled(outcome, held)
 		return
 	}
 	t.log(outcome, held)
@@ -100,10 +93,10 @@ func (t *writeLockTiming) log(outcome string, held time.Duration) {
 		t.name, t.pool, outcome, t.waited.Milliseconds(), held.Milliseconds(), threshold.Milliseconds())
 }
 
-func (t *writeLockTiming) logCanceled(heldToOwnerEnd, canceledAfter time.Duration) {
+func (t *writeLockTiming) logCanceled(outcome string, heldToOwnerEnd time.Duration) {
 	if t.store.logf == nil {
 		return
 	}
-	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=canceled release=unknown wait_ms=%d hold_ms=%d canceled_after_ms=%d threshold_ms=%d",
-		t.name, t.pool, t.waited.Milliseconds(), heldToOwnerEnd.Milliseconds(), canceledAfter.Milliseconds(), t.threshold().Milliseconds())
+	t.store.logf("event=l1_write_lock_canceled tx=%s pool=%s outcome=%s release=unknown wait_ms=%d hold_ms=%d",
+		t.name, t.pool, outcome, t.waited.Milliseconds(), heldToOwnerEnd.Milliseconds())
 }

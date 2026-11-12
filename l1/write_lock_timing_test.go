@@ -41,6 +41,19 @@ func (l *writeLockLog) slow(name string) []string {
 	return found
 }
 
+// canceled returns the canceled-transaction lines for one transaction name.
+func (l *writeLockLog) canceled(name string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var found []string
+	for _, line := range l.lines {
+		if strings.HasPrefix(line, "event=l1_write_lock_canceled tx="+name+" ") {
+			found = append(found, line)
+		}
+	}
+	return found
+}
+
 func writeLockField(t *testing.T, line, field string) time.Duration {
 	t.Helper()
 	match := regexp.MustCompile(` ` + field + `=(\d+)`).FindStringSubmatch(line)
@@ -157,9 +170,8 @@ func holdThenCancelForTest(s *Store, held chan<- struct{}, released <-chan struc
 
 // When the transaction's context ends, database/sql rolls back on its own and
 // another writer can take the lock. The owner cannot see when that finished,
-// so every canceled write is logged: the hold up to the owner's end, when the
-// context ended, and release=unknown.
-func TestWriteLockCancellationIsAlwaysReported(t *testing.T) {
+// so the canceled transaction is reported with the hold up to its own end.
+func TestWriteLockCancellationIsReportedWithUnknownRelease(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
 	s.logf = log.logf
@@ -175,15 +187,12 @@ func TestWriteLockCancellationIsAlwaysReported(t *testing.T) {
 	if err := <-owner; err != nil {
 		t.Fatal(err)
 	}
-	lines := log.slow("l1.holdThenCancelForTest")
-	if len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled release=unknown ") {
+	lines := log.canceled("l1.holdThenCancelForTest")
+	if len(lines) != 1 || !strings.Contains(lines[0], " release=unknown ") || len(log.slow("l1.holdThenCancelForTest")) != 0 {
 		t.Fatalf("canceled holder lines = %q (all %q)", lines, log.lines)
 	}
-	if canceled := writeLockField(t, lines[0], "canceled_after_ms"); canceled < 150*time.Millisecond || canceled >= 300*time.Millisecond {
-		t.Fatalf("canceled_after = %s, want about the 150ms before cancellation", canceled)
-	}
 	if hold := writeLockField(t, lines[0], "hold_ms"); hold < 450*time.Millisecond {
-		t.Fatalf("hold upper bound = %s, want it to include the owner's 300ms return", hold)
+		t.Fatalf("hold = %s, want it to run to the owner's end", hold)
 	}
 }
 
@@ -196,12 +205,12 @@ func cancelQuicklyForTest(s *Store) error {
 	}
 	defer write.rollback()
 	cancel()
-	for ctx.Err() == nil {
-	}
-	time.Sleep(10 * time.Millisecond) // let the cancellation callback record
 	return nil
 }
 
+// The owner returns at once after cancellation, before database/sql's own
+// rollback can be assumed finished, and below any threshold. The report does
+// not depend on that rollback or on a callback having run.
 func TestQuickCanceledWriteIsStillReported(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
@@ -209,7 +218,7 @@ func TestQuickCanceledWriteIsStillReported(t *testing.T) {
 	if err := cancelQuicklyForTest(s); err != nil {
 		t.Fatal(err)
 	}
-	if lines := log.slow("l1.cancelQuicklyForTest"); len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled release=unknown ") {
+	if lines := log.canceled("l1.cancelQuicklyForTest"); len(lines) != 1 {
 		t.Fatalf("quick canceled write lines = %q (all %q)", lines, log.lines)
 	}
 }
