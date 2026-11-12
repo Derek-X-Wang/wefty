@@ -2201,6 +2201,7 @@
           "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Effective retained Backup cap. Zero disables creation; pruning is always explicit." },
           "last_backup_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "last_grow_operation": { "$ref": "#/components/schemas/ComputerStorageGrowOutcome" },
+          "last_reset_operation": { "$ref": "#/components/schemas/ComputerStorageResetOutcome" },
           "last_restore_revocation": { "$ref": "#/components/schemas/ComputerRestoreRevocationReceipt" },
           "restore_operation": { "$ref": "#/components/schemas/ComputerRestoreOperation", "description": "Present only when the read named a restore_operation_revision: that restore's own state." },
           "clone_operation": { "$ref": "#/components/schemas/ComputerCloneOperation", "description": "Present only when the read named a clone_operation_revision: that clone's own state." },
@@ -2386,11 +2387,12 @@
       "import_id": { "type": "string", "minLength": 1 },
       "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
       "status": { "enum": ["reserved", "complete", "failed", "superseded"] },
-      "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
+      "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
       "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
-      "completed_at": { "type": "string", "format": "date-time" }
+      "completed_at": { "type": "string", "format": "date-time" },
+      "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
     },
-    "description": "Durable revision-bound observation used by services custody import --wait."
+    "description": "Durable revision-bound observation used by services custody import --wait. failure is the import's failure budget once an attempt was reported failed; an import that spent it ends failed with the last report's class as failure_code (#1608)."
     },
     "ComputerCustodyImport": {
         "type": "object",
@@ -2466,10 +2468,11 @@
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["planned", "published", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached"] },
-          "completed_at": { "type": "string", "format": "date-time" }
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
+          "completed_at": { "type": "string", "format": "date-time" },
+          "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "Computer Backup operation observation. A planned status is still running and every other status is terminal: published succeeded; failed always carries a typed failure_code; superseded means a removal or dead-node abort overtook it. A superseded operation carries completed_at only once its planned copy's absence is recorded, so a caller judges the outcome by status, not by completed_at."
+        "description": "Computer Backup operation observation. A planned status is still running and every other status is terminal: published succeeded; failed always carries a typed failure_code, either a helper failure receipt's code (the copy is proven absent) or the class of the report that spent the failure budget (#1608; the copy is owed to removal); superseded means a removal or dead-node abort overtook it. A superseded operation carries completed_at only once its planned copy's absence is recorded, so a caller judges the outcome by status, not by completed_at."
       },
       "ComputerStorageGrowOutcome": {
         "type": "object",
@@ -2480,10 +2483,38 @@
           "status": { "enum": ["planned", "applied", "failed", "superseded"] },
           "requested_bytes": { "type": "integer", "format": "int64", "minimum": 1 },
           "observed_available_bytes": { "type": "integer", "format": "int64", "minimum": 0 },
-          "failure_code": { "const": "insufficient_disk" },
-          "completed_at": { "type": "string", "format": "date-time" }
+          "failure_code": { "enum": ["insufficient_disk", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
+          "completed_at": { "type": "string", "format": "date-time" },
+          "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "Latest durable Computer Storage grow observation. Available bytes exist only when a validated helper refusal receipt supplied them."
+        "description": "Latest durable Computer Storage grow observation. Available bytes exist only when a validated helper refusal receipt supplied them. A grow that spent its failure budget ends failed with the last report's class as failure_code and the disk budget unchanged (#1608)."
+      },
+      "ComputerStorageResetOutcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation_revision", "status"],
+        "properties": {
+          "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "cleanup_owed", "superseded"] },
+          "failure_code": { "enum": ["engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
+          "completed_at": { "type": "string", "format": "date-time" },
+          "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
+        },
+        "description": "Latest durable Computer Storage reset observation. reserved, prepared and published are still running; retired completed it; cleanup_owed means the new generation is current but the predecessor could not be deleted within the failure budget, so the Computer is stable, held stopped, and the old bytes stay on the Node until removal; failed means the budget ended it before publication; superseded means a removal or dead-node abort overtook it. Reset failures before publication are counted and shown but do not yet end the reset."
+      },
+      "ComputerStorageOperationFailure": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage", "class", "code", "failed_attempts", "last_failed_at"],
+        "properties": {
+          "stage": { "enum": ["prepare", "retire"] },
+          "class": { "enum": ["engine_failure", "runtime_loss", "quarantined", "resume_deferred", "acknowledgement_refused", "agent_refused"] },
+          "code": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+          "failed_attempts": { "type": "integer", "format": "int64", "minimum": 0 },
+          "first_failed_at": { "type": "string", "format": "date-time" },
+          "last_failed_at": { "type": "string", "format": "date-time" }
+        },
+        "description": "One Storage operation stage's durable failure budget (#1608): how many attempts failed, since when on the L1 clock, and the last failure's class and code. The operation ends after 5 counted failures and 10 minutes since the first; a quarantine ends it at once; a resume deferral is recorded and not counted."
       },
       "ComputerRestoreOperation": {
         "type": "object",
@@ -2492,11 +2523,12 @@
         "properties": {
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
-          "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "storage_copy_engine_failure"] },
-          "completed_at": { "type": "string", "format": "date-time" }
+          "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "cleanup_owed", "superseded"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "storage_copy_engine_failure", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
+          "completed_at": { "type": "string", "format": "date-time" },
+          "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the restore was aborted with the old generation still current: failure_code is the failed precommitted predecessor Backup copy's code, or storage_copy_engine_failure when the restore's Storage copy kept failing on a live helper session past the agent's bound; `superseded` means a removal overtook it. The Computer is `stable` after both `retired` and `failed`."
+        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the restore was aborted with the old generation still current: failure_code is the failed precommitted predecessor Backup copy's code, or the class of the report that spent the restore's failure budget (#1608; storage_copy_engine_failure is the older form, #1591); `cleanup_owed` means the restore published but its predecessor could not be deleted within the failure budget: the new generation is current, the Computer is held stopped, and the old bytes stay on the Node until removal; `superseded` means a removal overtook it. The Computer is `stable` after `retired`, `failed` and `cleanup_owed`."
       },
       "ComputerCloneOperation": {
         "type": "object",
@@ -2507,10 +2539,11 @@
           "source_computer_id": { "type": "string", "minLength": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["reserved", "prepared", "complete", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "computer_storage_quarantined", "computer_storage_preparation_interrupted"] },
-          "completed_at": { "type": "string", "format": "date-time" }
+          "failure_code": { "enum": ["insufficient_disk", "computer_storage_quarantined", "computer_storage_preparation_interrupted", "engine_failure", "runtime_loss", "acknowledgement_refused", "agent_refused"] },
+          "completed_at": { "type": "string", "format": "date-time" },
+          "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "One Computer clone's own observed state, read through its destination Computer. reserved and prepared are still running; complete published the destination generation; failed means the helper refused the destination or could never prepare it and carries failure_code; superseded means a removal of the destination or source overtook it. The destination's Job failure may belong to a later operation, so only this record says how the clone ended."
+        "description": "One Computer clone's own observed state, read through its destination Computer. reserved and prepared are still running; complete published the destination generation; failed means the helper refused the destination or could never prepare it, or the clone spent its failure budget (#1608), and carries failure_code; superseded means a removal of the destination or source overtook it. The destination's Job failure may belong to a later operation, so only this record says how the clone ended."
       },
       "ServiceRemovalStall": {
         "type": "object",

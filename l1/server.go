@@ -503,6 +503,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-copy-acknowledgement", s.acknowledgeComputerStorageCopy)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/custody-export-acknowledgement", s.acknowledgeComputerCustodyExport)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/restore-retirement-acknowledgement", s.acknowledgeComputerRestoreRetirement)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/storage-operation-failure", s.reportComputerStorageOperationFailure)
 
 	person := http.NewServeMux()
 	person.HandleFunc("GET /v1/whoami", s.whoAmI)
@@ -2637,6 +2638,21 @@ func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.R
 		}
 	}
 	s.writeAgentComputer(w, r, http.StatusOK, computer)
+}
+
+func (s *Server) reportComputerStorageOperationFailure(w http.ResponseWriter, r *http.Request) {
+	var request ComputerStorageOperationFailureRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	response, err := s.store.ReportComputerStorageOperationFailure(r.Context(), identityFromRequest(r).NodeID,
+		r.PathValue("computer_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *http.Request) {

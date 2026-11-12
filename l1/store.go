@@ -765,7 +765,8 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
   cleanup_fence TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-	  status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'superseded')),
+	  status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'failed', 'cleanup_owed', 'superseded')),
+  failure_code TEXT NOT NULL DEFAULT '',
   verification_receipt_json BLOB,
   verification_receipt_hash TEXT,
   acknowledgement_key TEXT,
@@ -774,11 +775,12 @@ CREATE TABLE IF NOT EXISTS computer_storage_resets (
   requested_ns INTEGER NOT NULL,
   verified_ns INTEGER,
   published_ns INTEGER,
+  completed_ns INTEGER,
   PRIMARY KEY(computer_id, intent_revision),
   UNIQUE(computer_id, idempotency_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_reset_active
-	  ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded');
+	  ON computer_storage_resets(computer_id) WHERE status IN ('reserved', 'prepared', 'published');
 CREATE TABLE IF NOT EXISTS computer_storage_grows (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
@@ -838,7 +840,7 @@ CREATE TABLE IF NOT EXISTS computer_reconfiguration_aborts (
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
   aborted_revision INTEGER NOT NULL CHECK(aborted_revision > 0),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > aborted_revision),
-  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing')),
+  aborted_phase TEXT NOT NULL CHECK(aborted_phase IN ('backing_up', 'resetting', 'restoring', 'cloning', 'exporting', 'importing', 'reimaging', 'growing')),
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   actor TEXT NOT NULL,
@@ -904,7 +906,7 @@ CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
   old_copy_id TEXT UNIQUE,
   idempotency_key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'superseded')),
+  status TEXT NOT NULL CHECK(status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'cleanup_owed', 'superseded')),
 	  failure_code TEXT NOT NULL DEFAULT '',
 	preparation_outcome_json BLOB,
 	preparation_acknowledgement_key TEXT,
@@ -932,6 +934,23 @@ CREATE TABLE IF NOT EXISTS computer_storage_copy_operations (
 CREATE UNIQUE INDEX IF NOT EXISTS computer_storage_copy_active
   ON computer_storage_copy_operations(destination_computer_id)
   WHERE status IN ('reserved', 'prepared', 'published');
+CREATE TABLE IF NOT EXISTS computer_storage_operation_failures (
+  computer_id TEXT NOT NULL,
+  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
+  stage TEXT NOT NULL CHECK(stage IN ('prepare', 'retire')),
+  verb TEXT NOT NULL CHECK(verb IN ('import', 'clone', 'restore', 'reset', 'backup', 'grow')),
+  failed_attempts INTEGER NOT NULL CHECK(failed_attempts >= 0),
+  first_failed_ns INTEGER,
+  last_failed_ns INTEGER NOT NULL,
+  last_failure_class TEXT NOT NULL,
+  last_failure_code TEXT NOT NULL,
+  last_failure_detail TEXT NOT NULL DEFAULT '',
+  last_helper_generation INTEGER NOT NULL DEFAULT 0,
+  last_report_id TEXT NOT NULL,
+  last_report_hash TEXT NOT NULL,
+  exhausted_ns INTEGER,
+  PRIMARY KEY(computer_id, operation_revision, stage)
+);
 CREATE TABLE IF NOT EXISTS backups (
   backup_id TEXT PRIMARY KEY,
   computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
@@ -1566,6 +1585,16 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	if err := s.migrateComputerAbortConstraints(ctx); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"failure_code", "TEXT NOT NULL DEFAULT ''"}, {"completed_ns", "INTEGER"},
+	} {
+		if err := s.ensureColumn(ctx, "computer_storage_resets", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := s.migrateStorageOperationFailureConstraints(ctx); err != nil {
 		return err
 	}
 	if err := s.migrateBackupDigestConstraint(ctx); err != nil {
@@ -2342,6 +2371,100 @@ func (s *Store) migrateStorageProvenanceConstraints(ctx context.Context) error {
 	return nil
 }
 
+// migrateStorageOperationFailureConstraints widens the two Storage operation
+// status CHECKs for the failure budget (#1608): a reset can end `failed`, and a
+// reset or restore that published but cannot delete its predecessor ends
+// `cleanup_owed`. CREATE TABLE IF NOT EXISTS cannot change a CHECK, so each
+// table is rebuilt once, copying every column as sqlite_master describes it.
+// The rebuild drops each table's partial index; both are recreated listing
+// only the live statuses, so a `failed` or `cleanup_owed` row never blocks
+// the next operation of its Computer.
+func (s *Store) migrateStorageOperationFailureConstraints(ctx context.Context) error {
+	tables := []struct {
+		name, oldStatus, newStatus, index string
+	}{
+		{
+			name:      "computer_storage_resets",
+			oldStatus: "status IN ('reserved', 'prepared', 'published', 'retired', 'superseded')",
+			newStatus: "status IN ('reserved', 'prepared', 'published', 'retired', 'failed', 'cleanup_owed', 'superseded')",
+			index: `CREATE UNIQUE INDEX computer_storage_reset_active ON computer_storage_resets(computer_id)
+				WHERE status IN ('reserved', 'prepared', 'published')`,
+		},
+		{
+			name:      "computer_storage_copy_operations",
+			oldStatus: "status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'superseded')",
+			newStatus: "status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'cleanup_owed', 'superseded')",
+			index: `CREATE UNIQUE INDEX computer_storage_copy_active ON computer_storage_copy_operations(destination_computer_id)
+				WHERE status IN ('reserved', 'prepared', 'published')`,
+		},
+	}
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("l1: acquire Storage operation failure migration connection: %w", err)
+	}
+	defer connection.Close()
+	sources := make([]string, len(tables))
+	pending := false
+	for index, table := range tables {
+		if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+			table.name).Scan(&sources[index]); err != nil {
+			return fmt.Errorf("l1: inspect %s schema: %w", table.name, err)
+		}
+		pending = pending || !strings.Contains(sources[index], "'cleanup_owed'")
+	}
+	if !pending {
+		return nil
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("l1: disable foreign keys for Storage operation failure migration: %w", err)
+	}
+	defer connection.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("l1: begin Storage operation failure migration: %w", err)
+	}
+	defer tx.Rollback()
+	for index, table := range tables {
+		if strings.Contains(sources[index], "'cleanup_owed'") {
+			continue
+		}
+		if !strings.Contains(sources[index], table.oldStatus) {
+			return fmt.Errorf("l1: %s status constraint has an unknown durable shape", table.name)
+		}
+		migration := table.name + "_failure_migration"
+		createSQL, err := migratedSQLiteCreateTable(sources[index], migration, map[string]string{table.oldStatus: table.newStatus})
+		if err != nil {
+			return fmt.Errorf("l1: rewrite %s schema: %w", table.name, err)
+		}
+		if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+			return fmt.Errorf("l1: create widened %s schema: %w", table.name, err)
+		}
+		if err := copySQLiteTableColumns(ctx, tx, table.name, migration); err != nil {
+			return fmt.Errorf("l1: copy %s during migration: %w", table.name, err)
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE `+table.name+`;
+			ALTER TABLE `+migration+` RENAME TO `+table.name+`;
+			`+table.index); err != nil {
+			return fmt.Errorf("l1: publish widened %s schema: %w", table.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("l1: commit Storage operation failure migration: %w", err)
+	}
+	if _, err := connection.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return fmt.Errorf("l1: restore foreign keys after Storage operation failure migration: %w", err)
+	}
+	rows, err := connection.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("l1: verify Storage operation failure migration: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return errors.New("l1: Storage operation failure migration violated a foreign key")
+	}
+	return rows.Err()
+}
+
 // migrateComputerAbortConstraints widens the branch-introduced abort table
 // without assuming a fixed column set so a durable database from an earlier
 // review build remains openable.
@@ -2355,7 +2478,7 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 	if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='computer_reconfiguration_aborts'`).Scan(&sourceSQL); err != nil {
 		return fmt.Errorf("l1: inspect Computer abort schema: %w", err)
 	}
-	if strings.Contains(sourceSQL, "'growing'") && strings.Contains(sourceSQL, "'exporting'") && strings.Contains(sourceSQL, "'importing'") {
+	if strings.Contains(sourceSQL, "'restoring'") && strings.Contains(sourceSQL, "'cloning'") {
 		return nil
 	}
 	oldConstraint := ""
@@ -2369,7 +2492,7 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 			break
 		}
 	}
-	const newConstraint = "'backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing'"
+	const newConstraint = "'backing_up', 'resetting', 'restoring', 'cloning', 'exporting', 'importing', 'reimaging', 'growing'"
 	if oldConstraint == "" {
 		return errors.New("l1: Computer abort constraint has an unknown durable shape")
 	}
