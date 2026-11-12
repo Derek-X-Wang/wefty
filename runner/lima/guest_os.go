@@ -190,3 +190,33 @@ func RecordGuestOSAdvisory(ctx context.Context, limaHome, instance, limactl stri
 		return output, nil
 	}, limaHome, instance, now)
 }
+
+// GuestOSUnreadableError refuses `setup-oci --recreate` when the running
+// guest's OS release cannot be read: the base upgrade is never decided from
+// an unknown or older record (#1593).
+type GuestOSUnreadableError struct{}
+
+func (*GuestOSUnreadableError) Error() string {
+	return "host VM recreate refused: the guest OS release could not be read, so the host VM base upgrade cannot be decided. Start OCI so the host VM is running, then rerun setup-oci --recreate. Staying on the current base is supported."
+}
+
+// ObserveGuestOS reads the running guest's release and records it. Unlike
+// the advisory recording, it returns every failure: `setup-oci --recreate`
+// acts on the result. It never starts a stopped host VM.
+func ObserveGuestOS(ctx context.Context, limaHome, instance, limactl string, now time.Time) (GuestOSObservation, error) {
+	return observeGuestOS(ctx, runUserInstallCommand, guestReadBudget, limaHome, instance, limactl, now)
+}
+
+func observeGuestOS(ctx context.Context, run commandRunner, budget time.Duration, limaHome, instance, limactl string, now time.Time) (GuestOSObservation, error) {
+	output, err := readGuest(ctx, run, budget, limactl, instance, "cat", "/etc/os-release")
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return GuestOSObservation{}, ctxErr
+		}
+		return GuestOSObservation{}, &GuestOSUnreadableError{}
+	}
+	if _, err := ParseOSRelease(output); err != nil {
+		return GuestOSObservation{}, &GuestOSUnreadableError{}
+	}
+	return RecordGuestOS(limaHome, instance, output, now)
+}

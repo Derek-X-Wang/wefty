@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -450,14 +451,26 @@ func TestUpgradeDrainInterruptedAfterShutdownBeforeNewBootRecoversNeverService(t
 		return l1.Job{}, nil
 	}
 	f.failure = "build"
-	_, err := runUpgrade(t.Context(), f.host, false, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "build failed") {
+	// JSON mode discards the recovery notices, so the error and the report
+	// must say that recovery changed the stack (#1622).
+	var stdout bytes.Buffer
+	err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, false, &stdout, io.Discard)
+	if err == nil || strings.Contains(err.Error(), "installed stack unchanged") ||
+		!strings.Contains(err.Error(), "upgrade build failed; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged") {
 		t.Fatal(err)
+	}
+	var report upgradeReport
+	if e := json.Unmarshal(stdout.Bytes(), &report); e != nil || !slices.Equal(report.RestartedServices, []string{"never-app"}) || report.ClaimsDisabled {
+		t.Fatalf("report hides recovery: %v %s", e, &stdout)
 	}
 	if !restarted || !f.node.ClaimsEnabled {
 		t.Fatal("interrupted never service or intent not recovered before new build")
 	}
 	assertNoUpgradeDrainReceipt(t, f)
+	// Without a pending receipt the same failure changed nothing.
+	if _, err = runUpgrade(t.Context(), f.host, false, io.Discard); err == nil || !strings.Contains(err.Error(), "upgrade build failed; installed stack unchanged") {
+		t.Fatal(err)
+	}
 }
 
 func TestUpgradeDrainTimeoutFlagControlsBoundAndProgress(t *testing.T) {

@@ -594,7 +594,7 @@ func TestFleetUpgradeKeepsDrainIntentAndServiceSafeguards(t *testing.T) {
 					f.node.IntentReason = r.Reason
 					return f.node, nil
 				}
-				if err := recoverUpgradeDrain(t.Context(), op, paths, f.profile(t), io.Discard); err != nil {
+				if _, err := recoverUpgradeDrain(t.Context(), op, paths, f.profile(t), io.Discard); err != nil {
 					t.Fatal(err)
 				}
 			}

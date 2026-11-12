@@ -52,7 +52,7 @@ func (s *Store) RebindAdminDevice(ctx context.Context, userID, deviceID string) 
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "read rebound admin policy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin device rebind")
 	}
 	s.notifyComputerPolicyChanged()

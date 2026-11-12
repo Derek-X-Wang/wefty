@@ -37,6 +37,9 @@ const (
 	ComputerRestoreFailureQuarantined            ComputerRestoreFailureCode = "computer_storage_quarantined"
 	ComputerRestoreFailureAcknowledgementRefused ComputerRestoreFailureCode = "acknowledgement_refused"
 	ComputerRestoreFailureAgentRefused           ComputerRestoreFailureCode = "agent_refused"
+	// A restore whose bound Node died and the owner aborted (#1608). It ends
+	// `superseded`, not `failed`.
+	ComputerRestoreFailureAbortedDeadNode ComputerRestoreFailureCode = "aborted_dead_node"
 )
 
 type ComputerRestoreRequest struct {
@@ -405,7 +408,7 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	if err != nil {
 		return Computer{}, false, internalError(err, "read reserved Computer restore")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer restore reservation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -697,7 +700,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	if err != nil {
 		return Computer{}, false, internalError(err, "read staged cloned Computer")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer clone reservation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -864,7 +867,7 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 				return protocolError(contract.ErrorConflict, "Computer restore has inconsistent prior revocation evidence")
 			}
 			// Preserve the first committed bound receipt on same-operation replay.
-			if err := tx.Commit(); err != nil {
+			if err := write.commit(); err != nil {
 				return internalError(err, "commit restore authority revocation replay")
 			}
 			return nil
@@ -898,7 +901,7 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 	if affected != 1 {
 		return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return internalError(err, "commit restore authority revocation receipt")
 	}
 	return nil
@@ -1094,9 +1097,10 @@ func abortComputerRestore(ctx context.Context, tx *sql.Tx, row computerStorageCo
 // is spent (#1591). It aborts the restore. Any other outcome stays rejected,
 // because a restore's predecessor still owns the bytes and a deferral or a
 // runtime loss resolves on a later sweep.
-func acknowledgeComputerRestorePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+func acknowledgeComputerRestorePreparation(ctx context.Context, write *writeTransaction, row computerStorageCopyRow,
 	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
 	now time.Time) (Computer, error) {
+	tx := write.tx
 	if request.Receipt.Kind != "" || request.OldBackupReceipt != nil {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer restore preparation outcome is mutually exclusive with copy receipts")
 	}
@@ -1136,7 +1140,7 @@ func acknowledgeComputerRestorePreparation(ctx context.Context, tx *sql.Tx, row 
 	if err != nil {
 		return Computer{}, internalError(err, "read aborted Computer restore authority")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit aborted Computer restore")
 	}
 	return computer, nil
@@ -1405,7 +1409,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return Computer{}, err
 	}
 	if request.PreparationOutcome != nil && row.Operation == "restore" {
-		computer, err := acknowledgeComputerRestorePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		computer, err := acknowledgeComputerRestorePreparation(ctx, write, row, destinationComputerID, request, bodyHash, now)
 		if err != nil {
 			return Computer{}, err
 		}
@@ -1413,7 +1417,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return computer, nil
 	}
 	if request.PreparationOutcome != nil {
-		computer, err := acknowledgeComputerClonePreparation(ctx, tx, row, destinationComputerID, request, bodyHash, now)
+		computer, err := acknowledgeComputerClonePreparation(ctx, write, row, destinationComputerID, request, bodyHash, now)
 		if err != nil {
 			return Computer{}, err
 		}
@@ -1426,7 +1430,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		if err := abortRestoreForFailedPredecessorCopy(ctx, tx, row, *request.OldBackupReceipt, now); err != nil {
 			return Computer{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit failed restore predecessor copy outcome")
 		}
 		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
@@ -1444,7 +1448,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer Storage copy acknowledgement differs from durable evidence")
 		}
 		if row.Status == "prepared" {
-			if err := tx.Rollback(); err != nil {
+			if err := write.rollback(); err != nil {
 				return Computer{}, internalError(err, "close verified Computer Storage copy replay")
 			}
 			return s.publishVerifiedComputerStorageCopy(ctx, destinationComputerID, row.OperationRevision)
@@ -1466,7 +1470,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		if err != nil {
 			return Computer{}, internalError(err, "read refused Computer clone authority")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit refused Computer clone")
 		}
 		s.notifyComputerPolicyChanged()
@@ -1487,7 +1491,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		request.IdempotencyKey, bodyHash, now.UnixNano(), destinationComputerID); err != nil {
 		return Computer{}, internalError(err, "record Computer Storage copy verification")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage copy verification")
 	}
 	return s.publishVerifiedComputerStorageCopy(ctx, destinationComputerID, row.OperationRevision)
@@ -1499,9 +1503,10 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 // can never finish; a deferral is recorded as the retryable observation it is,
 // exactly as a Custody import records one, so the operator can see why the
 // clone has not landed yet without the node being told to give up.
-func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row computerStorageCopyRow,
+func acknowledgeComputerClonePreparation(ctx context.Context, write *writeTransaction, row computerStorageCopyRow,
 	destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string,
 	now time.Time) (Computer, error) {
+	tx := write.tx
 	if row.Operation != "clone" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "only a Computer clone or Custody import acknowledges a Storage copy preparation outcome")
 	}
@@ -1565,7 +1570,7 @@ func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row co
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer clone preparation authority")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer clone preparation outcome")
 	}
 	return computer, nil
@@ -1622,7 +1627,7 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 	if err != nil {
 		return Computer{}, internalError(err, "read published Computer Storage copy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage copy publication")
 	}
 	s.notifyComputerPolicyChanged()
@@ -1797,7 +1802,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		if err != nil {
 			return Computer{}, internalError(err, "read quarantined restore cleanup")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit restore cleanup quarantine")
 		}
 		return computer, nil
@@ -1839,7 +1844,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 	if err != nil {
 		return Computer{}, internalError(err, "read completed Computer restore")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer restore retirement")
 	}
 	return computer, nil
@@ -1848,3 +1853,62 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 func (directive ComputerStorageCopyDirective) String() string {
 	return fmt.Sprintf("%s:%s@%d", directive.Operation, directive.DestinationComputerID, directive.OperationRevision)
 }
+
+// endClonesOfRemovedSource ends every clone still copying from a Computer
+// that is being removed (#1608). Each ends `failed` with source_removed
+// through the clone end: its staging generation is retired and the
+// destination is latched failed, so it leaves `cloning` instead of waiting
+// for a copy that can no longer finish, and the owner removes it. A clone
+// whose destination already left `cloning` at that revision is superseded as
+// before. The source's removal still claims each destination's staging
+// generation (listComputerRemovalStorageGenerations).
+func endClonesOfRemovedSource(ctx context.Context, tx *sql.Tx, sourceComputerID string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
+		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, sourceComputerID)
+	if err != nil {
+		return internalError(err, "list clones sourced by removed Computer")
+	}
+	var clones []computerStorageCopyRow
+	for rows.Next() {
+		row, err := scanComputerStorageCopy(rows)
+		if err != nil {
+			rows.Close()
+			return internalError(err, "scan clone sourced by removed Computer")
+		}
+		clones = append(clones, row)
+	}
+	if err := rows.Close(); err != nil {
+		return internalError(err, "close clones sourced by removed Computer")
+	}
+	for _, row := range clones {
+		var phase string
+		var revision int64
+		if err := tx.QueryRowContext(ctx, `SELECT reconfiguration_phase, intent_revision FROM computers WHERE computer_id=?`,
+			row.DestinationComputerID).Scan(&phase, &revision); err != nil {
+			return internalError(err, "read clone destination of removed source")
+		}
+		if phase != string(ComputerReconfigurationCloning) || revision != row.OperationRevision {
+			if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
+				WHERE destination_computer_id=? AND operation_revision=? AND status IN ('reserved', 'prepared')`,
+				row.DestinationComputerID, row.OperationRevision); err != nil {
+				return internalError(err, "supersede clone sourced by removed Computer")
+			}
+			continue
+		}
+		latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureCode(ComputerCloneFailureSourceRemoved),
+			Message: "Computer clone source was removed before the copy finished", NodeID: row.BoundNodeID,
+			RequestedBytes: row.DestinationSize})
+		if err != nil {
+			return internalError(err, "encode removed clone source failure")
+		}
+		if err := endComputerStorageCopyLatched(ctx, tx, row, ComputerReconfigurationCloning,
+			ComputerCloneFailureSourceRemoved, latchedFailure, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ComputerCloneFailureSourceRemoved is the failure_code of a clone whose
+// source Computer was removed before the copy finished (#1608).
+const ComputerCloneFailureSourceRemoved = "source_removed"

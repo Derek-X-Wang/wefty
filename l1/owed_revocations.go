@@ -343,7 +343,7 @@ func (s *Store) settleOwedRevocationTx(ctx context.Context, begin writeTransacti
 	if err := settle(tx, row, write.at.UnixNano()); err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return false, internalError(err, "commit owed Computer revocation settlement")
 	}
 	return true, nil

@@ -494,7 +494,23 @@ rendered template boots. A plain `setup-oci` run reports the current and
 desired base and never blocks on a difference. A difference is advisory: doctor's
 `host-vm-base` finding passes with "base upgrade available", and staying on the
 current base is supported. An unobserved or unreadable record is unknown: it
-is never treated as a difference. Doctor also shows the guest kernel, read live
+is never treated as a difference. The setup result's base line and the doctor
+finding name the field (`guest_os`) and the action: rerun `setup-oci --recreate`.
+
+Only `setup-oci --recreate` applies a base upgrade. Every `--recreate` first
+reads the running guest's `/etc/os-release` with the same bound, records the
+result, and never decides from an older record, so no host VM is deleted while
+its base is unknown. A base that differs from the template makes the run
+recreate-required, adds `guest_os` to the setup result's differences, and goes
+through the unchanged recreate guard (zero live OCI attempts and the inventory
+absence proof). A matching base changes nothing. A guest that cannot be read,
+or whose release cannot be parsed, refuses before `lima.yaml`, the desired
+setup state or the host VM changes, also when the setup state already requires
+a recreate: HTTP 409
+`host_vm_recreate_blocked`, CLI exit 5, `retryable=false`,
+`details.reason = "guest_os_unreadable"`. After an applied recreate the setup
+result reports the base recorded for the new guest, or not observed when that
+read failed. `guest_os` is never written into the setup state. Doctor also shows the guest kernel, read live
 when the host VM answers; the kernel is not converged on, because it changes
 inside the guest. This is macOS only. A Linux node has no host VM: setup
 reports no base and doctor reports `host-vm-base` as not applicable.
@@ -601,7 +617,9 @@ regular helper identity manifests. A missing or invalid manifest still blocks
 and is explicitly labeled identity unavailable; it never proves absence.
 The message tells the owner to remove or export the named Computer or Backup
 before manually rerunning setup. `details.reason` explains an unknown inventory
-and the error says no automatic retry occurs. Empty `blockers` and `reason`
+and the error says no automatic retry occurs. An unreadable guest OS release
+under `--recreate` uses the same code with `details.reason` set to
+`guest_os_unreadable` (see the host VM base above). Empty `blockers` and `reason`
 fields are omitted. Raw guest command output is never part of the refusal.
 The real CLI binary checks this typed exit. A source-guard test confines host
 VM delete calls to `runner/lima/supervisor.go`.

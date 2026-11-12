@@ -55,7 +55,7 @@ func TestDoctorReportsOlderHostVMBaseAsAdvisory(t *testing.T) {
 	item := hostVMBaseFinding(t, report)
 	if item.Outcome != DiagnosticOK || item.Code != "oci_host_vm_base_upgrade_available" || item.Severity != DiagnosticInfo ||
 		!strings.Contains(item.Detail, "guest_os=ubuntu-24.04") || !strings.Contains(item.Detail, "template="+lima.TemplateGuestOS) ||
-		!strings.Contains(item.Detail, "kernel=6.8.0-88-generic") || !strings.Contains(item.Detail, "staying on the current base is supported") {
+		!strings.Contains(item.Detail, "kernel=6.8.0-88-generic") || !strings.Contains(item.Detail, "staying on the current base is supported; to upgrade, rerun setup-oci with --recreate") {
 		t.Fatalf("older base finding = %+v", item)
 	}
 	if report.Convergence.Class != ConvergenceUnchanged || report.Convergence.Base == nil || !report.Convergence.Base.UpgradeAvailable ||

@@ -1013,7 +1013,7 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer Backup cap result")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Backup cap")
 	}
 	return updated, nil
@@ -1221,7 +1221,7 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 		return Computer{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer desired state")
 	}
 	return updated, nil
@@ -1409,7 +1409,7 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 		return Computer{}, false, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer restart")
 	}
 	return updated, false, nil
@@ -1501,9 +1501,8 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 			return Computer{}, internalError(err, "supersede Computer Storage copy for removal")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
-		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, computerID); err != nil {
-		return Computer{}, internalError(err, "supersede clone custody forks sourced by removed Computer")
+	if err := endClonesOfRemovedSource(ctx, tx, computerID, now); err != nil {
+		return Computer{}, err
 	}
 	if computer.ReconfigurationPhase == ComputerReconfigurationGrowing {
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_grows SET status='superseded'
@@ -1622,7 +1621,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err != nil {
 		return Computer{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer removal intent")
 	}
 	if err := s.truncateRemovalSecretWAL(ctx); err != nil {
@@ -1844,7 +1843,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 				return Computer{}, internalError(readErr, "read pending Computer reimage preflight")
 			}
 			if operation.Status == "planned" {
-				return computer, tx.Commit()
+				return computer, write.commit()
 			}
 		}
 		if err := s.finalizeComputerProjectionTx(ctx, tx, computer, phase, now); err != nil {
@@ -1854,7 +1853,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		if err != nil {
 			return Computer{}, internalError(err, "read installed Computer projection")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Computer projection install")
 		}
 		return updated, nil
@@ -1967,7 +1966,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		return Computer{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer projection install")
 	}
 	s.notifyComputerPolicyChanged()

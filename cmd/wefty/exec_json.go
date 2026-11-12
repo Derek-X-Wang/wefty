@@ -119,7 +119,7 @@ func resolveExecFinished(ctx context.Context, clients *apiClients, record contra
 		return event, &runOutcomeError{runID: record.RunID, status: record.Status, reason: event.Reason}
 	}
 	if record.Restartable {
-		execution, err := readExec(ctx, clients, func(readCtx context.Context) (l3.RunExecution, error) {
+		execution, err := readExec(ctx, clients, nil, func(readCtx context.Context) (l3.RunExecution, error) {
 			return clients.getRunExecution(readCtx, record.RunID)
 		})
 		if err != nil || execution.Job == nil || execution.Job.RestartRecovery == nil {
@@ -147,7 +147,7 @@ func resolveExecFinished(ctx context.Context, clients *apiClients, record contra
 	resultCtx, stop := context.WithTimeout(ctx, execReadRecoveryBudget)
 	defer stop()
 	for {
-		result, err := readExec(resultCtx, clients, func(readCtx context.Context) (l3.RunResult, error) {
+		result, err := readExec(resultCtx, clients, nil, func(readCtx context.Context) (l3.RunResult, error) {
 			return clients.getRunResult(readCtx, record.RunID)
 		})
 		if err == nil && len(result.Document) > 0 {

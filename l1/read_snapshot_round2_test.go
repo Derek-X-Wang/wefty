@@ -226,7 +226,7 @@ func TestReadSnapshotOverrunLoggerRateLimit(t *testing.T) {
 
 		s, _ := snapshotStore(t)
 		var lines []string
-		s.logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+		s.setLogf(func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) })
 		slow := func() error {
 			return s.withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { time.Sleep(110 * time.Millisecond); return nil })
 		}

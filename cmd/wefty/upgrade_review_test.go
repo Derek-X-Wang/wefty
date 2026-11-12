@@ -64,7 +64,7 @@ func TestUpgradeServiceRefusalRecovery(t *testing.T) {
 			if failure == "transient" {
 				err = finishUpgradeDrain(t.Context(), *f.operations, paths, profile, receipt, false, &out)
 			} else {
-				err = recoverUpgradeDrain(t.Context(), *f.operations, paths, profile, &out)
+				_, err = recoverUpgradeDrain(t.Context(), *f.operations, paths, profile, &out)
 			}
 			if failure == "transient" {
 				if err == nil {

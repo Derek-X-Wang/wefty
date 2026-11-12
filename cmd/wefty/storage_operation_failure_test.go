@@ -95,3 +95,48 @@ func TestCustodyImportEndedByQuarantineKeepsItsExitStatus(t *testing.T) {
 		}
 	}
 }
+
+// An interrupted outcome on a running import keeps the wait going, the
+// attempt count prints once per change, and a later completion ends the wait
+// with success (#1643).
+func TestCustodyImportWaitRidesOutInterruptedOutcomes(t *testing.T) {
+	interrupted := &l1.ComputerStoragePreparationOutcome{Code: l1.ComputerStoragePreparationInterrupted,
+		Reason: l1.ComputerStoragePreparationReasonEngineFailure}
+	failure := func(attempts int64) *l1.ComputerStorageOperationFailure {
+		return &l1.ComputerStorageOperationFailure{Stage: l1.ComputerStorageOperationPrepare,
+			Class: l1.ComputerStorageOperationFailureEngine, Code: "engine_failure", FailedAttempts: attempts}
+	}
+	sequence := []l1.ComputerCustodyImportObservation{
+		{OperationRevision: 1, Status: "reserved", PreparationOutcome: interrupted, Failure: failure(1)},
+		{OperationRevision: 1, Status: "reserved", PreparationOutcome: interrupted, Failure: failure(1)},
+		{OperationRevision: 1, Status: "reserved", PreparationOutcome: interrupted, Failure: failure(2)},
+		{OperationRevision: 1, Status: "complete"},
+	}
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/custody-imports/import-1":
+			observed := sequence[min(reads, len(sequence)-1)]
+			reads++
+			_ = json.NewEncoder(w).Encode(observed)
+		case "/v1/computers/import-1":
+			_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "import-1", AppliedRevision: 1,
+				ReconfigurationPhase: l1.ComputerReconfigurationStable})
+		default:
+			t.Errorf("unexpected request %s", r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	var progress bytes.Buffer
+	observed, _, _, err := waitForCustodyImportReporting(t.Context(), &apiClients{l1: waitStubClient(t, server)},
+		"import-1", 1, retryableWaitFlags, &progress)
+	if err != nil || observed.Status != "complete" {
+		t.Fatalf("wait = %#v err=%v", observed, err)
+	}
+	lines := strings.Split(strings.TrimSpace(progress.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "failed attempts so far: 1") || !strings.Contains(lines[1], "failed attempts so far: 2") {
+		t.Fatalf("progress = %q", progress.String())
+	}
+}

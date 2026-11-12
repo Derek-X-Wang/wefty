@@ -117,7 +117,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 			return Job{}, internalError(readErr, "read pending service removal")
 		}
 		applyServiceRemoval(&job, removal)
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit idempotent service removal")
 		}
 		if err := s.truncateRemovalSecretWAL(ctx); err != nil {
@@ -151,7 +151,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 		if err := deleteServiceRows(ctx, tx, jobID); err != nil {
 			return Job{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit unbound service removal")
 		}
 		if err := s.truncateRemovalSecretWAL(ctx); err != nil {
@@ -179,7 +179,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 		return Job{}, internalError(err, "read requested service removal")
 	}
 	applyServiceRemoval(&job, removal)
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit service removal")
 	}
 	if err := s.truncateRemovalSecretWAL(ctx); err != nil {
@@ -253,7 +253,7 @@ func (s *Store) forceForgetService(ctx context.Context, jobID string, actor *ser
 		return Job{}, internalError(err, "read forced service forget result")
 	}
 	applyServiceRemoval(&forgotten, removal)
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit forced service forget")
 	}
 	return forgotten, nil
@@ -401,7 +401,8 @@ func listComputerRemovalStorageGenerations(ctx context.Context, q nodeQueryer, c
 		UNION
 		SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
 		FROM computer_storage_copy_operations
-		WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+		WHERE source_computer_id=? AND operation='clone'
+			AND (status='superseded' OR (status='failed' AND failure_code='source_removed'))
 		ORDER BY storage_generation`, computerID, computerID)
 	if err != nil {
 		return nil, internalError(err, "list Computer Storage removal generations")
@@ -547,7 +548,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 		if err != nil {
 			return Job{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit stalled service removal")
 		}
 		return job, nil
@@ -577,7 +578,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 			return Job{}, internalError(err, "read quarantined Computer removal")
 		}
 		applyServiceRemoval(&job, removal)
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Job{}, internalError(err, "commit Computer removal cleanup quarantine")
 		}
 		return job, nil
@@ -646,7 +647,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 		return Job{}, internalError(err, "read accepted removal acknowledgement")
 	}
 	applyServiceRemoval(&job, removal)
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit removal acknowledgement")
 	}
 	return job, nil
@@ -848,7 +849,7 @@ func (s *Store) FinalizeServiceRemoval(ctx context.Context, jobID string) (Job, 
 	if !finalized {
 		return job, false, nil
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, false, internalError(err, "commit service removal finalization")
 	}
 	return job, true, nil

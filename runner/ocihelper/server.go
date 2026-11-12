@@ -1025,7 +1025,16 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 // fence read-only inventory.
 func (session *serverSession) hasLiveRemovalAttemptLocked(jobID string, storage *ComputerStorageReference) bool {
 	for _, attempt := range session.attempts {
-		if attempt.state == attemptTombstoned || attempt.authority.JobID != jobID {
+		if attempt.state == attemptTombstoned {
+			continue
+		}
+		// A per-generation inventory is fenced by any live attempt on the same
+		// Storage, whatever its Job: after a Job rotation the Job that
+		// attaches can differ from the one being removed (#1611).
+		if storage != nil && attempt.computerStorage != nil && sameComputerStorageIdentity(*attempt.computerStorage, *storage) {
+			return true
+		}
+		if attempt.authority.JobID != jobID {
 			continue
 		}
 		if storage == nil || attempt.computerStorage == nil || sameComputerStorageIdentity(*attempt.computerStorage, *storage) {
@@ -1954,6 +1963,15 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			response.JobID = body.Removal.JobID
 			response.RemovalGeneration = body.Removal.RemovalGeneration
 			response.HelperSession = helper
+			// A detachment witness names the session that proved mount and
+			// loop absence; it must not outlive that session (#1611).
+			for i := range response.Attempts {
+				if witness := response.Attempts[i].StorageDetachment; witness != nil {
+					stamped := *witness
+					stamped.HelperGeneration = helper.SessionGeneration
+					response.Attempts[i].StorageDetachment = &stamped
+				}
+			}
 		}
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, err)
 	case MethodAttestRemoval:

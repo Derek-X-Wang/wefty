@@ -499,22 +499,43 @@ func upgradeDrainResult(primary, restore error, claimsOpen bool) error {
 	return primary
 }
 
-func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, out io.Writer) error {
+// recoverUpgradeDrain finishes an interrupted drain. It returns the settled
+// receipt when one was pending, so the caller can say what recovery changed.
+func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, out io.Writer) (*upgradeDrainReceipt, error) {
 	receipt, err := readUpgradeDrain(paths.config)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read interrupted upgrade receipt: %w", err)
+		return nil, fmt.Errorf("read interrupted upgrade receipt: %w", err)
 	}
 	if receipt.NodeID != profile.Identities.Node {
-		return errors.New("upgrade drain receipt names a different node")
+		return nil, errors.New("upgrade drain receipt names a different node")
 	}
 	if err := finishUpgradeDrain(ctx, op, paths, profile, receipt, true, out); err != nil {
-		return err
+		return nil, err
 	}
 	_, err = fmt.Fprintln(out, "Restored intent from interrupted upgrade.")
-	return err
+	return receipt, err
+}
+
+// upgradePreparationLeft says what a failed preparation left alone. Recovery
+// of an interrupted drain earlier in the same command may have restarted
+// services, restored claims and removed its receipt, so "installed stack
+// unchanged" would be false then (#1622).
+func upgradePreparationLeft(recovered *upgradeDrainReceipt) string {
+	if recovered != nil {
+		return "interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged"
+	}
+	return "installed stack unchanged"
+}
+
+// recoveredUpgradeReport adds what recovery changed to a report.
+func recoveredUpgradeReport(report upgradeReport, recovered *upgradeDrainReceipt) upgradeReport {
+	if recovered != nil {
+		report.RestartedServices, report.ClaimsDisabled = slices.Clone(recovered.restarted), recovered.claimsDisabled
+	}
+	return report
 }
 
 func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, recovering bool, out io.Writer) (resultErr error) {

@@ -2524,11 +2524,11 @@
           "operation_revision": { "type": "integer", "format": "int64", "minimum": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["reserved", "prepared", "published", "retired", "failed", "cleanup_owed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "storage_copy_engine_failure", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused"] },
+          "failure_code": { "enum": ["insufficient_disk", "digest_mismatch", "source_never_detached", "storage_copy_engine_failure", "engine_failure", "runtime_loss", "computer_storage_quarantined", "acknowledgement_refused", "agent_refused", "aborted_dead_node"] },
           "completed_at": { "type": "string", "format": "date-time" },
           "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the restore was aborted with the old generation still current: failure_code is the failed precommitted predecessor Backup copy's code, or the class of the report that spent the restore's failure budget (#1608; storage_copy_engine_failure is the older form, #1591); `cleanup_owed` means the restore published but its predecessor could not be deleted within the failure budget: the new generation is current, the Computer is held stopped, and the old bytes stay on the Node until removal; `superseded` means a removal overtook it. The Computer is `stable` after `retired`, `failed` and `cleanup_owed`."
+        "description": "One Computer restore's own observed state. `retired` completed it; `failed` means the restore was aborted with the old generation still current: failure_code is the failed precommitted predecessor Backup copy's code, or the class of the report that spent the restore's failure budget (#1608; storage_copy_engine_failure is the older form, #1591); `cleanup_owed` means the restore published but its predecessor could not be deleted within the failure budget: the new generation is current, the Computer is held stopped, and the old bytes stay on the Node until removal; `superseded` means a removal overtook it, or the owner aborted it after its bound Node died (failure_code aborted_dead_node; the Computer is then `stable`, held stopped, on the old generation before publication and the restored one after it). The Computer is `stable` after `retired`, `failed` and `cleanup_owed`."
       },
       "ComputerCloneOperation": {
         "type": "object",
@@ -2539,11 +2539,11 @@
           "source_computer_id": { "type": "string", "minLength": 1 },
           "backup_id": { "type": "string", "minLength": 1 },
           "status": { "enum": ["reserved", "prepared", "complete", "failed", "superseded"] },
-          "failure_code": { "enum": ["insufficient_disk", "computer_storage_quarantined", "computer_storage_preparation_interrupted", "engine_failure", "runtime_loss", "acknowledgement_refused", "agent_refused"] },
+          "failure_code": { "enum": ["insufficient_disk", "computer_storage_quarantined", "computer_storage_preparation_interrupted", "engine_failure", "runtime_loss", "acknowledgement_refused", "agent_refused", "source_removed", "aborted_dead_node"] },
           "completed_at": { "type": "string", "format": "date-time" },
           "failure": { "$ref": "#/components/schemas/ComputerStorageOperationFailure" }
         },
-        "description": "One Computer clone's own observed state, read through its destination Computer. reserved and prepared are still running; complete published the destination generation; failed means the helper refused the destination or could never prepare it, or the clone spent its failure budget (#1608), and carries failure_code; superseded means a removal of the destination or source overtook it. The destination's Job failure may belong to a later operation, so only this record says how the clone ended."
+        "description": "One Computer clone's own observed state, read through its destination Computer. reserved and prepared are still running; complete published the destination generation; failed means the helper refused the destination or could never prepare it, or the clone spent its failure budget (#1608), or its source Computer was removed (source_removed: the destination is latched failed and the owner removes it), and carries failure_code; superseded means a removal of the destination overtook it, or the owner aborted it after its bound Node died (failure_code aborted_dead_node; the destination is renamed aborted-clone-<computer_id> and cannot start). The destination's Job failure may belong to a later operation, so only this record says how the clone ended."
       },
       "ServiceRemovalStall": {
         "type": "object",

@@ -1069,25 +1069,21 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 				} else if !errors.Is(stateErr, os.ErrNotExist) {
 					return response, stateErr
 				}
+				limaHome, observationPath := "", ""
 				if runtime.GOOS == "darwin" {
-					limaHome := os.Getenv("LIMA_HOME")
+					limaHome = os.Getenv("LIMA_HOME")
 					if !filepath.IsAbs(limaHome) {
 						response.ReasonCode = contract.CapabilityReasonPrerequisiteMissing
 						response.MissingCapability = "LIMA_HOME"
 						response.Runbook = ocicontrol.RunbookPath
 						return response, nil
 					}
-					// The base is advisory: an unobserved or unreadable record
-					// reports no current value and never blocks this run.
-					observationPath, err := limarunner.GuestOSObservationPath(limaHome, *ociLimaInstance)
+					var err error
+					observationPath, err = setupHostVMBaseAndSizing(setupContext, &response, request, limaHome, *ociLimaInstance,
+						func(ctx context.Context) (limarunner.GuestOSObservation, error) {
+							return limarunner.ObserveGuestOS(ctx, limaHome, *ociLimaInstance, "", time.Now())
+						})
 					if err != nil {
-						return response, err
-					}
-					observation, observeErr := limarunner.ReadGuestOSObservation(observationPath)
-					base := limarunner.NewHostVMBase(observation, observeErr == nil)
-					response.Base = &base
-					if err := limarunner.UpdateInstanceSizing(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"),
-						limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}); err != nil {
 						return response, err
 					}
 				}
@@ -1145,6 +1141,13 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					}
 					response.RestartApplied = true
 					response.RecreateApplied = response.Convergence == ocicontrol.ConvergenceRecreateRequired
+					if response.RecreateApplied && observationPath != "" {
+						// The delete removed the old record; the reinstall
+						// recorded the new guest, or left it unobserved.
+						observation, observeErr := limarunner.ReadGuestOSObservation(observationPath)
+						base := limarunner.NewHostVMBase(observation, observeErr == nil)
+						response.Base = &base
+					}
 				}
 				if err := ocicontrol.WriteSetupState(*ociSetupState, desired); err != nil {
 					return response, err
