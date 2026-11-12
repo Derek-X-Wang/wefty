@@ -156,6 +156,11 @@ func (s *Store) truncateSecretWAL(ctx context.Context) (bool, error) {
 // when the checkpoint answers busy or refuses with SQLITE_BUSY because
 // another checkpoint is running, and records the outcome for removals.
 func (s *Store) checkpointSecretWALOnce(ctx context.Context) (bool, error) {
+	// A TRUNCATE checkpoint holds off writers for its whole run, wait included.
+	// It is named after the sweep or removal that asked for it.
+	lock := s.startWriteLockTiming("checkpoint", 2)
+	lock.acquired()
+	defer lock.end("checkpoint")
 	var busy, logFrames, checkpointedFrames int
 	err := s.checkpointDB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames)
 	var sqliteErr sqliteErrorCoder
@@ -207,11 +212,17 @@ func (s *Store) truncateRemovalSecretWAL(ctx context.Context) error {
 }
 
 func (s *Store) backfillTerminalOneShotSecrets(ctx context.Context) (int64, error) {
+	lock := s.startWriteLockTiming("main", 1)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		lock.beginFailed()
 		return 0, internalError(err, "begin terminal one-shot secret backfill")
 	}
-	defer tx.Rollback()
+	lock.acquired()
+	defer func() {
+		_ = tx.Rollback()
+		lock.end("rollback")
+	}()
 	result, err := tx.ExecContext(ctx, `UPDATE jobs SET spec_json=`+scrubbedOneShotSpecSQL+`, secrets_scrubbed_ns=?
 		WHERE job_id IN (
 			SELECT job_id FROM jobs
@@ -233,7 +244,9 @@ func (s *Store) backfillTerminalOneShotSecrets(ctx context.Context) (int64, erro
 		return 0, internalError(err, "advance secret scrub generation")
 	}
 	if err := tx.Commit(); err != nil {
+		lock.end("commit_failed")
 		return 0, internalError(err, "commit terminal one-shot secret backfill")
 	}
+	lock.end("commit")
 	return scrubbed, nil
 }

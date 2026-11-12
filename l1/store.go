@@ -93,6 +93,7 @@ type Store struct {
 	readSnapshotLastLog               atomic.Int64
 	logf                              func(string, ...any)
 	readSnapshotOverruns              atomic.Uint64
+	writeLockLogThreshold             time.Duration
 	personObservationFallbacks        atomic.Uint64
 	personObservationFallbackLastLog  atomic.Int64
 	db                                *sql.DB
