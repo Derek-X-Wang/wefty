@@ -2106,16 +2106,34 @@ attempt authorities and their deterministic resource rows. Ordinary services
 call it after the separate idempotent
 `DeleteManagedVolume(service_data, job_id)` succeeds; Computer operation
 cleanup calls it after the corresponding Computer disk deletion succeeds.
-Storage-only attestation has two closed authority shapes: the prepared-removal
-shape carries the exact helper-originated never-attached witness returned by
-`InventoryRemoval`. The witness names the Job that prepared the Storage, which
-is not compared to the removal's Job after a Job rotation (#1607); it must
-still name the removal's Node and root instance and the exact Storage
-identity. Reset/restore predecessor and failed-import cleanup
-carry a typed operation/revision attempt identity after their separately
-authorized `DeleteManagedVolume` call. The operation shapes cannot claim the
-never-attached witness, and an arbitrary synthetic attempt identity is refused.
-It inventories every named lease, snapshot, container, task, shim, cgroup,
+Storage-only removal attestation has three closed arms, one per Storage
+generation, plus separate operation-cleanup shapes.
+- Prepared (`storage-removal-<generation>`): carries the exact
+  helper-originated never-attached witness returned by `InventoryRemoval`.
+  The witness names the Job that prepared the Storage, which is not compared
+  to the removal's Job after a Job rotation (#1607); it must still name the
+  removal's Node and root instance and the exact Storage identity.
+- Absent (`storage-absent-<generation>`, `storage_absent`): no Storage payload
+  of the exact generation remains; a lock or refusal tombstone without bytes
+  may. It carries no witness.
+- Detached (`storage-detached-<generation>`, #1611): carries a
+  `storage_detachment` witness, helper evidence that a once-attached
+  generation is positively detached. It names the generation's last
+  attachment (Job, attempt, boot) without comparing it to the removal's Job,
+  the detach evidence kind with its boot or sweep-epoch rule, and the helper
+  session that proved mount and loop absence. It must name the removal's Node
+  and the exact Storage identity. Detach evidence records no root instance,
+  so the witness carries none; the removal record and the L1 acknowledgement
+  bind the root. The field is additive within wire major 2: agent and helper
+  are one checksum-bound pair, and any mixed pair fails closed.
+
+Each arm accepts only its own evidence: no arm may carry another arm's
+witness. Reset/restore predecessor and failed-import cleanup carry a typed
+operation/revision attempt identity after their separately authorized
+`DeleteManagedVolume` call; those operation shapes cannot claim a
+never-attached or a detachment witness, and an arbitrary synthetic attempt
+identity is refused.
+`AttestRemoval` inventories every named lease, snapshot, container, task, shim, cgroup,
 framed-log directory, and durable-data class. Ordinary services assert both
 their service-data directory and owner record; Computers instead assert disk
 image, allocation, quota, manifest, mount, loop, and attachment identities.

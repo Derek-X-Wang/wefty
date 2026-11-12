@@ -1,3 +1,11 @@
 .bin/
 __pycache__/
 *.pyc
+
+# go build ./cmd/<name> output at the repository root (#1625)
+/wefty
+/wefty-agent
+/wefty-computer-conformance
+/wefty-echo-service
+/wefty-l1
+/wefty-l3
