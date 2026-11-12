@@ -1304,7 +1304,11 @@ type RemovalAttemptManifest struct {
 	StorageOnly        bool                                        `json:"storage_only,omitempty"`
 	StorageAbsent      bool                                        `json:"storage_absent,omitempty"`
 	StoragePreparation *contract.ComputerStoragePreparationWitness `json:"storage_preparation,omitempty"`
-	Resources          []RemovalResource                           `json:"resources"`
+	// StorageDetachment is the third Storage-only arm (#1611): a once-attached
+	// generation the helper proved positively detached. Agent and helper are
+	// one checksum-bound pair, so this is a lockstep change within wire major 2.
+	StorageDetachment *contract.ComputerStorageDetachmentWitness `json:"storage_detachment,omitempty"`
+	Resources         []RemovalResource                          `json:"resources"`
 }
 
 type InventoryRemovalRequest struct {
@@ -1443,17 +1447,24 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 			}
 		}
 		want := ExpectedRemovalResources(identity, attempt.HandoffVolume, attempt.ComputerStorage)
+		if !attempt.StorageOnly && attempt.StorageDetachment != nil {
+			return errors.New("runtime removal attestation cannot claim Storage detachment evidence")
+		}
 		if attempt.StorageOnly {
 			if attempt.ComputerStorage == nil {
 				return errors.New("storage-only removal attestation requires Computer Storage")
 			}
 			switch {
 			case attempt.StorageAbsent && contract.ValidStorageAbsentRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
-				if attempt.StoragePreparation != nil {
-					return errors.New("already-absent storage removal evidence cannot claim preparation authority")
+				if attempt.StoragePreparation != nil || attempt.StorageDetachment != nil {
+					return errors.New("already-absent storage removal evidence cannot claim preparation or detachment evidence")
+				}
+			case !attempt.StorageAbsent && contract.ValidStorageDetachedRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
+				if attempt.StoragePreparation != nil || !validStorageDetachmentWitness(attempt.StorageDetachment, *attempt.ComputerStorage, authority.NodeID) {
+					return errors.New("storage-only removal attestation requires matching Computer Storage detachment evidence")
 				}
 			case !attempt.StorageAbsent && contract.ValidStorageOnlyRemovalAttemptID(authority.AttemptID, attempt.ComputerStorage.StorageGeneration):
-				if attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
+				if attempt.StorageDetachment != nil || attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
 					attempt.StoragePreparation.NodeID != authority.NodeID ||
 					attempt.StoragePreparation.ComputerID != attempt.ComputerStorage.ComputerID ||
 					attempt.StoragePreparation.StorageID != attempt.ComputerStorage.StorageID ||
@@ -1461,11 +1472,11 @@ func validateAttestRemovalRequest(request AttestRemovalRequest, nodeID string) e
 					return errors.New("storage-only removal attestation requires matching durable Computer Storage preparation evidence")
 				}
 			case !attempt.StorageAbsent && generation <= uint64(1<<63-1) && contract.ValidComputerStorageCleanupAttemptID(authority.AttemptID, int64(generation)):
-				if attempt.StoragePreparation != nil {
+				if attempt.StoragePreparation != nil || attempt.StorageDetachment != nil {
 					return errors.New("storage cleanup attestation cannot claim never-attached preparation evidence")
 				}
 			default:
-				return errors.New("storage-only removal attestation requires typed prepared-removal or storage-cleanup authority")
+				return errors.New("storage-only removal attestation requires typed prepared, detached, absent, or storage-cleanup authority")
 			}
 			want = expectedComputerStorageRemovalResources(attempt.ComputerStorage)
 		}
@@ -2200,4 +2211,13 @@ func randomCapability() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(value), nil
+}
+
+// validStorageDetachmentWitness checks a detachment witness against the
+// Storage row and Node it is offered for. The witness's own Valid holds the
+// kind and boot/sweep-epoch shape.
+func validStorageDetachmentWitness(witness *contract.ComputerStorageDetachmentWitness, storage ComputerStorageReference, nodeID string) bool {
+	return witness != nil && witness.Valid() && witness.NodeID == nodeID &&
+		witness.ComputerID == storage.ComputerID && witness.StorageID == storage.StorageID &&
+		witness.StorageGeneration == storage.StorageGeneration
 }

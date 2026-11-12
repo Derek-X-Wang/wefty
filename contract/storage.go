@@ -11,11 +11,17 @@ import (
 const (
 	StorageOnlyRemovalAttemptPrefix          = "storage-removal-"
 	StorageAbsentRemovalAttemptPrefix        = "storage-absent-"
+	StorageDetachedRemovalAttemptPrefix      = "storage-detached-"
 	ComputerStorageResetRetirementPrefix     = "storage-reset-"
 	ComputerStorageRestoreRetirementPrefix   = "storage-restore-"
 	ComputerStorageFailedImportCleanupPrefix = "storage-import-failed-"
 	ComputerStorageCopyVerifiedKind          = "computer_storage_copy_verified"
 	ComputerStorageResetVerifiedKind         = "computer_storage_reset_verified"
+	ComputerStorageDetachedKind              = "computer_storage_detached"
+	// The two detach evidence kinds the helper writes: a reap in the boot that
+	// detached, or a sweep that re-proved detachment after a restart.
+	ComputerStorageDetachSameBootReap   = "same_boot_reap"
+	ComputerStorageDetachPriorBootSweep = "prior_boot_sweep"
 )
 
 func StorageOnlyRemovalAttemptID(generation int64) string {
@@ -32,6 +38,16 @@ func StorageAbsentRemovalAttemptID(generation int64) string {
 
 func ValidStorageAbsentRemovalAttemptID(attemptID string, generation int64) bool {
 	return generation > 0 && attemptID == StorageAbsentRemovalAttemptID(generation)
+}
+
+// StorageDetachedRemovalAttemptID names the Storage-only removal row for a
+// once-attached generation that the helper proved positively detached (#1611).
+func StorageDetachedRemovalAttemptID(generation int64) string {
+	return fmt.Sprintf("%s%d", StorageDetachedRemovalAttemptPrefix, generation)
+}
+
+func ValidStorageDetachedRemovalAttemptID(attemptID string, generation int64) bool {
+	return generation > 0 && attemptID == StorageDetachedRemovalAttemptID(generation)
 }
 
 func ComputerStorageResetRetirementAttemptID(revision int64) string {
@@ -75,6 +91,61 @@ func (w ComputerStoragePreparationWitness) Valid() bool {
 		strings.TrimSpace(w.JobID) != "" && strings.TrimSpace(w.ComputerID) != "" &&
 		strings.TrimSpace(w.StorageID) != "" && w.StorageGeneration > 0 && w.Revision > 0 &&
 		strings.TrimSpace(w.Fence) != "" && w.HelperGeneration > 0
+}
+
+// ComputerStorageDetachmentWitness is helper-originated evidence that a
+// once-attached Storage generation is positively detached: its latest
+// attach/detach record is a detach, and the helper session named by
+// HelperGeneration proved no mount and no loop under the generation flock
+// (#1611). It is never preparation evidence and never absence evidence.
+//
+// The Attached* fields name the last attachment. They are recorded, not
+// compared to the removing Job: L1 may have replaced a stopped Computer's Job
+// since. A sweep restamp keeps them; they change only after a newer attach.
+// The witness carries no root instance, because detach evidence records
+// none; the removal record and the L1 acknowledgement bind the root.
+type ComputerStorageDetachmentWitness struct {
+	Kind                  string `json:"kind"`
+	EvidenceKind          string `json:"evidence_kind"`
+	ReceiptID             string `json:"receipt_id"`
+	NodeID                string `json:"node_id"`
+	ComputerID            string `json:"computer_id"`
+	StorageID             string `json:"storage_id"`
+	StorageGeneration     int64  `json:"storage_generation"`
+	AttachedJobID         string `json:"attached_job_id"`
+	AttachedAttemptID     string `json:"attached_attempt_id"`
+	AttachedBootSessionID string `json:"attached_boot_session_id"`
+	SweepEpoch            string `json:"sweep_epoch,omitempty"`
+	HelperGeneration      uint64 `json:"helper_generation"`
+}
+
+func (w ComputerStorageDetachmentWitness) Valid() bool {
+	switch w.EvidenceKind {
+	case ComputerStorageDetachSameBootReap:
+		if w.SweepEpoch != "" {
+			return false
+		}
+	case ComputerStorageDetachPriorBootSweep:
+		if strings.TrimSpace(w.SweepEpoch) == "" {
+			return false
+		}
+	default:
+		return false
+	}
+	return w.Kind == ComputerStorageDetachedKind && strings.TrimSpace(w.ReceiptID) != "" &&
+		strings.TrimSpace(w.NodeID) != "" && strings.TrimSpace(w.ComputerID) != "" &&
+		strings.TrimSpace(w.StorageID) != "" && w.StorageGeneration > 0 &&
+		strings.TrimSpace(w.AttachedJobID) != "" && strings.TrimSpace(w.AttachedAttemptID) != "" &&
+		strings.TrimSpace(w.AttachedBootSessionID) != "" && w.HelperGeneration > 0
+}
+
+// SameLastAttachment reports whether two witnesses describe the same last
+// attachment: a sweep restamp of one detach, not a newer attach.
+func (w ComputerStorageDetachmentWitness) SameLastAttachment(other ComputerStorageDetachmentWitness) bool {
+	return w.ComputerID == other.ComputerID && w.StorageID == other.StorageID &&
+		w.StorageGeneration == other.StorageGeneration && w.NodeID == other.NodeID &&
+		w.AttachedJobID == other.AttachedJobID && w.AttachedAttemptID == other.AttachedAttemptID &&
+		w.AttachedBootSessionID == other.AttachedBootSessionID
 }
 
 // ComputerStorageResetReceipt is the one cross-boundary witness for a

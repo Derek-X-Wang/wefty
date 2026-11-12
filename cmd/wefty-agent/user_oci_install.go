@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -47,7 +48,7 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 			return false, err
 		}
 	}
-	preparedPath := filepath.Join(filepath.Dir(c.SetupState), "host-vm-prepared.json")
+	preparedPath := userOCIPreparedPath(c)
 	wanted := preparedUserOCI{Assets: c.Assets, Instance: c.Instance, LimaHome: c.LimaHome, MountRoot: c.MountRoot, Sizing: c.Sizing}
 	var prepared preparedUserOCI
 	preparedErr := limarunner.ReadUserInstallJSON(preparedPath, &prepared)
@@ -161,6 +162,39 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 		}
 	}
 	return approved, nil
+}
+
+func userOCIPreparedPath(c limarunner.UserInstallConfig) string {
+	return filepath.Join(filepath.Dir(c.SetupState), "host-vm-prepared.json")
+}
+
+// userOCIRecreateReinstall returns the guest preparation a recreated host VM
+// needs before recovery (#1612). It forgets the prepared receipt first: if the
+// cycle stops after the delete, the next node-agent start prepares the new
+// guest instead of skipping it. The interim Mac bootstrap keeps no helper
+// assets in the running agent, so it cannot rebuild a guest and refuses.
+func userOCIRecreateReinstall(path, nodeID, bootID string, prepare func(context.Context, limarunner.UserInstallConfig, string, string) error) (func(context.Context) error, error) {
+	if path == "" {
+		return nil, &ocicontrol.ControlError{Code: ocicontrol.ErrorSetupRequired, Status: http.StatusPreconditionFailed,
+			Message: "host VM recreate refused: this node runs the interim Mac bootstrap, which cannot reinstall the guest helper in a new host VM; move to the per-user installation (wefty setup --oci-config) before recreating"}
+	}
+	var c limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &c); err != nil {
+		return nil, err
+	}
+	preparedPath := userOCIPreparedPath(c)
+	if err := os.Remove(preparedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	root, err := os.OpenRoot(filepath.Dir(preparedPath))
+	if err != nil {
+		return nil, err
+	}
+	syncErr := durable.SyncDir(root)
+	if err := errors.Join(syncErr, root.Close()); err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) error { return prepare(ctx, c, nodeID, bootID) }, nil
 }
 
 // Registered is only a startup signal. Keep a receipt only after the local

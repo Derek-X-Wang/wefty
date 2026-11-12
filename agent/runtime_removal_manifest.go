@@ -148,11 +148,22 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 		if manifest.ComputerStorage == nil {
 			return errors.New("agent: Storage-only removal manifest lacks durable preparation evidence")
 		}
+		// Three closed arms: absent, detached (once attached, positively
+		// detached; #1611), and prepared (never attached).
 		if manifest.StorageAbsent {
-			if manifest.StoragePreparation != nil || !contract.ValidStorageAbsentRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) {
+			if manifest.StoragePreparation != nil || manifest.StorageDetachment != nil ||
+				!contract.ValidStorageAbsentRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) {
 				return errors.New("agent: already-absent Storage manifest lacks typed helper evidence")
 			}
-		} else if manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() ||
+		} else if contract.ValidStorageDetachedRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) {
+			witness := manifest.StorageDetachment
+			if manifest.StoragePreparation != nil || witness == nil || !witness.Valid() || witness.NodeID != manifest.NodeID ||
+				witness.ComputerID != manifest.ComputerStorage.ComputerID || witness.StorageID != manifest.ComputerStorage.StorageID ||
+				witness.StorageGeneration != manifest.ComputerStorage.StorageGeneration ||
+				(witness.EvidenceKind == contract.ComputerStorageDetachSameBootReap && witness.AttachedBootSessionID != manifest.BootSessionID) {
+				return errors.New("agent: Storage-only removal manifest lacks a matching detachment witness")
+			}
+		} else if manifest.StorageDetachment != nil || manifest.StoragePreparation == nil || !manifest.StoragePreparation.Valid() ||
 			!contract.ValidStorageOnlyRemovalAttemptID(manifest.AttemptID, manifest.ComputerStorage.StorageGeneration) ||
 			manifest.StoragePreparation.NodeID != manifest.NodeID ||
 			manifest.StoragePreparation.ComputerID != manifest.ComputerStorage.ComputerID ||
@@ -160,7 +171,7 @@ func validateRuntimeResourceManifest(manifest workloadrunner.RuntimeResourceMani
 			manifest.StoragePreparation.StorageGeneration != manifest.ComputerStorage.StorageGeneration {
 			return errors.New("agent: Storage-only removal manifest lacks durable preparation evidence")
 		}
-	} else if manifest.StorageAbsent || strings.TrimSpace(manifest.LeaseID) == "" || strings.TrimSpace(manifest.TaskID) == "" ||
+	} else if manifest.StorageAbsent || manifest.StorageDetachment != nil || strings.TrimSpace(manifest.LeaseID) == "" || strings.TrimSpace(manifest.TaskID) == "" ||
 		strings.TrimSpace(manifest.ContainerID) == "" || strings.TrimSpace(manifest.SnapshotID) == "" ||
 		strings.TrimSpace(manifest.ShimID) == "" || strings.TrimSpace(manifest.CgroupID) == "" ||
 		strings.TrimSpace(manifest.LogSegmentDirectory) == "" {
@@ -339,12 +350,24 @@ func sameStorageOnlyInventory(left, right runtimeRemovalManifest) bool {
 		if !found || *oldAttempt.ComputerStorage != *newAttempt.ComputerStorage || oldAttempt.StorageAbsent && !newAttempt.StorageAbsent {
 			return false
 		}
-		if newAttempt.StorageAbsent {
-			if newAttempt.StoragePreparation != nil {
+		switch {
+		case newAttempt.StorageAbsent:
+			// Any arm may become absent: the bytes are gone.
+			if newAttempt.StoragePreparation != nil || newAttempt.StorageDetachment != nil {
 				return false
 			}
-		} else if oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil || *oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {
-			return false
+		case newAttempt.StorageDetachment != nil:
+			// A detached row may only be restamped (#1611): the same last
+			// attachment, re-proven by a newer boot or sweep. A changed last
+			// attachment means an attach happened after removal began.
+			if oldAttempt.StorageDetachment == nil || !oldAttempt.StorageDetachment.SameLastAttachment(*newAttempt.StorageDetachment) {
+				return false
+			}
+		default:
+			if oldAttempt.StorageDetachment != nil || oldAttempt.StoragePreparation == nil || newAttempt.StoragePreparation == nil ||
+				*oldAttempt.StoragePreparation != *newAttempt.StoragePreparation {
+				return false
+			}
 		}
 	}
 	return true
@@ -469,6 +492,14 @@ func validateRuntimeRemovalRecord(record runtimeRemovalRecord) error {
 		if attempt.StorageAbsent {
 			if attempt.StoragePreparation != nil {
 				return fmt.Errorf("already-absent Storage attempt %q field storage_preparation must be empty", attempt.AttemptID)
+			}
+			if attempt.StorageDetachment != nil {
+				return fmt.Errorf("already-absent Storage attempt %q field storage_detachment must be empty", attempt.AttemptID)
+			}
+		} else if attempt.StorageDetachment != nil {
+			// Detach evidence records no root; the removal record binds it.
+			if attempt.StoragePreparation != nil {
+				return fmt.Errorf("detached Storage attempt %q field storage_preparation must be empty", attempt.AttemptID)
 			}
 		} else if attempt.StoragePreparation == nil || attempt.StoragePreparation.RootInstanceID != record.removal.rootInstanceID {
 			return fmt.Errorf("Storage-only attempt %q field storage_preparation.root_instance_id does not match the removal root instance", attempt.AttemptID)

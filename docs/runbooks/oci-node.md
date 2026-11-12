@@ -71,7 +71,7 @@ wefty node oci off
 
 `oci always-on` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci off` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
-An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation, Backup copy, service data or Custody write record remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
+An unchanged setup rerun causes no restart, intent revision, or capability revision. On a Mac, setup also prints the host VM base: the observed guest OS against the template's. A difference reads "base upgrade available" and is advisory; it never blocks setup, and staying on the current base is supported. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation, Backup copy, service data or Custody write record remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
 Stopped Computers keep their Storage and therefore block recreation too.
 Stopped service data and owner records also block. For a known job with a valid
@@ -456,6 +456,22 @@ Meaning: the live installed systemd version and installed unit keys match the du
 
 Meaning: the live installed systemd version, policy name, or installed unit keys differ from the durable rendered helper policy. First action: rerun setup and apply restart convergence.
 
+## doctor-code-oci-host-vm-base-not-applicable
+
+Meaning: no Lima host VM is configured for this node. A native Linux node runs OCI on the host OS, so it has no host VM base. First action: none.
+
+## doctor-code-oci-host-vm-base-not-observed
+
+Meaning: the host VM guest OS (`ID-VERSION_ID` from the guest's `/etc/os-release`) has no readable record in the Lima instance directory. The node agent records it when it prepares the host VM: at the first start, at the first start after a wefty upgrade (the helper version changes, so the prepared receipt no longer matches), and after a recreate. An on-demand node restart without an upgrade skips preparation and records nothing new. An interim Mac bootstrap records it only at bootstrap. A failed or stuck guest read is logged as `event=host_vm_guest_os_unobserved` and never stops the node agent. An unknown base is never treated as a difference and never blocks setup. An agent that predates the observation reports this code with cause `peer_does_not_report`. First action: none; the record appears at the next preparation.
+
+## doctor-code-oci-host-vm-base-current
+
+Meaning: the observed guest OS matches the base the setup template boots. The detail also shows the guest kernel, read live when the host VM answers; the kernel is shown, never converged on. First action: none.
+
+## doctor-code-oci-host-vm-base-upgrade-available
+
+Meaning: the observed guest OS is older or different from the template's base, for example `ubuntu-24.04` against `ubuntu-26.04`. This is advisory and the finding passes: staying on the current base is supported, and a plain `setup-oci` still applies sizing and probe changes. Kernel-gated features fall back on an older guest kernel. First action: none required.
+
 ## doctor-code-oci-boot-sweep-not-recorded
 
 Meaning: no barrier-pinned verified sweep receipt exists. Evidence: record helper generation and agent boot identity. First action: inspect boot-barrier startup ordering; do not advertise OCI. Escalation: attach the acquire, sweep, verify, and probe event order.
@@ -610,7 +626,7 @@ Meaning: sizing differs and requires an authorized restart. Evidence: record old
 
 ## doctor-code-oci-convergence-recreate-required
 
-Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage, Backup copies, service data and Custody write records. First action: obtain explicit operator confirmation, follow the per-blocker recovery action below, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override.
+Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage, Backup copies, service data and Custody write records. First action: obtain explicit operator confirmation, follow the per-blocker recovery action below, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override. The recreate installs the guest helper and probe in the new host VM before recovery. If setup reports an error after the delete, restart the node agent: its startup prepares the new guest. An interim Mac bootstrap node refuses `--recreate` with `oci_setup_required`, because it cannot reinstall the helper; move it to the per-user installation first.
 
 ## host-vm-recreate-blocked
 

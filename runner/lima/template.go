@@ -194,7 +194,7 @@ cpus: %d
 memory: %s
 disk: %s
 base:
-  - template:_images/ubuntu-26.04
+  - template:_images/%s
 mountType: virtiofs
 mounts:
   - location: %s
@@ -221,7 +221,7 @@ portForwards:
     guestIPMustBeZero: false
     proto: any
     ignore: true
-`, config.Sizing.CPUs, quote(config.Sizing.Memory), quote(config.Sizing.Disk),
+`, config.Sizing.CPUs, quote(config.Sizing.Memory), quote(config.Sizing.Disk), TemplateGuestOS,
 		quote(filepath.Clean(config.HostAllowedMountRoot)), quote(GuestAllowedMountRoot), quote(GuestHelperSocket), HostHelperSocketName)
 	return []byte(template), nil
 }

@@ -479,7 +479,25 @@ Configure-only setup writes a separate desired-state receipt before returning
 a restart/recreate refusal. The applied receipt advances only after authorized
 convergence, so doctor derives unchanged, live-safe, restart-required, or
 recreate-required by comparing current with desired rather than echoing the
-last probe reason.
+last probe reason. The setup result and the doctor convergence finding name
+each differing setup-state field and the flag that applies it.
+
+The host VM base is not part of that comparison (#1593). The node agent reads
+the guest OS release (`ID-VERSION_ID` from the guest's `/etc/os-release`) when
+it prepares a Lima host VM, and records it in the instance directory as
+`wefty-guest-os.json`. A failed or stuck read leaves the base unknown and is
+logged; it never stops the node agent. The record is written only from that observation, never
+from the template or the desired state, and a recreate's `limactl delete`
+removes it with the VM it describes. The setup state format does not change,
+so an older build never meets the record. The desired base is the release the
+rendered template boots. A plain `setup-oci` run reports the current and
+desired base and never blocks on a difference. A difference is advisory: doctor's
+`host-vm-base` finding passes with "base upgrade available", and staying on the
+current base is supported. An unobserved or unreadable record is unknown: it
+is never treated as a difference. Doctor also shows the guest kernel, read live
+when the host VM answers; the kernel is not converged on, because it changes
+inside the guest. This is macOS only. A Linux node has no host VM: setup
+reports no base and doctor reports `host-vm-base` as not applicable.
 
 Every host VM recreate, including a per-user installation's recreate, passes
 the same guard immediately before Lima deletion, under the Lima lifecycle
@@ -490,6 +508,17 @@ staging and retired generations, quarantined Storage, and unresolved reset
 records. Service data and its owner records, including stopped services, and
 Custody write records also refuse recreation. There is no acknowledged-loss
 override.
+
+The new host VM has no guest helper. After `limactl start`, still under the
+Lima lifecycle lock, the recreate runs the per-user installation's guest
+preparation again: it installs the helper and probe image and verifies the
+helper handshake. Only then does the ordinary recovery run. A failed
+reinstall fails the setup request without recovery, and the applied receipt
+does not advance. Before the cycle starts, the recreate removes the per-user
+prepared receipt, so the next node-agent start prepares the new guest even
+when the cycle stopped after the delete. The interim Mac bootstrap keeps no
+helper assets in its running agent; it refuses a recreate with
+`oci_setup_required` before any quiesce or delete.
 
 The guard reads the helper's durable guest files. The node agent's local spool
 records removal acknowledgements, not a complete inventory of physical copies;
@@ -1047,7 +1076,14 @@ exact helper manifest is prepared by a durable reset/copy receipt, unattached,
 has no loop or mount, and has no prior attachment or retirement evidence is
 frozen as prepared Storage-only evidence. A generation whose exact managed
 disk root is already absent is frozen as distinct typed absent-Storage
-evidence; the helper never creates the missing root to prove that fact. Legacy
+evidence; the helper never creates the missing root to prove that fact. A
+once-attached generation whose latest attach/detach record is a detach, with
+no mount or loop, is frozen as detached Storage-only evidence (#1611). Its
+witness names the last attachment, which may belong to a Job L1 has since
+replaced. A refresh may restamp it only with the same last attachment; a
+changed last attachment, or a change between detached and prepared, refuses
+the refresh. Any arm may refresh to absent. A detached generation is deleted
+with the full helper check, never as already absent. Legacy
 reconstruction scans the Job's runtime authorities once and each L1-claimed
 Storage generation once, then deduplicates only byte-identical authorities.
 The session still passes the complete generation inventory through the
@@ -1059,8 +1095,8 @@ receipt covers the Job while the helper independently finalizes every Storage
 generation claimed by L1; historical generations do not need to be relabelled
 as members of the current runtime attempt.
 The frozen manifest contains empty runtime identifiers and does not manufacture
-lease, task, container, or other attempt rows. After a reboot, prepared
-Storage-only evidence is re-inventoried and refreshed under the current helper
+lease, task, container, or other attempt rows. After a reboot, prepared and
+detached Storage-only evidence is re-inventoried and refreshed under the current helper
 session before it can produce a no-runtime receipt.
 
 Only that durable `no_runtime_resources` receipt permits the local managed
