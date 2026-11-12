@@ -436,19 +436,7 @@ func exerciseLiveStorageProvenanceBudgets(t *testing.T, harness *acceptanceHarne
 			Detail: "status=" + backupOperation.Status + " " + storageBudgetDetail(backupOperation.Failure)}
 	}
 
-	created := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "create", source.ComputerID,
-		"--expect-current", "--allow-power-off", "--idempotency-key", "linux-native-budget-source-backup", "--wait", "4m")
-	backupID := ""
-	if created.Backups != nil {
-		for _, candidate := range created.Backups.Backups {
-			if candidate.Status == "available" {
-				backupID = candidate.BackupID
-			}
-		}
-	}
-	if backupID == "" {
-		t.Fatalf("no available Backup to copy from: %#v", created)
-	}
+	backupID := createLiveStorageBackup(t, harness, source, "linux-native-budget-source-backup")
 	source = waitForComputerCLI(t, harness, source.ComputerID, 3*time.Minute, computerDisplayPublished)
 
 	// Clone: no new generation root can be created. The clone ends failed,
@@ -618,6 +606,7 @@ func exerciseLiveCopyAbort(t *testing.T, harness *acceptanceHarness, reference, 
 		Passed: restoreBefore.ReconfigurationPhase == l1.ComputerReconfigurationRestoring &&
 			restoreAborted.ReconfigurationPhase == l1.ComputerReconfigurationStable &&
 			restoreAborted.StorageGeneration == restoreTarget.StorageGeneration &&
+			restoreAborted.DesiredState == contract.ServiceDesiredStopped &&
 			restoreStatus == "superseded" && restoreCode == string(l1.ComputerRestoreFailureAbortedDeadNode),
 		Detail: fmt.Sprintf("before_phase=%s aborted_phase=%s generation=%d->%d operation=%s/%s", restoreBefore.ReconfigurationPhase,
 			restoreAborted.ReconfigurationPhase, restoreTarget.StorageGeneration, restoreAborted.StorageGeneration, restoreStatus, restoreCode)}
@@ -628,9 +617,20 @@ func exerciseLiveCopyAbort(t *testing.T, harness *acceptanceHarness, reference, 
 			cloneStatus == "superseded" && cloneCode == string(l1.ComputerRestoreFailureAbortedDeadNode),
 		Detail: fmt.Sprintf("before_phase=%s aborted_phase=%s name=%s operation=%s/%s", cloneBefore.ReconfigurationPhase,
 			cloneAborted.ReconfigurationPhase, cloneAborted.Name, cloneStatus, cloneCode)}
+	// The Node facts behind the L1 fields: the restored Computer runs on its
+	// old generation, and neither copy left a generation root behind.
+	restarted := startLiveStorageComputer(t, harness, restoreAborted)
+	staging := restoreTarget
+	staging.StorageGeneration++
+	stagingAbsent := nodePathAbsent(t, filepath.Join(liveStorageRuntimeRoot, "computer-disks", liveComputerDiskName(t, staging)))
+	evidence.Restore.Passed = evidence.Restore.Passed && restarted.StorageGeneration == restoreTarget.StorageGeneration && stagingAbsent
+	evidence.Restore.Detail += fmt.Sprintf(" started_generation=%d staging_root_absent=%t", restarted.StorageGeneration, stagingAbsent)
+	cloneRoot := filepath.Join(liveStorageRuntimeRoot, "computer-disks", liveComputerDiskName(t, cloneAborted))
 	removedClone := removeAndWaitComputer(t, harness, cloneAborted, 5*time.Minute)
-	evidence.Clone.Detail += " removal_outcome=" + removedClone.RemovalOutcome
-	removedRestore := removeAndWaitComputer(t, harness, restoreAborted, 5*time.Minute)
+	cloneRootAbsent := nodePathAbsent(t, cloneRoot)
+	evidence.Clone.Passed = evidence.Clone.Passed && cloneRootAbsent
+	evidence.Clone.Detail += fmt.Sprintf(" removal_outcome=%s destination_root_absent=%t", removedClone.RemovalOutcome, cloneRootAbsent)
+	removedRestore := removeAndWaitComputer(t, harness, restarted, 5*time.Minute)
 	evidence.Restore.Detail += " removal_outcome=" + removedRestore.RemovalOutcome
 	_ = removeAndWaitComputer(t, harness, cloneSource, 5*time.Minute)
 	return evidence
