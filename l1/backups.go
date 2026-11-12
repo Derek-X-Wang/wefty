@@ -85,6 +85,14 @@ const (
 	// import that has never started. There is no detached source to copy, so
 	// the operation fails with positive copy absence like the other two (#558).
 	ComputerBackupFailureSourceNeverDetached ComputerBackupFailureCode = "source_never_detached"
+	// A Backup that spent its failure budget (#1608) ends with the class of
+	// the report that spent it. It proves nothing about the copy: removal
+	// still owes its absence.
+	ComputerBackupFailureEngine                 ComputerBackupFailureCode = "engine_failure"
+	ComputerBackupFailureRuntimeLoss            ComputerBackupFailureCode = "runtime_loss"
+	ComputerBackupFailureQuarantined            ComputerBackupFailureCode = "computer_storage_quarantined"
+	ComputerBackupFailureAcknowledgementRefused ComputerBackupFailureCode = "acknowledgement_refused"
+	ComputerBackupFailureAgentRefused           ComputerBackupFailureCode = "agent_refused"
 )
 
 func validComputerBackupFailureCode(code string) bool {
@@ -102,6 +110,9 @@ type ComputerBackupOperationOutcome struct {
 	Status            string                    `json:"status"`
 	FailureCode       ComputerBackupFailureCode `json:"failure_code,omitempty"`
 	CompletedAt       *time.Time                `json:"completed_at,omitempty"`
+	// Failure is the operation's failure budget, present once an attempt
+	// was reported failed (#1608).
+	Failure *ComputerStorageOperationFailure `json:"failure,omitempty"`
 }
 
 type ComputerBackupCreateRequest struct {
@@ -204,6 +215,21 @@ func readComputerBackupOperationByKey(ctx context.Context, q queryer, computerID
 		job_id, cleanup_fence, idempotency_key, request_hash, status, failure_code,
 		resume_desired_running, acknowledgement_key, acknowledgement_hash
 		FROM computer_backup_operations WHERE computer_id=? AND idempotency_key=?`, computerID, key).Scan(
+		&row.ComputerID, &row.OperationRevision, &row.BackupID, &row.CopyID,
+		&row.StorageID, &row.StorageGeneration, &row.AllocatedSize, &row.BoundNodeID,
+		&row.RootInstanceID, &row.JobID, &row.CleanupFence, &row.IdempotencyKey,
+		&row.RequestHash, &row.Status, &row.FailureCode, &row.ResumeDesiredRunning,
+		&row.AcknowledgementKey, &row.AcknowledgementHash)
+	return row, err
+}
+
+func readComputerBackupOperationByRevision(ctx context.Context, q queryer, computerID string, revision int64) (computerBackupOperationRow, error) {
+	var row computerBackupOperationRow
+	err := q.QueryRowContext(ctx, `SELECT computer_id, operation_revision, backup_id, copy_id,
+		source_storage_id, source_generation, allocated_size, bound_node_id, root_instance_id,
+		job_id, cleanup_fence, idempotency_key, request_hash, status, failure_code,
+		resume_desired_running, acknowledgement_key, acknowledgement_hash
+		FROM computer_backup_operations WHERE computer_id=? AND operation_revision=?`, computerID, revision).Scan(
 		&row.ComputerID, &row.OperationRevision, &row.BackupID, &row.CopyID,
 		&row.StorageID, &row.StorageGeneration, &row.AllocatedSize, &row.BoundNodeID,
 		&row.RootInstanceID, &row.JobID, &row.CleanupFence, &row.IdempotencyKey,
@@ -491,18 +517,35 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 		row.OperationRevision); err != nil {
 		return Backup{}, Computer{}, internalError(err, "complete Computer Backup operation")
 	}
+	if err := releaseComputerBackupIntent(ctx, tx, row, now); err != nil {
+		return Backup{}, Computer{}, err
+	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
-		return Backup{}, Computer{}, internalError(err, "read Computer Backup completion authority")
+		return Backup{}, Computer{}, internalError(err, "read completed Computer Backup")
+	}
+	if err := tx.Commit(); err != nil {
+		return Backup{}, Computer{}, internalError(err, "commit Computer Backup acknowledgement")
+	}
+	return backup, computer, nil
+}
+
+// releaseComputerBackupIntent is the shared tail of every ended Backup: the
+// Computer leaves `backing_up`, and a Computer the Backup stopped resumes when
+// it is still meant to run.
+func releaseComputerBackupIntent(ctx context.Context, tx *sql.Tx, row computerBackupOperationRow, now time.Time) error {
+	computer, err := readComputerAuthority(ctx, tx, row.ComputerID, now)
+	if err != nil {
+		return internalError(err, "read Computer Backup completion authority")
 	}
 	if computer.ReconfigurationPhase != ComputerReconfigurationBackingUp || computer.ReconfigurationRevision == nil ||
 		*computer.ReconfigurationRevision != row.OperationRevision {
-		return Backup{}, Computer{}, protocolError(contract.ErrorConflict, "Computer Backup operation was superseded")
+		return protocolError(contract.ErrorConflict, "Computer Backup operation was superseded")
 	}
 	if computer.IntentRevision == row.OperationRevision && computer.DesiredState == contract.ServiceDesiredRunning &&
 		row.ResumeDesiredRunning && computer.CurrentJob.State != contract.JobFailed {
 		if err := setComputerServiceDesiredState(ctx, tx, computer.CurrentJob, contract.ServiceDesiredRunning, now); err != nil {
-			return Backup{}, Computer{}, err
+			return err
 		}
 	}
 	appliedRevision := row.OperationRevision
@@ -512,17 +555,10 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 	if _, err := tx.ExecContext(ctx, `UPDATE computers SET reconfiguration_phase='stable',
 		reconfiguration_revision=NULL, applied_revision=CASE WHEN applied_revision<? THEN ? ELSE applied_revision END,
 		updated_ns=? WHERE computer_id=? AND reconfiguration_phase='backing_up' AND reconfiguration_revision=?`,
-		appliedRevision, appliedRevision, now.UnixNano(), computerID, row.OperationRevision); err != nil {
-		return Backup{}, Computer{}, internalError(err, "release Computer Backup intent")
+		appliedRevision, appliedRevision, now.UnixNano(), row.ComputerID, row.OperationRevision); err != nil {
+		return internalError(err, "release Computer Backup intent")
 	}
-	computer, err = readComputerAuthority(ctx, tx, computerID, now)
-	if err != nil {
-		return Backup{}, Computer{}, internalError(err, "read completed Computer Backup")
-	}
-	if err := tx.Commit(); err != nil {
-		return Backup{}, Computer{}, internalError(err, "commit Computer Backup acknowledgement")
-	}
-	return backup, computer, nil
+	return nil
 }
 
 func readLastComputerBackupOperation(ctx context.Context, q queryer, computerID string) (*ComputerBackupOperationOutcome, error) {
@@ -540,6 +576,10 @@ func readLastComputerBackupOperation(ctx context.Context, q queryer, computerID 
 	if completedNS.Valid {
 		value := time.Unix(0, completedNS.Int64).UTC()
 		outcome.CompletedAt = &value
+	}
+	outcome.Failure, err = readComputerStorageOperationFailure(ctx, q, computerID, outcome.OperationRevision, ComputerStorageOperationBackup)
+	if err != nil {
+		return nil, err
 	}
 	return &outcome, nil
 }
@@ -594,6 +634,10 @@ func (r *databaseReads) computerViewComputerBackupOperation(ctx context.Context,
 	if completedNS.Valid {
 		value := time.Unix(0, completedNS.Int64).UTC()
 		outcome.CompletedAt = &value
+	}
+	outcome.Failure, err = readComputerStorageOperationFailure(ctx, r.q, computerID, outcome.OperationRevision, ComputerStorageOperationBackup)
+	if err != nil {
+		return ComputerBackupOperationOutcome{}, internalError(err, "read Computer Backup operation failure")
 	}
 	return outcome, nil
 }
@@ -978,12 +1022,7 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 				storageCopy.OperationRevision).Scan(&failureCode); err != nil {
 				return Backup{}, internalError(err, "read restore predecessor Backup copy outcome")
 			}
-			// A restore that a removal overtook, or one aborted after its copy
-			// kept failing (#1591), may leave a finished predecessor Backup copy
-			// that was never cataloged.
-			uncataloged := storageCopy.Status == "superseded" || (storageCopy.Status == "failed" &&
-				failureCode == string(ComputerRestoreFailureStorageCopyEngineFailure))
-			if !uncataloged || !storageCopy.KeepOldBackup ||
+			if !restorePredecessorMayBeUncataloged(storageCopy.Status, failureCode) || !storageCopy.KeepOldBackup ||
 				!storageCopy.OldBackupID.Valid || !storageCopy.OldCopyID.Valid ||
 				r.BackupID != storageCopy.OldBackupID.String || r.CopyID != storageCopy.OldCopyID.String ||
 				r.ComputerID != storageCopy.DestinationComputerID || r.StorageID != storageCopy.DestinationStorageID ||
@@ -1031,7 +1070,12 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 			return Backup{}, err
 		}
 		r := request.Receipt
-		if operation.Status != "superseded" || r.BackupID != operation.BackupID || r.CopyID != operation.CopyID ||
+		// A planned copy that a removal overtook, or one whose Backup the
+		// failure budget ended (#1608), may hold bytes no receipt accounted
+		// for. A Backup that failed by receipt already proved its copy absent
+		// and holds that receipt's acknowledgement key, refused below.
+		if (operation.Status != "superseded" && operation.Status != "failed") ||
+			r.BackupID != operation.BackupID || r.CopyID != operation.CopyID ||
 			r.ComputerID != operation.ComputerID || r.StorageID != operation.StorageID ||
 			r.StorageGeneration != operation.StorageGeneration || r.NodeID != operation.BoundNodeID ||
 			r.RootInstanceID != operation.RootInstanceID || r.OperationRevision != operation.OperationRevision ||
@@ -1053,7 +1097,8 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE computer_backup_operations SET receipt_json=?, receipt_hash=?,
 			acknowledgement_key=?, acknowledgement_hash=?, completed_ns=?
-			WHERE computer_id=? AND operation_revision=? AND status='superseded'`, receiptJSON,
+			WHERE computer_id=? AND operation_revision=? AND status IN ('superseded', 'failed')
+			AND acknowledgement_key IS NULL`, receiptJSON,
 			bodyHash, request.IdempotencyKey, bodyHash, now.UnixNano(), computerID,
 			operation.OperationRevision); err != nil {
 			return Backup{}, internalError(err, "record superseded Backup copy absence")

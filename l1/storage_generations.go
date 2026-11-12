@@ -71,6 +71,43 @@ type ComputerStorageResetDirective struct {
 
 type ComputerStorageResetReceipt = contract.ComputerStorageResetReceipt
 
+// ComputerStorageResetOutcome projects the latest durable reset. A reset is
+// running while `reserved`, `prepared` or `published`; it ends `retired` once
+// its predecessor is gone, `cleanup_owed` when it published but could not
+// delete its predecessor within the failure budget (#1608), `failed` when the
+// budget ended it before publication, or `superseded` when a removal or
+// dead-Node abort overtook it.
+type ComputerStorageResetOutcome struct {
+	OperationRevision int64                            `json:"operation_revision"`
+	Status            string                           `json:"status"`
+	FailureCode       string                           `json:"failure_code,omitempty"`
+	CompletedAt       *time.Time                       `json:"completed_at,omitempty"`
+	Failure           *ComputerStorageOperationFailure `json:"failure,omitempty"`
+}
+
+func readLastComputerStorageResetOutcome(ctx context.Context, q queryer, computerID string) (*ComputerStorageResetOutcome, error) {
+	var outcome ComputerStorageResetOutcome
+	var completedNS sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT intent_revision, status, failure_code, completed_ns FROM computer_storage_resets
+		WHERE computer_id=? ORDER BY intent_revision DESC LIMIT 1`, computerID).Scan(&outcome.OperationRevision,
+		&outcome.Status, &outcome.FailureCode, &completedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if completedNS.Valid {
+		completed := time.Unix(0, completedNS.Int64).UTC()
+		outcome.CompletedAt = &completed
+	}
+	outcome.Failure, err = readComputerStorageOperationFailure(ctx, q, computerID, outcome.OperationRevision, ComputerStorageOperationReset)
+	if err != nil {
+		return nil, err
+	}
+	return &outcome, nil
+}
+
 const computerStorageResetReceiptKind = "computer_storage_reset_verified"
 
 type ComputerStorageResetAcknowledgementRequest struct {
@@ -162,6 +199,20 @@ func readComputerStorageResetByKey(ctx context.Context, q queryer, computerID, k
 		request_hash, status, verification_receipt_json, verification_receipt_hash,
 		acknowledgement_key, acknowledgement_hash, resume_desired_running
 		FROM computer_storage_resets WHERE computer_id=? AND idempotency_key=?`, computerID, key).Scan(
+		&row.ComputerID, &row.IntentRevision, &row.StorageID, &row.OldGeneration,
+		&row.NewGeneration, &row.DiskBytes, &row.BoundNodeID, &row.RootInstanceID, &row.JobID, &row.CleanupFence,
+		&row.IdempotencyKey, &row.RequestHash, &row.Status, &row.ReceiptJSON, &row.ReceiptHash,
+		&row.AcknowledgementKey, &row.AcknowledgementHash, &row.ResumeDesiredRunning)
+	return row, err
+}
+
+func readComputerStorageResetByRevision(ctx context.Context, q queryer, computerID string, revision int64) (computerStorageResetRow, error) {
+	var row computerStorageResetRow
+	err := q.QueryRowContext(ctx, `SELECT computer_id, intent_revision, storage_id, old_generation,
+		new_generation, disk_bytes, bound_node_id, root_instance_id, job_id, cleanup_fence, idempotency_key,
+		request_hash, status, verification_receipt_json, verification_receipt_hash,
+		acknowledgement_key, acknowledgement_hash, resume_desired_running
+		FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`, computerID, revision).Scan(
 		&row.ComputerID, &row.IntentRevision, &row.StorageID, &row.OldGeneration,
 		&row.NewGeneration, &row.DiskBytes, &row.BoundNodeID, &row.RootInstanceID, &row.JobID, &row.CleanupFence,
 		&row.IdempotencyKey, &row.RequestHash, &row.Status, &row.ReceiptJSON, &row.ReceiptHash,
@@ -745,8 +796,8 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 		return Computer{}, protocolError(contract.ErrorStaleIntentRevision,
 			"Computer Storage reset no longer owns predecessor retirement")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='retired'
-		WHERE computer_id=? AND intent_revision=? AND status='published'`, computerID, reset.IntentRevision); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='retired', completed_ns=?
+		WHERE computer_id=? AND intent_revision=? AND status='published'`, now.UnixNano(), computerID, reset.IntentRevision); err != nil {
 		return Computer{}, internalError(err, "complete Computer Storage predecessor retirement")
 	}
 	if reset.ResumeDesiredRunning && computer.DesiredState == contract.ServiceDesiredRunning &&

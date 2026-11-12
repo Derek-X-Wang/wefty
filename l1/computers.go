@@ -103,6 +103,7 @@ type Computer struct {
 	BackupCap                 int64                              `json:"backup_cap"`
 	LastBackupOperation       *ComputerBackupOperationOutcome    `json:"last_backup_operation,omitempty"`
 	LastGrowOperation         *ComputerStorageGrowOutcome        `json:"last_grow_operation,omitempty"`
+	LastResetOperation        *ComputerStorageResetOutcome       `json:"last_reset_operation,omitempty"`
 	LastRestoreRevocation     *ComputerRestoreRevocationReceipt  `json:"last_restore_revocation,omitempty"`
 	RestoreOperation          *ComputerRestoreOperation          `json:"restore_operation,omitempty"`
 	CloneOperation            *ComputerCloneOperation            `json:"clone_operation,omitempty"`
@@ -842,6 +843,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	computer.LastGrowOperation, err = readLastComputerStorageGrowOutcome(ctx, q, computerID)
 	if err != nil {
 		return Computer{}, fmt.Errorf("read last Computer Storage grow operation: %w", err)
+	}
+	computer.LastResetOperation, err = readLastComputerStorageResetOutcome(ctx, q, computerID)
+	if err != nil {
+		return Computer{}, fmt.Errorf("read last Computer Storage reset operation: %w", err)
 	}
 	computer.LastRestoreRevocation, err = readLastComputerRestoreRevocation(ctx, q, computerID)
 	if err != nil {

@@ -295,6 +295,31 @@ const MaximumServiceRemovalStallDetail = 1024
 // agent that produces it.
 const MinimumServiceRemovalStallAttempts = 3
 
+// MaximumStorageOperationFailures and StorageOperationFailureWindow are the
+// one failure budget every Storage operation stage shares (#1608): an
+// operation ends only after this many counted failures AND this long since the
+// first, measured on the L1 clock when each report arrives. The count stops a
+// burst of fast failures from ending an operation; the window gives a
+// transient host fault time to clear. They are the values first accepted for
+// restore in #1591, now durable across agent restarts.
+const (
+	MaximumStorageOperationFailures = 5
+	StorageOperationFailureWindow   = 10 * time.Minute
+)
+
+// MaximumStorageOperationFailureDetail bounds the free-text context of one
+// Storage operation failure report. The class and code are the facts.
+const MaximumStorageOperationFailureDetail = MaximumServiceRemovalStallDetail
+
+// storageOperationFailureRetryBase and storageOperationFailureRetryCeiling
+// pace the next attempt of a failing Storage operation directive: the delay
+// doubles with each counted failure, so an operation that cannot succeed ends
+// 10 to 15 minutes after its first failure, after about seven calls.
+const (
+	storageOperationFailureRetryBase    = 15 * time.Second
+	storageOperationFailureRetryCeiling = 5 * time.Minute
+)
+
 // MaximumComputerReimagePreflightRefusals is how many consecutive authority
 // refusals of the same reimage preflight acknowledgement L1 admits before the
 // refusal is a durable fact about the operation rather than one bad try. It

@@ -50,6 +50,9 @@ type ComputerStorageGrowOutcome struct {
 	ObservedAvailableBytes *int64     `json:"observed_available_bytes,omitempty"`
 	FailureCode            string     `json:"failure_code,omitempty"`
 	CompletedAt            *time.Time `json:"completed_at,omitempty"`
+	// Failure is the grow's failure budget, present once an attempt was
+	// reported failed (#1608).
+	Failure *ComputerStorageOperationFailure `json:"failure,omitempty"`
 }
 
 type computerStorageGrowRow struct {
@@ -62,15 +65,25 @@ type computerStorageGrowRow struct {
 }
 
 func readLastComputerStorageGrowOutcome(ctx context.Context, q queryer, computerID string) (*ComputerStorageGrowOutcome, error) {
-	return scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
+	return withComputerStorageGrowFailure(ctx, q, computerID)(scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
 		receipt_json, completed_ns FROM computer_storage_grows WHERE computer_id=?
-		ORDER BY operation_revision DESC LIMIT 1`, computerID))
+		ORDER BY operation_revision DESC LIMIT 1`, computerID)))
 }
 
 func readComputerStorageGrowOutcomeByRevision(ctx context.Context, q queryer, computerID string, operationRevision int64) (*ComputerStorageGrowOutcome, error) {
-	return scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
+	return withComputerStorageGrowFailure(ctx, q, computerID)(scanComputerStorageGrowOutcome(q.QueryRowContext(ctx, `SELECT operation_revision, status, new_disk_bytes, failure_code,
 		receipt_json, completed_ns FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`,
-		computerID, operationRevision))
+		computerID, operationRevision)))
+}
+
+func withComputerStorageGrowFailure(ctx context.Context, q queryer, computerID string) func(*ComputerStorageGrowOutcome, error) (*ComputerStorageGrowOutcome, error) {
+	return func(outcome *ComputerStorageGrowOutcome, err error) (*ComputerStorageGrowOutcome, error) {
+		if err != nil || outcome == nil {
+			return outcome, err
+		}
+		outcome.Failure, err = readComputerStorageOperationFailure(ctx, q, computerID, outcome.OperationRevision, ComputerStorageOperationGrow)
+		return outcome, err
+	}
 }
 
 func (r *databaseReads) computerStorageGrowOutcome(ctx context.Context, computerID string, operationRevision int64) (*ComputerStorageGrowOutcome, error) {
