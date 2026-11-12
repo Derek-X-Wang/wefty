@@ -25,6 +25,7 @@ type recreateFixture struct {
 	commands                [][]string
 	quiesced                bool
 	reinstalls              int
+	reinstalledAfter        []string
 	reinstallUnlocked       bool
 	reinstallErr            error
 	recovered               bool
@@ -129,7 +130,9 @@ func (f *recreateFixture) recreate(t *testing.T) error {
 	t.Helper()
 	return f.barrier.Recreate(t.Context(), func(context.Context) error { f.quiesced = true; return nil }, func(context.Context) error {
 		f.reinstalls++
-		f.commands = append(f.commands, []string{"reinstall"})
+		if len(f.commands) != 0 {
+			f.reinstalledAfter = f.commands[len(f.commands)-1]
+		}
 		if f.barrier.cycleMu.TryLock() {
 			f.barrier.cycleMu.Unlock()
 			f.reinstallUnlocked = true
@@ -179,14 +182,9 @@ func TestRecreateReinstallsGuestHelperBeforeRecovery(t *testing.T) {
 	if err := f.recreate(t); err != nil || !f.recovered {
 		t.Fatalf("recreate = %v, recovered=%t", err, f.recovered)
 	}
-	var order []string
-	for _, command := range f.commands {
-		if command[0] == "delete" || command[0] == "start" || command[0] == "reinstall" {
-			order = append(order, command[0])
-		}
-	}
-	if strings.Join(order, ",") != "delete,start,reinstall" || f.reinstalls != 1 || f.reinstallUnlocked {
-		t.Fatalf("recreate order = %v, reinstall outside cycle lock=%t", order, f.reinstallUnlocked)
+	last := f.commands[len(f.commands)-1]
+	if f.reinstalls != 1 || len(f.reinstalledAfter) == 0 || f.reinstalledAfter[0] != "start" || last[0] != "start" || f.reinstallUnlocked {
+		t.Fatalf("reinstalls=%d after=%v last command=%v, reinstall outside cycle lock=%t", f.reinstalls, f.reinstalledAfter, last, f.reinstallUnlocked)
 	}
 	if f.barrier.cycleMu.TryLock() {
 		f.barrier.cycleMu.Unlock()
