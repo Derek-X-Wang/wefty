@@ -483,9 +483,15 @@ If a cancelled POST may have reached L3, bounded public reads find the run by
 its unique capture path before cancelling it. No submission POST is retried
 after a signal. A hard kill cannot be handled.
 
-Observation errors never cancel a run. Exec retries transient transport and
-server read errors for up to forty seconds per read, keeping its log cursor so
-output is not duplicated. If observation is still lost, it exits 13, says
+Observation errors never cancel a run. Exec retries transient read errors,
+keeping its log cursor so output is not duplicated. A successful read ends the
+retries. An unreachable service is retried every second for up to forty
+seconds per read, which outlasts a service restart. A busy service is retried
+for up to five minutes per read: one that answers a retryable server error, or
+that gives no answer within forty seconds. The gap between those reads doubles
+from one second to ten, so a loaded host is not asked every second. A run
+continues while its reads are busy, so exec keeps waiting for the command's
+own exit status. If observation is still lost, it exits 13, says
 "the run continues", and prints the run ID, follow and cancel commands, and
 retained storage path. After a failed run ends, exec also waits up to forty
 seconds for the command result to arrive before reporting a missing result

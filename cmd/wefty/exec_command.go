@@ -52,6 +52,16 @@ func execHeartbeatSchedule() (tick string, ticks int) {
 
 // Outlast the phase-1 service restart, which must complete in under 30 seconds.
 var execReadRecoveryBudget = 40 * time.Second
+
+// A busy service is still there, so its reads get longer than a restart does.
+// Under sustained host load one production read stayed unanswered for the
+// whole restart window while the run went on (#1629).
+var execReadOverloadBudget = 5 * time.Minute
+
+// The gap between reads of a busy service doubles from the poll interval up to
+// this many poll intervals.
+const execReadOverloadGapLimit = 10
+
 var execCancelSettlementBudget = l1.CancelSettlementTimeout
 
 type execParams struct {

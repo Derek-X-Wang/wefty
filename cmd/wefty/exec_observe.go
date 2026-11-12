@@ -11,14 +11,24 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// Attached exec outlasts transient transport failures during a service restart.
-// Each read has a bounded recovery window; successful reads reset the window.
-// Keep the log cursor outside retries so already delivered output is not replayed.
+// Attached exec outlasts transient read failures. Successful reads reset both
+// windows. Keep the log cursor outside retries so already delivered output is
+// not replayed.
+//
+// An unreachable service gets the restart window. A service that is there but
+// busy, answering a retryable server error or nothing before the attempt's
+// deadline, gets the longer overload window and a growing gap, so a loaded
+// host is not asked again every second (#1629).
 func readExec[T any](caller context.Context, clients *apiClients, read func(context.Context) (T, error)) (T, error) {
-	ctx, stop := context.WithTimeout(withoutClientRetry(caller), execReadRecoveryBudget)
+	overload, stop := context.WithTimeout(withoutClientRetry(caller), execReadOverloadBudget)
 	defer stop()
-	for {
-		value, err := read(ctx)
+	restart, stopRestart := context.WithTimeout(overload, execReadRecoveryBudget)
+	defer stopRestart()
+	for busyReads := 0; ; {
+		attempt, stopAttempt := context.WithTimeout(overload, execReadRecoveryBudget)
+		value, err := read(attempt)
+		timedOut := attempt.Err() != nil
+		stopAttempt()
 		if err == nil {
 			return value, nil
 		}
@@ -27,12 +37,14 @@ func readExec[T any](caller context.Context, clients *apiClients, read func(cont
 		}
 		var transport *unavailableError
 		var response *apiResponseError
-		transient := errors.As(err, &transport) || errors.Is(err, context.DeadlineExceeded) ||
-			(errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable)
-		if !transient || ctx.Err() != nil {
+		window, gap := restart, execPollInterval
+		if timedOut || (errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable) {
+			window, gap = overload, min(execPollInterval<<busyReads, execReadOverloadGapLimit*execPollInterval)
+			busyReads++
+		} else if !errors.As(err, &transport) && !errors.Is(err, context.DeadlineExceeded) {
 			return value, err
 		}
-		if e := clients.wait(ctx, execPollInterval); e != nil {
+		if window.Err() != nil || clients.wait(window, gap) != nil {
 			return value, err
 		}
 	}
