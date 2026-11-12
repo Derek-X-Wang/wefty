@@ -679,3 +679,43 @@ func TestComputerGrowFailureAtIntentWriteReleasesItsReservation(t *testing.T) {
 		t.Fatalf("grow to another size after the failed one = %+v err=%v", response, err)
 	}
 }
+
+// The attached-manifest refusal runs after the intent write. It releases the
+// pending capacity and removes this grow's own intent, and leaves the disk's
+// allocation state as it was (#1644).
+func TestComputerGrowAttachedManifestRefusalReleasesReservationAndOwnIntent(t *testing.T) {
+	root := t.TempDir()
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
+	diskRoot := filepath.Dir(imagePath)
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present {
+		t.Fatalf("manifest present=%t err=%v", present, err)
+	}
+	manifest.Attached = &AttemptAuthority{NodeID: request.Authority.NodeID, JobID: request.Authority.JobID,
+		AttemptID: "attempt-grow", FencingToken: "fence-grow", BootSessionID: request.Authority.BootSessionID,
+		Class: "service", RemovalGeneration: "1"}
+	if err := writeComputerDiskManifest(diskRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, capacityReservations: map[string]*capacityReservation{
+		request.Authority.JobID: {diskBytes: request.Storage.DiskBytes, diskMaterialized: false, attempts: make(map[string]struct{})}},
+		attempts: make(map[string]*containerdAttempt),
+		computerGrowResize: func(context.Context, string, string, int64, int64) error {
+			t.Error("refused grow reached resize")
+			return errors.New("unexpected resize")
+		},
+	}
+	if _, err := engine.GrowComputerStorage(t.Context(), request); err == nil ||
+		!strings.Contains(err.Error(), "without live attachment ownership") {
+		t.Fatalf("attached manifest without ownership = %v", err)
+	}
+	reservation := engine.capacityReservations[request.Authority.JobID]
+	if reservation == nil || reservation.pendingDiskBytes != 0 || reservation.diskMaterialized ||
+		reservation.diskBytes != request.Storage.DiskBytes {
+		t.Fatalf("reservation after refusal = %+v", reservation)
+	}
+	if _, present, err := readComputerStorageGrowIntent(diskRoot); err != nil || present {
+		t.Fatalf("refused grow left its intent: present=%t err=%v", present, err)
+	}
+}

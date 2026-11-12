@@ -207,13 +207,19 @@ func (engine *ContainerdEngine) reserveGrowCapacity(request GrowComputerStorageR
 // before it resized anything (#1644): its pending capacity and its own grow
 // intent. Kept, the pending delta made every later grow of this Computer to
 // another size conflict with the reservation until the helper restarted, even
-// after L1 ended this grow. A resumed grow whose image already has the new
-// size keeps both: its recovery owns them.
-func (engine *ContainerdEngine) abandonGrowBeforeResize(diskRoot string, request GrowComputerStorageRequest, imageSize int64) error {
-	if imageSize != request.Storage.DiskBytes {
+// after L1 ended this grow. It undoes only what reserveGrowCapacity set; the
+// disk's own size and allocation state stay as they were. A grow whose image
+// or manifest already names the new size keeps both: its recovery owns them.
+func (engine *ContainerdEngine) abandonGrowBeforeResize(diskRoot string, request GrowComputerStorageRequest, imageSize int64, manifestAtOldSize bool) error {
+	if imageSize != request.Storage.DiskBytes || !manifestAtOldSize {
 		return nil
 	}
-	engine.rollbackGrowCapacity(request.Authority.JobID, request.Storage.DiskBytes, true)
+	engine.capacityMu.Lock()
+	if reservation := engine.capacityReservations[request.Authority.JobID]; reservation != nil {
+		reservation.pendingDiskBytes = 0
+		reservation.pendingDiskAdmissionCeiling = 0
+	}
+	engine.capacityMu.Unlock()
 	intent, present, err := readComputerStorageGrowIntent(diskRoot)
 	if err != nil || !present || intent.Request != request {
 		return err
@@ -504,6 +510,9 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 	if !imagePresent {
 		return GrowComputerStorageResponse{}, errors.New("Computer grow refused because the current disk image is missing")
 	}
+	// Only a grow that has changed nothing yet may be abandoned: the image and
+	// the manifest both still name the old size.
+	manifestAtOldSize := !present || manifest.Storage.DiskBytes == request.Storage.DiskBytes
 	available, admitted, err := engine.reserveGrowCapacity(request, diskRoot, imageSize)
 	if err != nil {
 		return GrowComputerStorageResponse{}, err
@@ -516,14 +525,14 @@ func (engine *ContainerdEngine) GrowComputerStorage(ctx context.Context, request
 		return GrowComputerStorageResponse{}, err
 	}
 	if err := writeComputerStorageGrowIntent(diskRoot, request); err != nil {
-		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize))
+		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize, manifestAtOldSize))
 	}
 	loopDevice := ""
 	if attachment != nil {
 		loopDevice = attachment.loopDevice
 	} else if present && manifest.Attached != nil {
 		err := errors.New("Computer grow found an attached manifest without live attachment ownership")
-		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize))
+		return GrowComputerStorageResponse{}, errors.Join(err, engine.abandonGrowBeforeResize(diskRoot, request, imageSize, manifestAtOldSize))
 	}
 	if err := engine.resizeComputerStorage(ctx, imagePath, loopDevice, request.Storage.DiskBytes, request.NewDiskBytes); err != nil {
 		var uncertain *ComputerStorageGrowUncertainError
