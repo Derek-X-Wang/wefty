@@ -36,6 +36,10 @@ func classifyCommandReport(err error) commandReport {
 	if errors.As(err, &maintenanceFault) || errors.As(err, &catalogFault) {
 		return commandReport{exitCode: exitFailure, err: err, errorDocument: contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: err.Error(), Retryable: false}}}
 	}
+	var pin *upgradePinError
+	if errors.As(err, &pin) {
+		return commandReport{exitCode: exitConflict, err: err, errorDocument: contract.ErrorResponse{Error: contract.APIError{Code: upgradeErrorCommitNotOnMain, Message: err.Error(), Retryable: false}}}
+	}
 	var doctor *doctorResultError
 	if errors.As(err, &doctor) {
 		report := classifyCommandReport(doctor.cause)
