@@ -583,7 +583,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	}
 	if upgradeAlreadyInstalled(paths, destination, commit) {
 		_, err := fmt.Fprintln(warnings, "already at "+commit)
-		return upgradeReport{Version: commit, AlreadyAt: true}, err
+		return recoveredUpgradeReport(upgradeReport{Version: commit, AlreadyAt: true}, recovered), err
 	}
 	live := []string{filepath.Join(paths.data, "l1.sqlite"), filepath.Join(paths.data, "l3.sqlite")}
 	for index, path := range live {

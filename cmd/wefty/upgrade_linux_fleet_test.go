@@ -791,3 +791,19 @@ func TestLinuxFleetUpgradeRecoversDrainBeforePreflightRefusal(t *testing.T) {
 		})
 	}
 }
+
+// A refused state preflight still names the commit that was built.
+func TestLinuxFleetUpgradePreflightFailureReportsVersion(t *testing.T) {
+	f, _ := newLinuxUpgradeFixture(t, serviceplan.ControlPlane)
+	command := f.operations.command
+	f.operations.command = func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
+		if slices.Contains(args, "--state-preflight") {
+			return nil, fmt.Errorf("injected preflight refusal")
+		}
+		return command(ctx, dir, env, name, args...)
+	}
+	report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "upgrade state preflight failed; installed stack unchanged: injected preflight refusal") || report.Version == "" {
+		t.Fatalf("preflight failure: version=%q err=%v", report.Version, err)
+	}
+}
