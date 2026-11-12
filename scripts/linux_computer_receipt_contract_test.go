@@ -444,3 +444,35 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		},
 	}
 }
+
+// The Storage failure budget durations live in two build-tagged files, and
+// only the realtiming lane compiles the acceptance one. Both must declare the
+// same constants, or a constant added to one breaks the lane's L1 build and
+// nothing cheaper notices.
+func TestStorageFailureBudgetBuildVariantsDeclareTheSameConstants(t *testing.T) {
+	declared := func(path, wantTag string) string {
+		text := string(mustReadFile(t, path))
+		if !strings.HasPrefix(text, "//go:build "+wantTag+"\n") {
+			t.Fatalf("%s does not start with //go:build %s", path, wantTag)
+		}
+		var names []string
+		for _, name := range []string{"StorageOperationFailureWindow", "storageOperationFailureRetryBase", "storageOperationFailureRetryCeiling"} {
+			if strings.Count(text, name+" ") < 1 || !strings.Contains(text, name) {
+				t.Fatalf("%s does not declare %s", path, name)
+			}
+			names = append(names, name)
+		}
+		if got := strings.Count(text, " = "); got != len(names) {
+			t.Fatalf("%s declares %d constants, want exactly %d", path, got, len(names))
+		}
+		return strings.Join(names, ",")
+	}
+	production := declared("../l1/storage_operation_budget.go", "!acceptance_short_storage_budget")
+	acceptance := declared("../l1/storage_operation_budget_acceptance.go", "acceptance_short_storage_budget")
+	if production != acceptance {
+		t.Fatalf("budget build variants differ: %s vs %s", production, acceptance)
+	}
+	if text := string(mustReadFile(t, "../l1/storage_operation_budget_acceptance.go")); !strings.Contains(text, "StorageOperationFailureWindow = 30 * time.Second") {
+		t.Fatal("the acceptance window is no longer the 30s the receipt gate and the matrix require")
+	}
+}

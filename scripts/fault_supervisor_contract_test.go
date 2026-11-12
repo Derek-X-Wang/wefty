@@ -185,7 +185,6 @@ func TestFaultSupervisorStorageFaultActions(t *testing.T) {
 	}
 	for _, action := range []string{
 		"freeze-storage-roots", "thaw-storage-roots", "freeze-backup-roots", "thaw-backup-roots",
-		"freeze-storage-quarantine", "thaw-storage-quarantine",
 		"freeze-computer-disk:" + disk, "thaw-computer-disk:" + disk,
 	} {
 		supervisor.send(t, action)
@@ -194,7 +193,6 @@ func TestFaultSupervisorStorageFaultActions(t *testing.T) {
 	want := strings.Join([]string{
 		"+i " + filepath.Join(runtimeDirectory, "computer-disks"), "-i " + filepath.Join(runtimeDirectory, "computer-disks"),
 		"+i " + filepath.Join(runtimeDirectory, "computer-backups"), "-i " + filepath.Join(runtimeDirectory, "computer-backups"),
-		"+i " + filepath.Join(runtimeDirectory, "computer-disk-quarantine"), "-i " + filepath.Join(runtimeDirectory, "computer-disk-quarantine"),
 		"+i " + diskRoot, "-i " + diskRoot,
 	}, "\n") + "\n"
 	if got := string(mustReadFile(t, chattrLog)); got != want {

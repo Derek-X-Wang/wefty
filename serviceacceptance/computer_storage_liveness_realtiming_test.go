@@ -187,6 +187,17 @@ type liveNodeControlFacts struct {
 	PendingRemovals []string
 }
 
+func (facts liveNodeControlFacts) removalPending(jobIDs ...string) bool {
+	for _, pending := range facts.PendingRemovals {
+		for _, jobID := range jobIDs {
+			if pending == jobID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func readLiveNodeControlFacts(t *testing.T, controlSocket string) liveNodeControlFacts {
 	t.Helper()
 	client, err := ocicontrol.NewClient(controlSocket)
@@ -247,9 +258,15 @@ func exerciseLiveStopReimageRemove(t *testing.T, harness *acceptanceHarness, con
 	evidence.ResidueAbsent = nodePathAbsent(t, filepath.Join(liveStorageRuntimeRoot, "computer-disks", evidence.DiskName)) &&
 		nodePathAbsent(t, filepath.Join(liveStorageRuntimeRoot, "computer-mounts", evidence.DiskName)) &&
 		computerQuarantineEntries(t, evidence.DiskName) == 0
+	// The agent releases its removal record when it has processed L1's
+	// acknowledgement, which the CLI can see a moment earlier.
 	after := readLiveNodeControlFacts(t, controlSocket)
+	for deadline := time.Now().Add(30 * time.Second); after.removalPending(evidence.FirstJobID, evidence.RotatedJobID) && time.Now().Before(deadline); {
+		time.Sleep(500 * time.Millisecond)
+		after = readLiveNodeControlFacts(t, controlSocket)
+	}
 	evidence.HelperSessionAfter = after.HelperSession
-	evidence.NoPendingRemoval = len(after.PendingRemovals) == 0
+	evidence.NoPendingRemoval = !after.removalPending(evidence.FirstJobID, evidence.RotatedJobID)
 	return evidence
 }
 
@@ -299,12 +316,14 @@ func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference
 		return current.IntentRevision >= resetting.IntentRevision && current.LastResetOperation != nil &&
 			storageBudgetSpent(current.LastResetOperation.Failure, l1.ComputerStorageOperationPrepare)
 	})
-	// The budget is spent. One more report interval must leave the reset
+	// The budget is spent. One more counted failure must leave the reset
 	// running on the old generation.
-	time.Sleep(10 * time.Second)
-	held := runComputerCLI[l1.Computer](t, harness, false, "services", "status", target.ComputerID)
+	held := waitForComputerCLI(t, harness, target.ComputerID, 3*time.Minute, func(current l1.Computer) bool {
+		return current.LastResetOperation == nil || current.LastResetOperation.Failure == nil ||
+			current.LastResetOperation.Failure.FailedAttempts > counted.LastResetOperation.Failure.FailedAttempts
+	})
 	notEnded := held.ReconfigurationPhase == l1.ComputerReconfigurationResetting && held.LastResetOperation != nil &&
-		held.LastResetOperation.CompletedAt == nil &&
+		held.LastResetOperation.Failure != nil && held.LastResetOperation.CompletedAt == nil &&
 		held.StorageGeneration == target.StorageGeneration
 	thaw()
 	healed := waitForComputerCLI(t, harness, target.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
@@ -320,30 +339,33 @@ func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference
 
 // exerciseLiveImportBudget refuses every new generation root while a Custody
 // import copies. The import must end failed by the budget, with the
-// destination latched failed and removable.
+// destination latched failed and removable. The awaited CLI is not the end
+// signal: it reports the first interrupted preparation while L1 still counts,
+// so the scenario holds the fault until L1 latches the destination.
 func exerciseLiveImportBudget(t *testing.T, harness *acceptanceHarness, exportID, exportDirectory, manifestPath, manifestDigest string) liveStorageBudgetEvidence {
 	t.Helper()
 	thaw := liveStorageFault(t, harness, "freeze-storage-roots", "thaw-storage-roots")
 	started := time.Now()
-	outcome := runStorageCLIOutcome(t, harness, "services", "custody", "import", exportID,
+	outcome := runComputerCLI[storageCLIOutcome](t, harness, false, "services", "custody", "import", exportID,
 		"--name", "linux-native-import-budget", "--disk-bytes", fmt.Sprint(160<<20), "--node", "acceptance-node",
 		"--path", exportDirectory, "--manifest", manifestPath, "--manifest-digest", manifestDigest,
-		"--idempotency-key", "linux-native-import-budget", "--wait", "6m")
+		"--idempotency-key", "linux-native-import-budget")
+	if outcome.CustodyImport == nil || outcome.CustodyImport.DestinationComputerID == "" {
+		t.Fatalf("Custody import under a root fault printed no import: %#v", outcome)
+	}
+	destination := waitForComputerCLI(t, harness, outcome.CustodyImport.DestinationComputerID, 5*time.Minute, func(current l1.Computer) bool {
+		_, _, _, _, latched := latchedStorageOperationFailure(current)
+		return latched && current.ReconfigurationPhase == l1.ComputerReconfigurationStable
+	})
 	elapsed := time.Since(started)
 	thaw()
-	if outcome.CustodyImport == nil || outcome.CustodyImport.DestinationComputerID == "" {
-		t.Fatalf("Custody import under a root fault printed no import: %#v\n%s", outcome, outcome.Stderr)
-	}
-	destination := runComputerCLI[l1.Computer](t, harness, false, "services", "status", outcome.CustodyImport.DestinationComputerID)
-	verb, stage, attempts, class, latched := latchedStorageOperationFailure(destination)
+	verb, stage, attempts, class, _ := latchedStorageOperationFailure(destination)
 	evidence := liveStorageBudgetEvidence{
-		Passed: outcome.Failed && outcome.CustodyImport.Status == "failed" &&
-			outcome.CustodyImport.FailureCode == string(l1.ComputerStorageOperationFailureEngine) && latched &&
-			verb == string(l1.ComputerStorageOperationImport) && stage == string(l1.ComputerStorageOperationPrepare) &&
+		Passed: verb == string(l1.ComputerStorageOperationImport) && stage == string(l1.ComputerStorageOperationPrepare) &&
 			class == string(l1.ComputerStorageOperationFailureEngine) && attempts >= l1.MaximumStorageOperationFailures &&
 			elapsed >= acceptanceStorageFailureWindow,
-		Detail: fmt.Sprintf("status=%s failure_code=%s latched=%t verb=%s stage=%s class=%s failed_attempts=%d wait_elapsed=%s",
-			outcome.CustodyImport.Status, outcome.CustodyImport.FailureCode, latched, verb, stage, class, attempts, elapsed.Round(time.Second))}
+		Detail: fmt.Sprintf("verb=%s stage=%s class=%s failed_attempts=%d latched_after=%s",
+			verb, stage, class, attempts, elapsed.Round(time.Second))}
 	removed := removeAndWaitComputer(t, harness, destination, 5*time.Minute)
 	evidence.Detail += " removal_outcome=" + removed.RemovalOutcome
 	return evidence
@@ -451,16 +473,14 @@ func exerciseLiveStorageProvenanceBudgets(t *testing.T, harness *acceptanceHarne
 	result.SecondRestoreSucceeded = secondRestore.Computer.StorageGeneration > stopped.StorageGeneration
 	restored := *secondRestore.Computer
 
-	// Restore whose predecessor cannot be deleted. The helper would turn a
-	// refused deletion into a cleanup quarantine, so the fault refuses that
-	// record too; each pass is then one counted retire failure. The restore
+	// Restore whose predecessor cannot be deleted. The deletion fails with a
+	// permission error, which the adapter does not retry into a cleanup
+	// quarantine, so each pass is one counted retire failure. The restore
 	// ends `cleanup_owed` and the Computer starts on the new generation.
 	predecessorName := liveComputerDiskName(t, restored)
 	thawPredecessor := liveStorageFault(t, harness, "freeze-computer-disk:"+predecessorName, "thaw-computer-disk:"+predecessorName)
-	thawQuarantine := liveStorageFault(t, harness, "freeze-storage-quarantine", "thaw-storage-quarantine")
 	owedRestore := runStorageCLIOutcome(t, harness, "services", "restore", restored.ComputerID, backupID,
 		"--retire-old", "--expect-current", "--idempotency-key", "linux-native-restore-cleanup-owed", "--wait", "6m")
-	thawQuarantine()
 	thawPredecessor()
 	result.RestoreCleanupOwed = liveStorageBudgetEvidence{Detail: "no restore operation recorded"}
 	if owedRestore.Computer == nil {

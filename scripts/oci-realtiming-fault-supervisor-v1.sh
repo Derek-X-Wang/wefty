@@ -178,19 +178,17 @@ MANIFEST
           continue
         fi
         ;;
-      freeze-storage-roots|thaw-storage-roots|freeze-backup-roots|thaw-backup-roots|freeze-storage-quarantine|thaw-storage-quarantine)
+      freeze-storage-roots|thaw-storage-roots|freeze-backup-roots|thaw-backup-roots)
         # A Storage failure the helper cannot turn into a receipt (#1634). The
         # immutable flag makes every create, rename and unlink in the directory
         # fail with EPERM, for root too, until the matching thaw clears it:
         # storage-roots refuses a new generation root (restore, clone and
-        # import copy), backup-roots a new Backup copy, and storage-quarantine
-        # the cleanup quarantine a refused deletion would otherwise end in.
+        # import copy) and backup-roots a new Backup copy.
         # Failures are recorded, not fatal: under set -e they would take the
         # shared supervisor down.
         case "${action#*-}" in
           storage-roots) fault_directory=/var/lib/wefty/oci/computer-disks ;;
           backup-roots) fault_directory=/var/lib/wefty/oci/computer-backups ;;
-          storage-quarantine) fault_directory=/var/lib/wefty/oci/computer-disk-quarantine ;;
         esac
         if [ "${action%%-*}" = freeze ]; then
           if ! install --directory --owner=root --group=root --mode=0700 "$fault_directory" || ! chattr +i "$fault_directory"; then
@@ -206,7 +204,8 @@ MANIFEST
         # The same fault on one generation root: the helper can read it and
         # take its lock, but cannot write a manifest or a grow intent into it
         # (grow, and reset before the fence) or delete it (predecessor
-        # deletion).
+        # deletion). The deletion fails with a permission error, which the
+        # adapter does not retry and so never turns into a cleanup quarantine.
         name="${action#*:}"
         case "${name#wefty-computer-disk-}" in ''|*[!0-9a-f]*) exit 64 ;; esac
         disk_root="/var/lib/wefty/oci/computer-disks/$name"
@@ -241,8 +240,8 @@ MANIFEST
               volume_kind:"computer_disk",
               computer_storage:{computer_id:$computer, storage_id:$storage, storage_generation:$generation},
               removal:{removal_generation:1}, attempts:1}' \
-            > "$quarantine_root/$name-cleanup-1.json.tmp" ||
-          ! mv "$quarantine_root/$name-cleanup-1.json.tmp" "$quarantine_root/$name-cleanup-1.json"; then
+            > "$quarantine_root/.acceptance-$name.tmp" ||
+          ! mv "$quarantine_root/.acceptance-$name.tmp" "$quarantine_root/$name-cleanup-1.json"; then
           record_action_failure "could not write the quarantine record for $name"
           continue
         fi
