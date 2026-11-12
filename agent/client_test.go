@@ -165,6 +165,27 @@ func TestRenewalRequestTimeoutIsStrictlyInsideAuthority(t *testing.T) {
 	}
 }
 
+// #1524: near the end of the lease a renewal may wait for all but a one-second
+// reserve (half the remainder below two seconds), not for half of it.
+func TestRenewalRequestTimeoutKeepsOnlyAReserve(t *testing.T) {
+	for _, test := range []struct {
+		remaining, operation, want time.Duration
+	}{
+		{remaining: 30 * time.Second, operation: 10 * time.Second, want: 10 * time.Second},
+		{remaining: 19 * time.Second, operation: 10 * time.Second, want: 10 * time.Second},
+		{remaining: 9 * time.Second, operation: 10 * time.Second, want: 8 * time.Second},
+		{remaining: 4 * time.Second, operation: 10 * time.Second, want: 3 * time.Second},
+		{remaining: 2 * time.Second, operation: 10 * time.Second, want: time.Second},
+		{remaining: 1500 * time.Millisecond, operation: 10 * time.Second, want: 750 * time.Millisecond},
+		{remaining: 2 * time.Nanosecond, operation: 10 * time.Second, want: time.Nanosecond},
+		{remaining: 0, operation: 10 * time.Second, want: 0},
+	} {
+		if got := renewalRequestTimeout(test.remaining, test.operation); got != test.want {
+			t.Errorf("renewal timeout(%s, %s) = %s, want %s", test.remaining, test.operation, got, test.want)
+		}
+	}
+}
+
 func TestClientTransportSupportsConcurrentAttemptTraffic(t *testing.T) {
 	assertClientTransportSupportsConcurrentAttemptTraffic(t)
 }
