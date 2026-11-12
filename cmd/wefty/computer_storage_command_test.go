@@ -599,7 +599,12 @@ func (runtime fix303RuntimeLossRuntime) CopyComputerStorage(_ context.Context, r
 	}
 }
 
-func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing.T) {
+// A runtime loss during a Custody import is counted by L1's failure budget
+// and retried; it no longer ends the wait (#1643). The wait reports the
+// running attempt count on stderr and ends only when L1 ends the import, here
+// at the wait deadline because one loss is far inside the budget. Before
+// #1608 the first interrupted outcome ended the import and the wait (#303).
+func TestRuntimeLossImportWaitFollowsTheFailureBudget(t *testing.T) {
 	t.Parallel()
 	h := newStorageCLIHarness(t)
 	barrier := &fix303BootBarrier{}
@@ -664,9 +669,10 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 		directives, directiveErr := h.store.ListNodeComputerStorageCopyDirectives(h.ctx, "fabric-storage-node", h.node.NodeID, h.node.BootSessionID)
 		t.Logf("agent made no copy call; directives=%+v err=%v", directives, directiveErr)
 	}
-	if err == nil || !strings.Contains(err.Error(), "computer_storage_preparation_interrupted") ||
-		strings.Contains(err.Error(), "context deadline exceeded") || elapsed >= waitBudget ||
-		!bytes.Contains(stdout.Bytes(), []byte(`"code": "computer_storage_preparation_interrupted"`)) {
+	var outcome *custodyImportOutcomeError
+	if err == nil || errors.As(err, &outcome) || !strings.Contains(err.Error(), "timed out") || elapsed < waitBudget ||
+		!strings.Contains(stderr.String(), "failed attempts so far: 1 (last runtime_loss/") ||
+		!bytes.Contains(stdout.Bytes(), []byte(`"status": "reserved"`)) {
 		t.Fatalf("runtime-loss import stdout=%s stderr=%s elapsed=%s err=%v", stdout.String(), stderr.String(), elapsed, err)
 	}
 	if barrierErr := barrier.Ensure(t.Context()); barrierErr == nil || !strings.Contains(barrierErr.Error(), "boot barrier has not completed") {
