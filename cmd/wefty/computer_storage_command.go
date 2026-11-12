@@ -759,7 +759,7 @@ func executeComputerCustodyImport(ctx context.Context, clients *apiClients, json
 	}
 	output := storageMutationOutput{MutationApplied: !replayed, IdempotentReplay: replayed, CustodyImport: &imported}
 	if wait.timeout > 0 {
-		observed, computer, observation, waitErr := waitForCustodyImport(ctx, clients, imported.ImportID, imported.OperationRevision, wait)
+		observed, computer, observation, waitErr := waitForCustodyImportReporting(ctx, clients, imported.ImportID, imported.OperationRevision, wait, stderr)
 		imported.Status, imported.FailureCode = observed.Status, observed.FailureCode
 		imported.PreparationOutcome, imported.CompletedAt = observed.PreparationOutcome, observed.CompletedAt
 		output.CustodyImport, output.Observation = &imported, &observation
@@ -974,8 +974,19 @@ func waitForComputerRestore(ctx context.Context, clients *apiClients, computerID
 }
 
 func waitForCustodyImport(ctx context.Context, clients *apiClients, importID string, operationRevision int64, wait storageWaitFlags) (l1.ComputerCustodyImportObservation, l1.Computer, storageWaitObservation, error) {
+	return waitForCustodyImportReporting(ctx, clients, importID, operationRevision, wait, nil)
+}
+
+// waitForCustodyImportReporting follows one import until L1 ends it. An
+// interrupted preparation outcome does not end the wait: L1 keeps the import
+// running under its failure budget (#1608) and retries it, so only L1's own
+// `failed` is a failure (#1643). Each new failed attempt is reported on
+// progress while the import keeps running.
+func waitForCustodyImportReporting(ctx context.Context, clients *apiClients, importID string, operationRevision int64,
+	wait storageWaitFlags, progress io.Writer) (l1.ComputerCustodyImportObservation, l1.Computer, storageWaitObservation, error) {
 	var observed l1.ComputerCustodyImportObservation
 	var computer l1.Computer
+	reportedAttempts := int64(0)
 	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
 		current, readErr := clients.getComputerCustodyImport(ctx, importID)
 		if readErr != nil {
@@ -997,17 +1008,22 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 		if observed.Status == "superseded" {
 			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}
 		}
-		if observed.PreparationOutcome != nil {
-			outcome := custodyImportFailed
-			switch observed.PreparationOutcome.Code {
-			case l1.ComputerStoragePreparationResumeDeferred:
-				outcome = custodyImportDeferred
-			case l1.ComputerStoragePreparationQuarantined:
-				outcome = custodyImportQuarantined
+		// A deferral or a quarantine the helper recorded keeps its own exit
+		// status: neither clears within a wait. An interrupted outcome does
+		// not end the wait while the import is still running.
+		if outcome := observed.PreparationOutcome; outcome != nil && outcome.Code != l1.ComputerStoragePreparationInterrupted {
+			exit := custodyImportDeferred
+			if outcome.Code == l1.ComputerStoragePreparationQuarantined {
+				exit = custodyImportQuarantined
 			}
-			return false, &custodyImportOutcomeError{importID: importID, outcome: outcome, detail: observed.PreparationOutcome.Code}
+			return false, &custodyImportOutcomeError{importID: importID, outcome: exit, detail: outcome.Code}
 		}
 		if observed.Status == "reserved" {
+			if failure := observed.Failure; failure != nil && progress != nil && failure.FailedAttempts != reportedAttempts {
+				reportedAttempts = failure.FailedAttempts
+				_, _ = fmt.Fprintf(progress, "Custody import %s: %d failed attempts so far (last %s/%s); L1 retries it until it completes or its failure budget ends it\n",
+					importID, failure.FailedAttempts, failure.Class, failure.Code)
+			}
 			return false, nil
 		}
 		if observed.Status != "complete" {
