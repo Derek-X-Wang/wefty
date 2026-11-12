@@ -723,10 +723,12 @@ func (barrier *SupervisedBootBarrier) Restart(ctx context.Context, quiesce, reco
 	return recover(ctx)
 }
 
-// Recreate replaces the Lima instance from an explicit setup template, then
-// runs the ordinary helper/sweep/probe recovery before reporting success.
-func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, recover func(context.Context) error, template TemplateConfig) error {
-	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil || recover == nil {
+// Recreate replaces the Lima instance from an explicit setup template. The new
+// guest has no helper, so reinstall installs it while the cycle lock still
+// excludes the boot barrier and idle stop (#1612). The ordinary
+// helper/sweep/probe recovery runs before reporting success.
+func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, reinstall, recover func(context.Context) error, template TemplateConfig) error {
+	if barrier == nil || barrier.Supervisor == nil || barrier.Barrier == nil || quiesce == nil || reinstall == nil || recover == nil {
 		return errors.New("supervised OCI recreate cycle is unavailable")
 	}
 	payload, err := RenderTemplate(template)
@@ -769,6 +771,9 @@ func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, rec
 		if intentErr == nil {
 			if _, intentErr = barrier.Supervisor.runBounded(ctx, "delete", "--force", barrier.Supervisor.config.Instance); intentErr == nil {
 				_, intentErr = barrier.Supervisor.runBounded(ctx, "start", "--name="+barrier.Supervisor.config.Instance, temporaryPath)
+				if intentErr == nil {
+					intentErr = reinstall(ctx)
+				}
 			} else {
 				barrier.Supervisor.restoreRecreateSocket(ctx)
 			}

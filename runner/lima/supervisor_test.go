@@ -713,8 +713,8 @@ func TestSupervisedBarrierCycleAcquisitionHonorsContext(t *testing.T) {
 
 func TestSupervisedBarrierRecreateDeletesAndStartsFromExplicitTemplate(t *testing.T) {
 	f := newRecreateFixture(t)
-	if err := f.recreate(t); err != nil || !f.quiesced || !f.recovered {
-		t.Fatalf("recreate quiesced=%t recovered=%t err=%v", f.quiesced, f.recovered, err)
+	if err := f.recreate(t); err != nil || !f.quiesced || f.reinstalls != 1 || !f.recovered {
+		t.Fatalf("recreate quiesced=%t reinstalls=%d recovered=%t err=%v", f.quiesced, f.reinstalls, f.recovered, err)
 	}
 	if !f.helperStopped {
 		t.Fatal("empty-disk inspection did not fence helper writes before deletion")
