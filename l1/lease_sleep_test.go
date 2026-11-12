@@ -245,7 +245,7 @@ func TestLeaseSleepClockFailureRefusesComparison(t *testing.T) {
 	c.advance(0, 5*time.Minute)
 	c.awakeErr = errors.New("pausing clock unavailable")
 	var logs []string
-	f.store.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	f.store.setLogf(func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) })
 	result, err := f.store.Reconcile(t.Context())
 	if err != nil || result.ExpiredAttempts != 0 || result.DeadNodes != 1 || result.StaleNodes != 0 {
 		t.Fatalf("failed sample blocked maintenance or expired authority: %+v err=%v", result, err)
@@ -544,7 +544,7 @@ func TestLeaseSleepWideWakeSampleUsesBounds(t *testing.T) {
 	// Reconcile compares expiry against the maximum possible credit.
 	source.samples = []sleepClockReadSequence{{before: c.awake, boot: c.elapsed, after: c.awake + 31*time.Second, endBoot: c.elapsed + 31*time.Second}}
 	var logs []string
-	f.store.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	f.store.setLogf(func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) })
 	result, err := f.store.Reconcile(t.Context())
 	if err != nil || result.ExpiredAttempts != 0 || result.DeadNodes != 0 || result.StaleNodes != 0 {
 		t.Fatalf("uncertain wake expired authority: %+v err=%v", result, err)

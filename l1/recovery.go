@@ -32,9 +32,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	ctx = write.ctx
 	clockErr := attemptClockError(ctx)
 	if clockErr != nil {
-		if s.logf != nil {
-			s.logf("event=attempt_lease_clock_retry action=retry_next_tick error=%q", clockErr)
-		}
+		s.logf("event=attempt_lease_clock_retry action=retry_next_tick error=%q", clockErr)
 	}
 
 	result := ReconcileResult{}

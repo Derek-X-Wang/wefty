@@ -22,7 +22,7 @@ func TestReadSnapshotTargetOverrunReturnsAnswer(t *testing.T) {
 
 		s, _ := snapshotStore(t)
 		var logs bytes.Buffer
-		s.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
+		s.setLogf(func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) })
 		answer := ""
 		err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
 			time.Sleep(125 * time.Millisecond)

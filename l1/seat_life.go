@@ -84,9 +84,6 @@ func (s *Store) CheckSeatLife(ctx context.Context) error {
 }
 
 func (s *Store) logSeatLifeError(target string, err error) {
-	if s.logf == nil {
-		return
-	}
 	code := errorCode(err)
 	if code == "" {
 		code = contract.ErrorInternal
