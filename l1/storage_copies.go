@@ -18,9 +18,10 @@ import (
 const computerStorageCopyReceiptKind = "computer_storage_copy_verified"
 
 // ComputerRestoreFailureCode names why L1 aborted a restore. The first three
-// are the failed predecessor Backup copy's own code; the last is a Storage
-// copy that kept failing with an engine failure on a live helper session past
-// the agent's bound (#1591).
+// are the failed predecessor Backup copy's own code; storage_copy_engine_failure
+// is a Storage copy that kept failing past the in-memory bound of an agent of
+// the previous release (#1591, removed with #1627); the rest are the classes of
+// the failure budget (#1608).
 type ComputerRestoreFailureCode string
 
 const (
