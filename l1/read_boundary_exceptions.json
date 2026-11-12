@@ -102,12 +102,6 @@
     "slice": "permanent"
   },
   {
-    "site": "read_snapshot.go:*Store.beginWriteOn | db",
-    "count": 1,
-    "reason": "Shared body of the two write-door constructors: begins the immediate transaction on the pool its door passes and times the write lock (#1524).",
-    "slice": "permanent"
-  },
-  {
     "site": "read_snapshot.go:*Store.beginWriteTransaction | s.db",
     "count": 1,
     "reason": "write transaction constructor: existing immediate transaction and authoritative clock",

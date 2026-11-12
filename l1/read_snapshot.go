@@ -630,25 +630,43 @@ type writeTransaction struct {
 
 // A caller that already sampled its write clock supplies it here. This keeps
 // the existing sampling point and prevents a second clock read during migration.
+// The caller names the transaction in slow write-lock diagnostics.
 func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceActionActor, pinned ...time.Time) (*writeTransaction, error) {
-	return s.beginWriteOn(ctx, s.db, "main", caller, pinned)
+	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
+		return nil, fmt.Errorf("l1: invalid pinned write clock")
+	}
+	lock := s.startWriteLockTiming("main", 2)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		lock.beginFailed()
+		return nil, err
+	}
+	lock.acquired(ctx)
+	var at time.Time
+	if len(pinned) == 1 {
+		at = canonicalTime(pinned[0])
+	} else {
+		at = canonicalTime(s.clock.Now())
+	}
+	ctx = withAttemptClock(ctx, s.clock, at)
+	ctx, err = withLeaseSleepGap(ctx, tx, true)
+	if err != nil {
+		_ = tx.Rollback()
+		lock.end("rollback")
+		return nil, err
+	}
+	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding, lock: lock}, nil
 }
 
 // beginSettlementWriteTransaction is the write door for heartbeat revocation
 // receipts. Its separate pool retains the bounded SQLite busy wait; callers
 // cannot accidentally move these writes to the main pool's five-second wait.
 func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *serviceActionActor, pinned ...time.Time) (*writeTransaction, error) {
-	return s.beginWriteOn(ctx, s.settlementDB, "settlement", caller, pinned)
-}
-
-// beginWriteOn is the one body of both write doors. Its caller's caller names
-// the transaction in slow write-lock diagnostics.
-func (s *Store) beginWriteOn(ctx context.Context, db *sql.DB, pool string, caller *serviceActionActor, pinned []time.Time) (*writeTransaction, error) {
 	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
 		return nil, fmt.Errorf("l1: invalid pinned write clock")
 	}
-	lock := s.startWriteLockTiming(pool, 3)
-	tx, err := db.BeginTx(ctx, nil)
+	lock := s.startWriteLockTiming("settlement", 2)
+	tx, err := s.settlementDB.BeginTx(ctx, nil)
 	if err != nil {
 		lock.beginFailed()
 		return nil, err
