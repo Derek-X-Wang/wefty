@@ -40,6 +40,12 @@ func TestPerUserInstallRefusesWrongHomeAndCreatesThroughNodeProcess(t *testing.T
 		if len(args) > 0 && args[len(args)-1] == "-u" {
 			return []byte("501\n"), nil
 		}
+		if len(args) > 0 && args[0] == "create" {
+			return nil, os.MkdirAll(filepath.Join(c.LimaHome, c.Instance), 0o700)
+		}
+		if len(args) > 0 && args[len(args)-1] == "/etc/os-release" {
+			return []byte("PRETTY_NAME=\"Ubuntu 26.04 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"26.04\"\nID=ubuntu\nID_LIKE=debian\n"), nil
+		}
 		return nil, nil
 	}, ensure: func(context.Context) error { commands = append(commands, []string{"supervisor.Ensure"}); return nil }, install: func(_ context.Context, h GuestHelperInstallConfig) error {
 		installs++
@@ -59,9 +65,13 @@ func TestPerUserInstallRefusesWrongHomeAndCreatesThroughNodeProcess(t *testing.T
 	if installs != 1 {
 		t.Fatalf("helper installs=%d", installs)
 	}
-	want := [][]string{{"limactl", "list", "--json"}, {"limactl", "create", "--tty=false", "--name=wefty-proof", c.TemplatePath}, {"supervisor.Ensure"}, {"limactl", "--tty=false", "shell", "--workdir=/", "wefty-proof", "id", "-un"}, {"limactl", "--tty=false", "shell", "--workdir=/", "wefty-proof", "id", "-u"}}
+	want := [][]string{{"limactl", "list", "--json"}, {"limactl", "create", "--tty=false", "--name=wefty-proof", c.TemplatePath}, {"supervisor.Ensure"}, {"limactl", "--tty=false", "shell", "--workdir=/", "wefty-proof", "id", "-un"}, {"limactl", "--tty=false", "shell", "--workdir=/", "wefty-proof", "id", "-u"}, {"limactl", "--tty=false", "shell", "--workdir=/", "wefty-proof", "cat", "/etc/os-release"}}
 	if !reflect.DeepEqual(commands, want) {
 		t.Fatalf("commands=%v", commands)
+	}
+	observation, err := ReadGuestOSObservation(filepath.Join(c.LimaHome, c.Instance, GuestOSObservationFile))
+	if err != nil || observation.GuestOS != "ubuntu-26.04" {
+		t.Fatalf("recorded guest OS = %+v, %v", observation, err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "user-install-timing.json")); err != nil {
 		t.Fatal(err)

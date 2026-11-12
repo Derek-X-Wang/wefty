@@ -179,6 +179,37 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 	_, err = fmt.Fprintf(stdout, "OCI setup configured (%s); intent enabled=%t revision=%d; probe preloaded=%t; restart applied=%t; recreate applied=%t; reason=%s\n",
 		response.Convergence, response.Intent.Enabled, response.Intent.Revision, response.ProbePreloaded,
 		response.RestartApplied, response.RecreateApplied, response.ReasonCode)
+	if err != nil {
+		return err
+	}
+	return writeSetupConvergenceDetail(stdout, response)
+}
+
+// writeSetupConvergenceDetail names what differs and the step still needed,
+// and the host VM base, which is advisory and never blocks setup (#1593).
+func writeSetupConvergenceDetail(stdout io.Writer, response ocicontrol.SetupResponse) error {
+	if len(response.Differences) != 0 {
+		line := "differs: " + strings.Join(response.Differences, ", ")
+		if action := ocicontrol.ConvergenceAction(response.Convergence); action != "" && !response.RestartApplied && !response.RecreateApplied {
+			line += "; to apply, " + action
+		}
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
+			return err
+		}
+	}
+	base := response.Base
+	if base == nil {
+		return nil
+	}
+	var err error
+	switch {
+	case base.Current == "":
+		_, err = fmt.Fprintf(stdout, "host VM base: current not observed yet (recorded when the node agent next prepares the host VM); template %s\n", base.Desired)
+	case base.UpgradeAvailable:
+		_, err = fmt.Fprintf(stdout, "host VM base upgrade available: current %s, template %s. Staying on the current base is supported.\n", base.Current, base.Desired)
+	default:
+		_, err = fmt.Fprintf(stdout, "host VM base: %s (matches the template)\n", base.Current)
+	}
 	return err
 }
 
