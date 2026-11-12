@@ -320,6 +320,22 @@ are kept until their deletion is verified.
 _Avoid_: disk version, volume revision, snapshot, removal generation,
 authority generation, Lineage
 
+**Storage operation failure budget**:
+The durable bound L1 keeps on a failing Storage operation stage (reset,
+restore, clone, Custody import, Backup, grow): an operation ends only after
+5 counted failed attempts and 10 minutes since the first, on the L1 clock.
+A quarantine ends it at once; a resume deferral is recorded, not counted.
+_Avoid_: retry limit, agent bound, attempt counter (the agent keeps none)
+
+**Cleanup owed**:
+The end state of a reset or restore that published its new Storage
+generation but could not delete the old one within its failure budget. The
+Computer is usable on the new generation, held stopped until an explicit
+start, and the old generation's bytes stay on the Node until removal deletes
+them. It is a data switch that happened, not a failure to switch.
+_Avoid_: failed (the old generation is no longer current), wiped, partial
+reset, cleanup quarantine (the helper's own refusal receipt)
+
 **Backup**:
 An immutable logical cold-copy record of one exact Storage generation, under
 wefty's removal responsibility. It outlives explicit pruning of its physical

@@ -554,6 +554,46 @@ func TestLegacyComputerRemovalRefusesEmptyJobAndGenerationInventories(t *testing
 	}
 }
 
+// A stopped Computer whose Job L1 replaced, and which never ran, has no
+// runtime removal for its current Job, and the helper finds no Storage
+// evidence it can name for that Job yet (#1611). The removal must refuse with
+// that explicit error on every pass and go through the same failure handling
+// as the refresh path, not return the reconstruction error past it (#1607).
+func TestComputerRemovalReconstructionFailureGoesThroughFailureHandling(t *testing.T) {
+	controller := &removalController{nodeID: "node", bootSessionID: "boot"}
+	controller.beginRemoval = func(context.Context, localRemoval) error { return nil }
+	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
+		return runtimeRemovalRecord{}, false, nil
+	}
+	controller.reconstructRuntime = func(context.Context, workloadrunner.RuntimeRemovalProofRequest) ([]workloadrunner.RuntimeResourceManifest, error) {
+		return nil, nil
+	}
+	controller.persistRuntimeRemoval = func(context.Context, localRemoval, []workloadrunner.RuntimeResourceManifest) error {
+		t.Fatal("an empty reconstruction must not persist a removal manifest")
+		return nil
+	}
+	controller.recordRemovalFailure = func(context.Context, localRemoval, string, string) error { return nil }
+	untyped := 0
+	controller.recordUntypedFailure = func(context.Context, localRemoval) error {
+		untyped++
+		return nil
+	}
+	directive := l1.RemovalDirective{
+		JobID: "rotated-never-ran", BoundNodeID: "node", Kind: contract.JobKindOCI, RemovalGeneration: 2,
+		CleanupFence: "cleanup", RootInstanceID: "root",
+		ComputerStorage: &l1.ComputerStorageClaim{ComputerID: "computer", StorageID: "storage", StorageGeneration: 1, DiskBytes: 8 << 30},
+	}
+	for pass := 1; pass <= 2; pass++ {
+		err := controller.process(t.Context(), directive)
+		if err == nil || !strings.Contains(err.Error(), "found neither runtime authority nor Storage evidence") {
+			t.Fatalf("pass %d removal = %v, want the explicit reconstruction refusal", pass, err)
+		}
+		if untyped != pass {
+			t.Fatalf("pass %d reached failure handling %d times, want %d", pass, untyped, pass)
+		}
+	}
+}
+
 func TestLegacyComputerRemovalCombinesJobRuntimeWithEmptyGenerationEvidence(t *testing.T) {
 	removal := localRemoval{jobID: "detached-computer", generation: 2, rootInstanceID: "root", cleanupFence: "cleanup"}
 	storage := &workloadrunner.ComputerStorage{

@@ -109,6 +109,9 @@ type ComputerCustodyImportObservation struct {
 	FailureCode        string                             `json:"failure_code,omitempty"`
 	PreparationOutcome *ComputerStoragePreparationOutcome `json:"preparation_outcome,omitempty"`
 	CompletedAt        *time.Time                         `json:"completed_at,omitempty"`
+	// Failure is the import's failure budget, present once an attempt was
+	// reported failed (#1608).
+	Failure *ComputerStorageOperationFailure `json:"failure,omitempty"`
 }
 
 // custodyExportTaintingPredicate is the SQL form of
@@ -817,6 +820,10 @@ func (r *databaseReads) computerViewGetComputerCustodyImport(ctx context.Context
 			return ComputerCustodyImportObservation{}, internalError(err, "decode Custody import preparation outcome")
 		}
 		observation.PreparationOutcome = &outcome
+	}
+	observation.Failure, err = readComputerStorageOperationFailure(ctx, r.q, importID, observation.OperationRevision, ComputerStorageOperationImport)
+	if err != nil {
+		return ComputerCustodyImportObservation{}, internalError(err, "read Custody import failure")
 	}
 	return observation, nil
 }

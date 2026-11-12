@@ -1726,6 +1726,28 @@ func TestPreparedComputerStorageRemovalInventoryCarriesOnlyStorageRows(t *testin
 			t.Fatalf("prepared Computer inventory invented runtime row: %+v", resource)
 		}
 	}
+	// L1 replaced the stopped Computer's Job after the reset prepared this
+	// generation: the witness keeps naming the reset's Job, and the removal
+	// names the current one. The witness still binds Node, root and Storage
+	// (#1607).
+	rotated := *receipt
+	rotated.JobID = "job-that-ran-the-reset"
+	rotatedManifest := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, DiskImage: "disk.ext4",
+		MountDirectory: "disk", Prepared: true, PreparationReceipt: &rotated}
+	rotatedAttempt, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), rotatedManifest)
+	if err != nil || !eligible || rotatedAttempt.StoragePreparation == nil || rotatedAttempt.StoragePreparation.JobID != rotated.JobID {
+		t.Fatalf("prepared Storage after a Job rotation = %+v eligible=%t err=%v", rotatedAttempt, eligible, err)
+	}
+	if err := validateAttestRemovalRequest(AttestRemovalRequest{JobID: removal.JobID, RemovalGeneration: "2",
+		Attempts: []RemovalAttemptManifest{rotatedAttempt}}, removal.NodeID); err != nil {
+		t.Fatalf("prepared Storage after a Job rotation failed attestation: %v", err)
+	}
+	foreignNode := rotated
+	foreignNode.NodeID = "node-other"
+	if _, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), computerDiskManifest{Version: computerDiskManifestVersion,
+		Storage: *storage, DiskImage: "disk.ext4", MountDirectory: "disk", Prepared: true, PreparationReceipt: &foreignNode}); err != nil || eligible {
+		t.Fatalf("a witness from another Node became removal evidence: eligible=%t err=%v", eligible, err)
+	}
 	notPrepared := computerDiskManifest{Version: computerDiskManifestVersion, Storage: *storage, Prepared: true, PreparationReceipt: receipt,
 		PreviousDetachment: &computerDiskEvidence{ReceiptID: "prior"}}
 	if attempt, eligible, err := preparedComputerStorageRemovalAttempt(request, t.TempDir(), notPrepared); err != nil || eligible {

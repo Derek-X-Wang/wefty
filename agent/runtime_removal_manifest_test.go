@@ -127,6 +127,20 @@ func TestReconstructedStorageOnlyManifestRefreshesAfterHelperBoot(t *testing.T) 
 	if err := spool.storeReconstructedRuntimeRemoval(t.Context(), removal, []workloadrunner.RuntimeResourceManifest{attempt}, startedAt.Add(time.Minute)); err != nil {
 		t.Fatalf("refresh Storage-only inventory after helper boot: %v", err)
 	}
+	// A witness that names the Job which prepared the Storage, not the
+	// removal's current Job, is valid evidence after a Job rotation (#1607);
+	// one from another Node is not.
+	rotatedWitness := *witness
+	rotatedWitness.JobID = "job-that-prepared"
+	rotated := attempt
+	rotated.StoragePreparation = &rotatedWitness
+	if err := validateRuntimeResourceManifest(rotated); err != nil {
+		t.Fatalf("Storage-only manifest after a Job rotation: %v", err)
+	}
+	rotatedWitness.NodeID = "node-other"
+	if err := validateRuntimeResourceManifest(rotated); err == nil {
+		t.Fatal("Storage-only manifest accepted a witness from another Node")
+	}
 	additionalStorage := *storage
 	additionalStorage.StorageGeneration = 2
 	additional := attempt

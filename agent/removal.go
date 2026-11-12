@@ -299,7 +299,10 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 		if !found && removal.kind == contract.JobKindOCI {
 			runtimeRemoval, err = controller.reconstructAndPersistRuntimeRemoval(ctx, removal, directiveStorages)
 			if err != nil {
-				return err
+				// The same stall accounting as the refresh below: a removal
+				// whose reconstruction keeps failing is counted and declared
+				// stalled, not retried silently for ever (#1607).
+				return controller.handleRemovalFailure(ctx, removal, err)
 			}
 			found = true
 		}

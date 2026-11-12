@@ -118,7 +118,10 @@ func TestComputerDiskSweepEvidenceRejectsIncompleteOrForeignDetachment(t *testin
 	}
 }
 
-func TestComputerDiskConsumerEvidenceBindsNamedPriorJobNotConsumerJob(t *testing.T) {
+// A consumer must name a prior Job, but the evidence's historical Job is not
+// compared to it: L1 replaces a stopped Computer's Job without running it, and
+// the evidence keeps naming the Job that last attached (#1607).
+func TestComputerDiskConsumerEvidenceNeedsANamedPriorJobButNotTheSameOne(t *testing.T) {
 	storage := ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 1}
 	evidence := computerDiskEvidence{
 		Kind: computerDiskSweepReceipt, ReceiptID: "receipt-1", ComputerID: storage.ComputerID,
@@ -132,10 +135,15 @@ func TestComputerDiskConsumerEvidenceBindsNamedPriorJobNotConsumerJob(t *testing
 	if !validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
 		t.Fatal("same-boot helper sweep did not authorize the consumer naming the prior Job")
 	}
-	consumer.PriorJobID = "consumer-job"
-	if validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
-		t.Fatal("consumer Job substituted for the named prior Job")
+	consumer.PriorJobID = "rotated-job"
+	if !validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
+		t.Fatal("a rotated Job could not consume the generation's own detach evidence")
 	}
+	consumer.BootSessionID = ""
+	if validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
+		t.Fatal("a consumer without a boot authorized detached Storage consumption")
+	}
+	consumer.BootSessionID = "boot-a"
 	consumer.PriorJobID = ""
 	if validComputerDiskConsumerDetachmentEvidence(&evidence, storage, consumer) {
 		t.Fatal("unnamed prior Job authorized detached Storage consumption")
