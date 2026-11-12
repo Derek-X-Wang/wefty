@@ -84,6 +84,19 @@ func TestRestoreAbortsWhenItsBoundNodeDies(t *testing.T) {
 					t.Fatal("a late copy receipt published an aborted restore")
 				}
 			}
+			if stage == ComputerStorageOperationRetire {
+				// A partitioned Node that comes back and finishes deleting the
+				// predecessor cannot complete an aborted restore.
+				if _, err := h.store.db.Exec(`UPDATE nodes SET state=? WHERE node_id=?`, contract.NodeAlive, node.NodeID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.store.AcknowledgeComputerRestoreRetirement(ctx, "fabric-computer-node", computer.ComputerID,
+					RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+						RemovalGeneration: uint64(directive.OperationRevision), CleanupFence: directive.CleanupFence,
+						RootInstanceID: directive.RootInstanceID, IdempotencyKey: "late-retirement"}); err == nil {
+					t.Fatal("a late retirement acknowledgement completed an aborted restore")
+				}
+			}
 			after, err := h.store.GetComputer(ctx, computer.ComputerID)
 			if err != nil || after.StorageGeneration != wantGeneration || after.ReconfigurationPhase != ComputerReconfigurationStable {
 				t.Fatalf("Computer after late evidence = %#v err=%v", after, err)
@@ -239,5 +252,35 @@ func TestRemovingCloneSourceLatchesTheDestinationFailed(t *testing.T) {
 	if _, err := h.store.RemoveComputer(ctx, clone.ComputerID,
 		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(ended, "operator-remove")}); err != nil {
 		t.Fatalf("remove the latched destination: %v", err)
+	}
+}
+
+// A clone whose destination already left `cloning` at that revision is
+// superseded, not latched, when its source is removed: the clone end's CAS
+// would refuse it and fail the source's removal.
+func TestRemovingCloneSourceSupersedesACloneWhoseDestinationMovedOn(t *testing.T) {
+	ctx := context.Background()
+	h, _, source, backup, _ := publishedBackupForStorageCopy(t, 2)
+	clone, _, err := h.store.BeginComputerClone(ctx, ComputerCloneRequest{BackupID: backup.BackupID,
+		ComputerMutationPrecondition: computerPrecondition(source, "operator"), Name: "moved-clone",
+		DiskBytes: backup.AllocatedSize, IdempotencyKey: "moved-clone", Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.db.Exec(`UPDATE computers SET intent_revision=intent_revision+1 WHERE computer_id=?`, clone.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := testReads(h.store).GetComputer(ctx, source.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.RemoveComputer(ctx, source.ComputerID,
+		ComputerRemoveRequest{ComputerMutationPrecondition: computerPrecondition(current, "operator-remove")}); err != nil {
+		t.Fatalf("source removal failed on a moved destination: %v", err)
+	}
+	var status string
+	if err := h.store.db.QueryRow(`SELECT status FROM computer_storage_copy_operations WHERE destination_computer_id=?`,
+		clone.ComputerID).Scan(&status); err != nil || status != "superseded" {
+		t.Fatalf("clone of a moved destination = %q err=%v", status, err)
 	}
 }
