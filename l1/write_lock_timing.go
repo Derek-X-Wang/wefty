@@ -86,7 +86,7 @@ func (t *writeLockTiming) threshold() time.Duration {
 
 func (t *writeLockTiming) log(outcome string, held time.Duration) {
 	threshold := t.threshold()
-	if t.store.logf == nil || t.waited < threshold && held < threshold {
+	if t.waited < threshold && held < threshold {
 		return
 	}
 	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=%s wait_ms=%d hold_ms=%d threshold_ms=%d",
@@ -94,9 +94,6 @@ func (t *writeLockTiming) log(outcome string, held time.Duration) {
 }
 
 func (t *writeLockTiming) logCanceled(outcome string, heldToOwnerEnd time.Duration) {
-	if t.store.logf == nil {
-		return
-	}
 	t.store.logf("event=l1_write_lock_canceled tx=%s pool=%s outcome=%s release=unknown wait_ms=%d hold_ms=%d",
 		t.name, t.pool, outcome, t.waited.Milliseconds(), heldToOwnerEnd.Milliseconds())
 }

@@ -91,7 +91,7 @@ type Store struct {
 	readSnapshotPageCutoffForTest     time.Duration
 	readDB                            *sql.DB
 	readSnapshotLastLog               atomic.Int64
-	logf                              func(string, ...any)
+	logSink                           atomic.Pointer[func(string, ...any)]
 	readSnapshotOverruns              atomic.Uint64
 	writeLockLogThreshold             time.Duration
 	personObservationFallbacks        atomic.Uint64
@@ -287,7 +287,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	db.SetMaxOpenConns(16)
 	store := &Store{
 		seatStartWait: options.SeatStartWait, seatCommandMaxRuntime: options.SeatCommandMaxRuntime, seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
-		db: db, logf: log.Printf, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
+		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		logRetention:                      logRetention,
@@ -302,6 +302,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		deploymentID:                      deploymentID,
 		policyChanged:                     make(chan struct{}),
 	}
+	store.setLogf(log.Printf)
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -5939,4 +5940,18 @@ func (r *databaseReads) result(ctx context.Context, jobID string) (JobResult, er
 	result.SkipReason = contract.ResultUploadSkipReason(skipReason)
 	result.UploadedAt = time.Unix(0, uploadedNS).UTC()
 	return result, nil
+}
+
+// setLogf replaces the store's diagnostic logger; nil silences it. Every write
+// commit reads the logger (write-lock timing) while NewServer may replace it,
+// so the logger lives in an atomic pointer and changes only here (#1656).
+func (s *Store) setLogf(logf func(string, ...any)) {
+	s.logSink.Store(&logf)
+}
+
+// logf writes one diagnostic line through the current logger, if any.
+func (s *Store) logf(format string, args ...any) {
+	if sink := s.logSink.Load(); sink != nil && *sink != nil {
+		(*sink)(format, args...)
+	}
 }

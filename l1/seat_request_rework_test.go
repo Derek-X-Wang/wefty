@@ -157,7 +157,7 @@ func TestSeatRequestBadCleanupDoesNotBlockOtherCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs string
-	f.store.logf = func(format string, args ...any) { logs += fmt.Sprintf(format, args...) }
+	f.store.setLogf(func(format string, args ...any) { logs += fmt.Sprintf(format, args...) })
 	list, err := f.store.PollSeatCalls(t.Context(), "fabric-computer-node", poll)
 	if err != nil || len(list.Requests) != 1 || list.Requests[0].SeatID != good.SeatID {
 		t.Fatalf("bad candidate blocked healthy request: %+v %v", list, err)

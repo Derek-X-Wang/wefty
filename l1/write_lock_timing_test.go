@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,7 +91,7 @@ func waitWriteLockForTest(s *Store) error {
 func TestSlowWriteLockLogsHolderAndWaiter(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
-	s.logf = log.logf
+	s.setLogf(log.logf)
 	s.writeLockLogThreshold = 100 * time.Millisecond
 	held := make(chan struct{})
 	holder := make(chan error, 1)
@@ -142,7 +143,7 @@ func commitThenWorkForTest(s *Store, work time.Duration) error {
 func TestWriteLockHoldEndsAtCommit(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
-	s.logf = log.logf
+	s.setLogf(log.logf)
 	s.writeLockLogThreshold = 100 * time.Millisecond
 	if err := commitThenWorkForTest(s, 300*time.Millisecond); err != nil {
 		t.Fatal(err)
@@ -174,7 +175,7 @@ func holdThenCancelForTest(s *Store, held chan<- struct{}, released <-chan struc
 func TestWriteLockCancellationIsReportedWithUnknownRelease(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
-	s.logf = log.logf
+	s.setLogf(log.logf)
 	s.writeLockLogThreshold = 100 * time.Millisecond
 	held, released := make(chan struct{}), make(chan struct{})
 	owner := make(chan error, 1)
@@ -214,7 +215,7 @@ func cancelQuicklyForTest(s *Store) error {
 func TestQuickCanceledWriteIsStillReported(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
-	s.logf = log.logf
+	s.setLogf(log.logf)
 	if err := cancelQuicklyForTest(s); err != nil {
 		t.Fatal(err)
 	}
@@ -390,4 +391,52 @@ func TestReconcileStampsAuthorityLossAfterWriteLock(t *testing.T) {
 	if lost := time.Unix(0, lostNS).UTC(); !lost.Equal(unblocked) {
 		t.Fatalf("authority lost at %s, want %s (after the lock wait)", lost, unblocked)
 	}
+}
+
+// #1656: NewServer swaps the store's logger while another server over the same
+// store still commits writes, and every commit's write-lock timing may log.
+// The race detector must see no unsynchronized access to the logger.
+func TestStoreLoggerSwapsWhileWritesCommit(t *testing.T) {
+	s, _ := snapshotStore(t)
+	whileCommitting := func(swap func()) {
+		t.Helper()
+		stop := make(chan struct{})
+		writer := make(chan error, 1)
+		var commits atomic.Int64
+		go func() {
+			for {
+				select {
+				case <-stop:
+					writer <- nil
+					return
+				default:
+				}
+				if err := waitWriteLockForTest(s); err != nil {
+					writer <- err
+					return
+				}
+				commits.Add(1)
+			}
+		}()
+		// Keep swapping until commits have overlapped the swaps.
+		for commits.Load() < 20 {
+			swap()
+		}
+		close(stop)
+		if err := <-writer; err != nil {
+			t.Fatal(err)
+		}
+	}
+	whileCommitting(func() {
+		if _, err := NewServer(&identityAnswerFabric{}, s, ServerConfig{}); err != nil {
+			t.Error(err)
+		}
+	})
+	// Every commit now logs, through a logger swapped while commits run.
+	log := &writeLockLog{}
+	s.writeLockLogThreshold = time.Nanosecond
+	whileCommitting(func() {
+		s.setLogf(log.logf)
+		s.setLogf(nil)
+	})
 }

@@ -25,7 +25,7 @@ func TestSeatApprovalWindowRebootAtFiftyNineMinutesCannotExtendGrant(t *testing.
 			f.clock.Advance(beforeBoot)
 			clock.boot = "boot-b"
 			var logs []string
-			f.store.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+			f.store.setLogf(func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) })
 			if err := f.store.CheckSeatLife(t.Context()); err != nil {
 				t.Fatal(err)
 			}
