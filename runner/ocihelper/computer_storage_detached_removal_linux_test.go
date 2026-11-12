@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -187,9 +188,14 @@ func TestDetachedStorageProofThenDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	neighbourName, _ := deterministicComputerDiskName(neighbour)
-	neighbourManifest, err := os.ReadFile(filepath.Join(engine.config.RuntimeRoot, "computer-disks", neighbourName, "attachment.json"))
-	if err != nil {
-		t.Fatal(err)
+	neighbourRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", neighbourName)
+	neighbourBefore := map[string][]byte{}
+	for _, file := range []string{"attachment.json", "disk.ext4"} {
+		payload, err := os.ReadFile(filepath.Join(neighbourRoot, file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		neighbourBefore[file] = payload
 	}
 
 	response, err := engine.inventoryComputerStorageRemoval(t.Context(), detachedRemovalRequest(storage, "boot-a"), ResourceInventory{})
@@ -214,21 +220,42 @@ func TestDetachedStorageProofThenDeletion(t *testing.T) {
 	}
 	removal := ManagedVolumeRemovalAuthority{NodeID: "node-1", BootSessionID: "boot-a", JobID: "rotated-job",
 		PriorJobID: "rotated-job", RemovalGeneration: 2, CleanupFence: "cleanup"}
-	if err := engine.deleteComputerDisk(storage, removal); err == nil {
-		t.Fatal("deletion removed an attached generation")
+	deleteRequest := DeleteManagedVolumeRequest{Kind: ManagedVolumeComputerDisk, ComputerStorage: &storage, Removal: &removal}
+	if response, err := engine.DeleteManagedVolume(t.Context(), deleteRequest); err == nil || response.Deleted {
+		t.Fatalf("deletion removed an attached generation: %+v err=%v", response, err)
 	}
 	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.deleteComputerDisk(storage, removal); err != nil {
-		t.Fatalf("delete the detached generation: %v", err)
+	if response, err := engine.DeleteManagedVolume(t.Context(), deleteRequest); err != nil || !response.Deleted {
+		t.Fatalf("delete the detached generation: %+v err=%v", response, err)
 	}
-	if _, err := os.Lstat(filepath.Join(diskRoot, "disk.ext4")); !os.IsNotExist(err) {
-		t.Fatalf("the detached generation's image survived deletion: %v", err)
+
+	// Post-delete attestation from a fresh inventory: every named resource of
+	// the detached generation is absent, and the neighbour is still there,
+	// byte for byte.
+	inventory := ResourceInventory{}
+	if err := engine.inventoryComputerDiskResources(&inventory); err != nil {
+		t.Fatal(err)
 	}
-	after, err := os.ReadFile(filepath.Join(engine.config.RuntimeRoot, "computer-disks", neighbourName, "attachment.json"))
-	if err != nil || !bytes.Equal(neighbourManifest, after) {
-		t.Fatalf("deletion touched another Computer's generation (err=%v)", err)
+	attestation, err := attestRemovalInventory(inventory, AttestRemovalRequest{JobID: "rotated-job", RemovalGeneration: "2",
+		Attempts: []RemovalAttemptManifest{attempt}})
+	if err != nil || len(attestation.Assertions) != len(attempt.Resources) {
+		t.Fatalf("post-delete attestation = %+v err=%v", attestation, err)
 	}
-	_ = system
+	for _, assertion := range attestation.Assertions {
+		if !assertion.Absent {
+			t.Fatalf("post-delete attestation kept %+v", assertion)
+		}
+	}
+	if !slices.Contains(inventory.ComputerDiskImages, neighbourName) || !slices.Contains(inventory.ComputerDiskManifests, neighbourName) {
+		t.Fatalf("the neighbour Computer's generation left the inventory: %+v", inventory)
+	}
+	for file, before := range neighbourBefore {
+		after, err := os.ReadFile(filepath.Join(neighbourRoot, file))
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("deletion changed the neighbour's %s (err=%v)", file, err)
+		}
+	}
+	_, _ = system, diskRoot
 }
