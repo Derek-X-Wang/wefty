@@ -74,3 +74,23 @@ func TestEndedStorageOperationWaitErrorCarriesTheFailureBudget(t *testing.T) {
 		}
 	}
 }
+
+// The failure budget ends a quarantined Custody import at once, so the wait
+// sees `failed` before any preparation outcome; it keeps the quarantine exit.
+func TestCustodyImportEndedByQuarantineKeepsItsExitStatus(t *testing.T) {
+	for code, want := range map[string]custodyImportOutcome{
+		l1.ComputerStoragePreparationQuarantined: custodyImportQuarantined,
+		"engine_failure":                         custodyImportFailed,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(l1.ComputerCustodyImportObservation{OperationRevision: 1, Status: "failed", FailureCode: code})
+		}))
+		_, _, _, err := waitForCustodyImport(t.Context(), &apiClients{l1: waitStubClient(t, server)}, "import-1", 1, retryableWaitFlags)
+		server.Close()
+		var outcome *custodyImportOutcomeError
+		if !errors.As(err, &outcome) || outcome.outcome != want || outcome.detail != code {
+			t.Fatalf("%s import wait = %#v, want %s", code, err, want)
+		}
+	}
+}

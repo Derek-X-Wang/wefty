@@ -264,6 +264,9 @@ func TestStorageOperationFailureClassification(t *testing.T) {
 		{"stale fence", refused(http.StatusConflict, contract.ErrorStaleFence, false)},
 		{"node dead", refused(http.StatusConflict, contract.ErrorNodeDead, false)},
 		{"no live helper session", errors.New("OCI helper session is not configured")},
+		{"helper connection limit", &ocihelper.RPCError{Code: ocihelper.CodeConnectionLimit}},
+		{"helper sweep required", fmt.Errorf("copy: %w", &ocihelper.RPCError{Code: ocihelper.CodeSweepRequired})},
+		{"helper session busy", &ocihelper.RPCError{Code: ocihelper.CodeSessionBusy}},
 		{"cleanup quarantine", errors.Join(errors.New("delete"), &workloadrunner.ManagedVolumeCleanupQuarantinedError{})},
 	} {
 		t.Run("not reported/"+row.name, func(t *testing.T) {

@@ -985,7 +985,13 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 			return false, fmt.Errorf("Custody import %q observation revision %d does not match accepted revision %d", importID, observed.OperationRevision, operationRevision)
 		}
 		if observed.Status == "failed" {
-			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportFailed, detail: observed.FailureCode}
+			// The failure budget ends a quarantined import at once (#1608);
+			// it keeps the quarantine exit status it always had.
+			outcome := custodyImportFailed
+			if observed.FailureCode == l1.ComputerStoragePreparationQuarantined {
+				outcome = custodyImportQuarantined
+			}
+			return false, &custodyImportOutcomeError{importID: importID, outcome: outcome, detail: observed.FailureCode}
 		}
 		if observed.Status == "superseded" {
 			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}

@@ -176,8 +176,9 @@ var storageOperationFailureCode = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 // (#1608). It does not interpret further: L1 decides what the class means.
 // It reports false for what says nothing about the operation itself: a
 // cancelled or unreachable L1, an L1 answer about the node session or the
-// attempt's authority, a helper with no live session to answer, and a
-// cleanup quarantine, which has its own receipt path.
+// attempt's authority, a helper with no live session to answer or one that
+// answered about its session, and a cleanup quarantine, which has its own
+// receipt path.
 func classifyStorageOperationFailure(err error) (storageOperationFailure, bool) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return storageOperationFailure{}, false
@@ -221,6 +222,13 @@ func classifyStorageOperationFailure(err error) (storageOperationFailure, bool) 
 	var rpc *ocihelper.RPCError
 	if errors.As(err, &rpc) {
 		switch rpc.Code {
+		case ocihelper.CodeSessionBusy, ocihelper.CodeSessionStale, ocihelper.CodeSweepRequired,
+			ocihelper.CodeConnectionLimit, ocihelper.CodeStartupBoundTripped, ocihelper.CodeDiagnosticFailure,
+			ocihelper.CodePeerUnauthenticated, ocihelper.CodeVersionMismatch, ocihelper.CodeChecksumMismatch:
+			// The helper answered about its session, not about this
+			// operation: a busy or unswept session, a connection slot, a
+			// handshake. The same call succeeds once the session is ready.
+			return storageOperationFailure{}, false
 		case ocihelper.CodeComputerStorageQuarantined:
 			return storageOperationFailure{class: l1.ComputerStorageOperationFailureQuarantined, code: string(rpc.Code)}, true
 		case ocihelper.CodeComputerStorageResumeDeferred:
