@@ -14,7 +14,7 @@ const jsonValueFlags = `o button dy dx screenshot agent-path allowed-mount-root 
 computer-default-image computer-shared-seat-limit computer-seat-memory-bytes computer-dedicated-cap
 host-vm-idle-wait host-vm-minimum-free-bytes
 seat-start-wait computer-idle-wait seat-idle-wait seat-warning-wait seat-command-max-runtime
-capability claims-enabled class control-url coordinator-url cpu-millicores cursor device-id dir disk-bytes drain-timeout
+capability claims-enabled class commit control-url coordinator-url cpu-millicores cursor device-id dir disk-bytes drain-timeout
 envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name
 file follow-for from oci-config helper-checksum idempotency-key image install-manifest instance-key
 intent-file intent-revision interpreter join-code key kind l1 l3 lang limit local-port manifest

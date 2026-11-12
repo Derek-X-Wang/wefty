@@ -79,6 +79,11 @@ const (
 
 const errorWaitTimeout contract.ErrorCode = "wait_timeout"
 
+// upgradeErrorCommitNotOnMain is `wefty upgrade --commit` refusing a commit
+// that the fetched main does not contain. It uses the conflict exit and is
+// classified in command_reporting.go and exercised through the real binary.
+const upgradeErrorCommitNotOnMain contract.ErrorCode = "upgrade_commit_not_on_main"
+
 // Seat refusal codes share the conflict exit. This is the explicit whitelist
 // consumed by command_reporting.go and exercised through the real binary.
 const (
@@ -460,7 +465,8 @@ Every command uses typed exits: usage 2, unauthorized 3, not found 4,
 conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. JSON errors go to stderr.
 
 Commands:
-  upgrade [--yes] [--drain-timeout DURATION]  Build latest main and upgrade this Mac's installed stack
+  upgrade [--yes] [--drain-timeout DURATION] [--commit SHA]
+                             Build latest main, or one commit on main, and upgrade this Mac's installed stack
   setup [--proof] [--oci-config FILE] [--from DIR] [--node-id ID]
                              Install the daily plain Mac stack and connection profile
     --role control-plane|join
