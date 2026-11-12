@@ -646,7 +646,11 @@ not a receipt), `runtime_loss` (the session was lost during the call),
 `quarantined`, `resume_deferred`, `acknowledgement_refused` (the helper call
 succeeded and L1 refused its acknowledgement with a non-transient error), or
 `agent_refused` (the agent refused the directive locally). The agent keeps no
-count; L1 decides.
+count; L1 decides. The agent reports nothing for a cancelled pass, an L1 that
+did not answer or answered about availability, the node session or the
+attempt's authority, a helper with no live session, or a cleanup quarantine,
+which keeps its own receipt route; it retries those after its own pace on the
+same curve, and they are not counted.
 
 The rule: an operation stage ends when it has at least 5 counted failures and
 at least 10 minutes have passed since the first, measured on the L1 clock as
@@ -695,8 +699,11 @@ that copy absent and owes nothing. Each operation read (`restore_operation`,
 `last_reset_operation`, and the Custody import observation) carries the
 latest stage's budget as `failure`: class, code, attempts, and the first and
 last failure times. Typed positive-absence receipts keep their own routes and
-end their operations at once, as below. Agents that do not report keep the
-per-verb outcome paths below unchanged.
+end their operations at once, as below. `services restore --wait` ends on
+`cleanup_owed` with a warning, not an error. For one release, an agent of the
+previous release still sends its preparation outcomes on the copy
+acknowledgement, and L1 keeps the per-verb outcome paths below for it unchanged;
+they are removed afterwards (#1627).
 
 A cold Backup is one explicitly disruptive Computer intent. L1 first commits
 the immutable logical Backup identity and its one planned V1 source-node copy
@@ -804,24 +811,21 @@ copy fails with a typed Backup failure receipt is aborted before switchover:
 L1 records the restore operation `failed` with that copy's `failure_code`,
 retires the never-published staging generation, and returns the Computer to
 `stable` on the old generation.
-A restore whose copy keeps failing with a typed engine failure on a live helper
-session is aborted the same way (#1591). Each failure leaves the restore
-`restoring` and the next sweep calls the copy again, so a transient host fault
-clears by itself. The agent counts these failures per restore operation and
-destination generation, and keeps the count and the time of the first failure
-until the copy succeeds or L1 accepts the abort; other errors neither count
-nor reset it. Once at least 5 failures have been counted and at least 10
-minutes have passed since the first, the agent writes one terminal log line
-(code, Computer, revision, generation, count, elapsed) and sends L1 the
-exact-generation `computer_storage_preparation_interrupted` outcome with
-reason `engine_failure`, retrying only that acknowledgement and never the copy.
-It is the only preparation outcome a restore acknowledges. L1 records the
-restore `failed` with `failure_code=storage_copy_engine_failure` and the
-outcome, retires the staging generation, and returns the Computer to `stable`
-on the old generation; the directive is no longer listed. An identical replay
-is resolved by the outcome's own `intent_revision`, so it reads the same answer
-even after a newer restore started. The count lives in the agent's memory: an
-agent restart starts the bound again, an accepted limit. The abort deletes
+A restore whose copy keeps failing on a live helper session is aborted the
+same way, by the Storage operation failure budget above (#1591, #1608). Each
+failure leaves the restore `restoring`, and the next attempt calls the copy
+again after L1's `retry_after_seconds`, so a transient host fault clears by
+itself. The agent reports every failure and keeps no count; L1 counts them on
+its own clock, so an agent restart no longer starts the bound again. Once the
+budget is spent, L1 records the restore `failed` with the last class's code,
+retires the staging generation, and returns the Computer to `stable` on the
+old generation; the directive is no longer listed. For one release, an agent
+of the previous release still applies its own in-memory bound (5 failures and
+10 minutes) and then sends the exact-generation
+`computer_storage_preparation_interrupted` outcome with reason
+`engine_failure` on the copy acknowledgement. L1 records that restore `failed`
+with `failure_code=storage_copy_engine_failure`; an identical replay is
+resolved by the outcome's own `intent_revision` (#1627). Either abort deletes
 nothing. The helper may hold the partial copy under the retired staging
 generation and, when "keep predecessor as Backup" was set, a finished
 predecessor Backup copy that was never cataloged. Removal of the Computer

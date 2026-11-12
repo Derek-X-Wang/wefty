@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,7 +95,23 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 
 	var acknowledgementsMu sync.Mutex
 	var acknowledgements []l1.ComputerBackupAcknowledgementRequest
+	var reports []l1.ComputerStorageOperationFailureRequest
 	client := newRoundTripClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/storage-operation-failure") {
+			// L1's failure budget answers with its own doubling pace.
+			var report l1.ComputerStorageOperationFailureRequest
+			if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+				t.Errorf("decode failure report: %v", err)
+			}
+			acknowledgementsMu.Lock()
+			reports = append(reports, report)
+			count := len(reports)
+			acknowledgementsMu.Unlock()
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(response, `{"disposition":"counted","failed_attempts":%d,"retry_after_seconds":%d,"operation_status":"planned"}`,
+				count, int(doublingDelay(storageOperationRetryBase, storageOperationRetryCeiling, count)/time.Second))
+			return
+		}
 		var acknowledgement l1.ComputerBackupAcknowledgementRequest
 		if err := json.NewDecoder(request.Body).Decode(&acknowledgement); err != nil {
 			t.Errorf("decode Backup acknowledgement: %v", err)
@@ -119,7 +137,7 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 	}
 	backups := newBackupController(client, nil, ocirunner.NewAdapter(barrier), "pre-admission-node",
 		"pre-admission-boot", "managed-root-1", t.Logf)
-	backups.now = func() time.Time {
+	backups.failures.now = func() time.Time {
 		nowMu.Lock()
 		defer nowMu.Unlock()
 		return now
@@ -155,8 +173,9 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 		}
 	}
 
-	// The untyped refusal: one dispatch, then every heartbeat inside the
-	// backoff is a no-op rather than another trip to the helper.
+	// The untyped refusal: one dispatch, reported to L1's failure budget,
+	// then every heartbeat inside L1's retry_after is a no-op rather than
+	// another trip to the helper.
 	for range 4 {
 		heartbeat()
 	}
@@ -164,15 +183,23 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 		t.Fatalf("Backup creations inside the first backoff = %d, want 1", creates)
 	}
 	requireSessionAndNeighbourIntact("after an untyped refusal")
-	advance(backupCreateRetryBase)
+	advance(storageOperationRetryBase)
 	heartbeat()
-	advance(backupCreateRetryBase)
+	advance(storageOperationRetryBase)
 	heartbeat()
 	if creates := engine.createCount(); creates != 2 {
 		t.Fatalf("Backup creations after one base interval and then one more = %d, want 2 (the wait doubles)", creates)
 	}
 	if got := acknowledged(); len(got) != 0 {
-		t.Fatalf("an untyped refusal was reported to L1: %+v", got)
+		t.Fatalf("an untyped refusal was acknowledged as a receipt: %+v", got)
+	}
+	acknowledgementsMu.Lock()
+	reported := append([]l1.ComputerStorageOperationFailureRequest(nil), reports...)
+	acknowledgementsMu.Unlock()
+	if len(reported) != 2 || reported[0].Class != l1.ComputerStorageOperationFailureEngine ||
+		reported[0].Verb != l1.ComputerStorageOperationBackup || reported[0].OperationRevision != directive.OperationRevision ||
+		reported[0].Fence != directive.CleanupFence || reported[0].ReportID == reported[1].ReportID {
+		t.Fatalf("failure reports = %#v, want two engine failures of this Backup", reported)
 	}
 	requireSessionAndNeighbourIntact("after a retried untyped refusal")
 
@@ -180,7 +207,7 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 	engine.mu.Lock()
 	engine.typed = true
 	engine.mu.Unlock()
-	advance(backupCreateRetryCeiling)
+	advance(storageOperationRetryCeiling)
 	heartbeat()
 	got := acknowledged()
 	if len(got) != 1 || got[0].Receipt.Kind != "computer_backup_copy_failed_absent" ||
@@ -188,10 +215,7 @@ func TestRefusedBackupLeavesHelperSessionAndNeighbourAndSettlesOnce(t *testing.T
 		got[0].Receipt.HelperGeneration != handshake.SessionGeneration {
 		t.Fatalf("typed Backup refusal acknowledgements = %+v, want one source_never_detached failure", got)
 	}
-	backups.mu.Lock()
-	_, pending := backups.createRetries["create\x00"+directive.CopyID]
-	backups.mu.Unlock()
-	if pending {
+	if !backups.failures.due(backupOperation(directive)) {
 		t.Fatal("a settled Backup kept its retry backoff")
 	}
 	requireSessionAndNeighbourIntact("after the typed refusal settled")

@@ -266,6 +266,15 @@ func (c *Client) AcknowledgeComputerStorageReset(ctx context.Context, computerID
 	return computer, err
 }
 
+// ReportComputerStorageOperationFailure reports one failed attempt of a
+// Storage operation stage to L1's failure budget (#1608). Every 200 answer
+// is final for that attempt.
+func (c *Client) ReportComputerStorageOperationFailure(ctx context.Context, computerID string, request l1.ComputerStorageOperationFailureRequest) (l1.ComputerStorageOperationFailureResponse, error) {
+	var response l1.ComputerStorageOperationFailureResponse
+	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-operation-failure", request, &response)
+	return response, err
+}
+
 func (c *Client) AcknowledgeComputerStorageGrow(ctx context.Context, computerID string, request l1.ComputerStorageGrowAcknowledgementRequest) (l1.Computer, error) {
 	var computer l1.Computer
 	err := c.post(ctx, "/v1/agent/computers/"+url.PathEscape(computerID)+"/storage-grow-acknowledgement", request, &computer)
