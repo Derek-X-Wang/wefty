@@ -1211,84 +1211,56 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		return false
 	}
 	if err.Code == CodeEngineFailure {
-		// A Run the helper refused after positively reaping that attempt, with
-		// its exclusive session still live, is bounded by the attempt. Without
-		// this, an ordinary refusal -- an out-of-root operator mount, say --
-		// made the client close its own control connection, which invalidated
-		// the helper session and turned every later request in the window into
-		// session_stale (#424).
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodRun && err.EngineFailure.AttemptScoped {
-			return false
-		}
-		// Attempt-port and host-bridge backend refusals are scoped to the
-		// already-authorized live attempt. The helper process and exclusive
-		// session remain authoritative while the attempt backend republishes.
-		if err.EngineFailure != nil && (err.EngineFailure.Operation == MethodDialAttemptPort || err.EngineFailure.Operation == MethodDialHostBridge) {
-			return false
-		}
-		// Managed-volume deletion is independently authorized and verified for
-		// one durable resource. Its failure is scoped to that volume/removal
-		// operation; it does not prove that helper session authority disappeared.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteVolume {
-			return false
-		}
-		// Backup-copy deletion is the same shape: one durable copy, separately
-		// authorized, and the caller accepts only an independently verified
-		// positive-absence receipt. Reading its refusal as node-wide loss made
-		// an immutable Backup copy invalidate the exclusive session on every
-		// retry, so the node dropped kind:oci and nothing could be placed while
-		// the stalled removal's Slot was free (#513).
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDeleteBackup {
-			return false
-		}
-		// Creating a Backup copy is the other half of that shape: one copy of
-		// one detached Storage generation, separately authorized, file-level
-		// mechanics that never touch the engine namespace, and accepted only
-		// against a receipt the helper derives from the copy itself. A refusal
-		// answered on this session proves the session answered. Reading it as
-		// loss made a Backup of a never-started clone tear the session down on
-		// every retry, withdraw kind:oci, and take running neighbours' attempts
-		// with it (#558). Transport loss and session_stale still prove loss.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodCreateBackup {
-			return false
-		}
-		// A Computer Storage copy (import, clone or restore) is the same
-		// shape again: one destination generation, separately authorized,
-		// file-level mechanics that never touch the engine namespace. A typed
-		// failure answered on this session proves the session answered.
-		// Reading it as loss made one failed import or clone close the
-		// session and end every attempt on the Node (#1581). The adapter
-		// turns the failure of an import or clone into a terminal,
-		// exact-generation preparation outcome of its own.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodCopyStorage {
-			return false
-		}
-		// The retained-handoff inventory is a read. It mutates nothing, holds
-		// no authority over any attempt, and a node whose accounting pass
-		// failed is still a node that can place work -- so reading its
-		// refusal as node-wide loss would drop kind:oci over a byte count,
-		// the #513 shape.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodInventoryHandoffs {
-			return false
-		}
-		// Run-mailbox operations are confined, attempt-scoped evidence
-		// operations. A refused read or removal cannot prove that the helper
-		// session or namespace authority disappeared (#834).
-		if err.EngineFailure != nil && (err.EngineFailure.Operation == MethodListRunMailbox ||
-			err.EngineFailure.Operation == MethodReadRunMailbox || err.EngineFailure.Operation == MethodRemoveRunMailbox) {
-			return false
-		}
-		// Delete is independently bounded and followed by attempt-scoped
-		// verification. Cancellation or deadline expiry here is failed cleanup
-		// for this attempt, not proof that the helper session or namespace
-		// authority disappeared.
-		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodDelete &&
-			(err.EngineFailure.Reason == EngineFailureDeadlineExceeded || err.EngineFailure.Reason == EngineFailureCanceled) {
-			return false
-		}
-		return true
+		return engineFailureProvesRuntimeLoss(err.EngineFailure)
 	}
 	return err.ImageFailure != nil && err.ImageFailure.Kind == ImageFailureEngineLoss
+}
+
+// engineFailureProvesRuntimeLoss is an allow-list (#1606). An engine_failure
+// proves runtime loss only for a method whose failure leaves the engine
+// namespace, or this session's authority over a live attempt, unproven. The
+// recovery for those is the one the session already has: close it, and let the
+// replacement session's boot sweep and verify reclaim the namespace.
+//
+// Every other method is scoped to the one operation and the resource it names:
+// a Computer's Storage, Backup copy, Custody export, removal inventory or
+// attestation, Seat, memory limit, control state or token, a managed volume, a
+// run mailbox, an attempt port or bridge, an image pin (including a pre-Run
+// attempt pin), or a read. Its refusal
+// was answered on this live session, so it proves the session answered. Its
+// caller owns the failure. Under the old deny-by-default rule, each of these
+// made one refused request close the session and end every OCI attempt on the
+// Node, again on every retry: #424, #513, #558, #597, #834, #1581, #1606.
+//
+// A failure that names no operation keeps the old reading: loss. TestEngineFailureRuntimeLossCoversEveryMethod makes each new
+// Method choose a row.
+func engineFailureProvesRuntimeLoss(fact *EngineFailureFact) bool {
+	if fact == nil || fact.Operation == "" {
+		return true
+	}
+	switch fact.Operation {
+	case MethodAcquireSession, MethodHeartbeat, MethodSweep, MethodVerify:
+		// Session and whole-namespace operations.
+		return true
+	case MethodRun:
+		// A Run the helper refused after positively reaping that attempt, with
+		// its session still live, is bounded by the attempt (#424).
+		return !fact.AttemptScoped
+	case MethodSignal, MethodWatch:
+		// Attempt lifecycle: a failure leaves the live payload's state, or the
+		// teardown that ends it, unproven. Session replacement and its sweep
+		// are what reap the attempt. ReleaseAttemptImagePin is not here: it
+		// runs only before Run, for an attempt with no payload, and the helper
+		// keeps the pin for a retry.
+		return true
+	case MethodDelete:
+		// Delete is bounded and followed by attempt-scoped verification. Its
+		// own deadline or cancellation is failed cleanup for this attempt; any
+		// other failure leaves the attempt's absence unproven.
+		return fact.Reason != EngineFailureDeadlineExceeded && fact.Reason != EngineFailureCanceled
+	default:
+		return false
+	}
 }
 
 func runtimeLossError(err error) error {
