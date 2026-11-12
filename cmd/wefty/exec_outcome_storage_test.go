@@ -107,12 +107,14 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 	if e := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, &stderr); e != nil {
 		t.Fatal(e)
 	}
+	// Check the protected folders after the last sweep: on a busy host the
+	// first sweep can stop at its budget before it reaches them.
+	sweepExecUntilGone(t, stack.clients, old)
 	for _, path := range []string{params.Storage, young, unrelated, unknown, outside} {
 		if _, e := os.Stat(path); e != nil {
 			t.Errorf("sweep removed protected folder %s: %v", path, e)
 		}
 	}
-	sweepExecUntilGone(t, stack.clients, old)
 	if !strings.Contains(stderr.String(), "warning") {
 		t.Errorf("unverifiable sweep did not warn: %q", stderr.String())
 	}
@@ -145,9 +147,9 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 }
 
 // sweepExecUntilGone repeats the sweep until it has retired every path. One
-// sweep stops at its two-second budget, warns, and leaves the rest for the
-// next exec. On a busy host retiring one capture can use that whole budget,
-// so a single sweep is not required to finish (#1617).
+// sweep stops at its two-second budget and warns; a later exec sweeps again.
+// On a busy host retiring one capture can use that whole budget, so a single
+// sweep is not required to finish (#1617).
 func sweepExecUntilGone(t *testing.T, clients *apiClients, paths ...string) {
 	t.Helper()
 	testwait.Until(t, "exec sweep to retire "+strings.Join(paths, ", "), func() (bool, error) {
