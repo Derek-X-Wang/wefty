@@ -20,6 +20,8 @@ type storageResetController struct {
 	nodeID               string
 	bootSessionID        string
 	logf                 func(string, ...any)
+	// failures reports every failed attempt to L1's failure budget (#1608).
+	failures *storageFailureReporter
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -31,20 +33,68 @@ func newStorageResetController(client *Client, session *agentSession, resetter w
 		return nil
 	}
 	return &storageResetController{client: client, session: session, resetter: resetter,
-		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf, inflight: make(map[string]struct{})}
+		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf, inflight: make(map[string]struct{}),
+		failures: newStorageFailureReporter(client, nodeID, bootSessionID, logf)}
+}
+
+// storageResetOperation names the budget a reset directive spends: prepare
+// until the new generation is published, then retire.
+func storageResetOperation(directive l1.ComputerStorageResetDirective) storageOperationRef {
+	stage := l1.ComputerStorageOperationPrepare
+	if directive.Phase == "published" {
+		stage = l1.ComputerStorageOperationRetire
+	}
+	return storageOperationRef{computerID: directive.ComputerID, verb: l1.ComputerStorageOperationReset,
+		revision: directive.IntentRevision, stage: stage, fence: directive.CleanupFence}
 }
 
 func storageResetKey(directive l1.ComputerStorageResetDirective) string {
 	return fmt.Sprintf("%s\x00%d", directive.ComputerID, directive.IntentRevision)
 }
 
+// process runs one directive from a recovery pass. It takes the same
+// in-flight reservation and pace as a heartbeat's enqueue, so the two paths
+// never run one operation twice at once or ahead of L1's retry_after.
 func (controller *storageResetController) process(ctx context.Context, directive l1.ComputerStorageResetDirective) error {
 	if controller == nil {
 		return nil
 	}
+	key, reserved := controller.reserve(directive)
+	if !reserved {
+		return nil
+	}
+	defer controller.release(key)
+	return controller.run(ctx, directive)
+}
+
+func (controller *storageResetController) run(ctx context.Context, directive l1.ComputerStorageResetDirective) error {
 	if directive.BoundNodeID != controller.nodeID {
 		return fmt.Errorf("Computer Storage reset belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 	}
+	return controller.failures.settle(ctx, storageResetOperation(directive), controller.attempt(ctx, directive))
+}
+
+// reserve claims the directive unless it is already in flight or L1's pace
+// says it is not yet due; both are read under the one lock, so a failing
+// attempt records its pace before it releases the reservation.
+func (controller *storageResetController) reserve(directive l1.ComputerStorageResetDirective) (string, bool) {
+	key := storageResetKey(directive)
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if _, exists := controller.inflight[key]; exists || !controller.failures.due(storageResetOperation(directive)) {
+		return "", false
+	}
+	controller.inflight[key] = struct{}{}
+	return key, true
+}
+
+func (controller *storageResetController) release(key string) {
+	controller.mu.Lock()
+	delete(controller.inflight, key)
+	controller.mu.Unlock()
+}
+
+func (controller *storageResetController) attempt(ctx context.Context, directive l1.ComputerStorageResetDirective) error {
 	if directive.Phase == "published" {
 		return controller.retirePredecessor(ctx, directive)
 	}
@@ -66,15 +116,12 @@ func (controller *storageResetController) process(ctx context.Context, directive
 			IntentRevision: receipt.IntentRevision, CleanupFence: receipt.CleanupFence,
 			HelperGeneration: receipt.HelperGeneration},
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (controller *storageResetController) retirePredecessor(ctx context.Context, directive l1.ComputerStorageResetDirective) error {
 	if controller.finalizeVolumes == nil || controller.attestRuntimeRemoval == nil {
-		return errors.New("Computer Storage retirement requires shared OCI deletion and attestation")
+		return refuseStorageOperation("removal_mechanics_missing", errors.New("Computer Storage retirement requires shared OCI deletion and attestation"))
 	}
 	generation := uint64(directive.IntentRevision)
 	storage := &workloadrunner.ComputerStorage{ComputerID: directive.ComputerID, StorageID: directive.StorageID,
@@ -107,7 +154,7 @@ func (controller *storageResetController) retirePredecessor(ctx context.Context,
 	}
 	if err := validateRuntimeRemovalAttestation(runtimeRemovalManifest{Version: 1, JobID: directive.JobID,
 		RemovalGeneration: generation, Attempts: []workloadrunner.RuntimeResourceManifest{manifest}}, attestation); err != nil {
-		return err
+		return refuseStorageOperation("attestation_mismatch", err)
 	}
 	_, err = controller.client.AcknowledgeComputerStorageRetirement(ctx, directive.ComputerID, l1.RemovalAcknowledgementRequest{
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
@@ -123,23 +170,15 @@ func (controller *storageResetController) enqueue(ctx context.Context, directive
 	if controller == nil {
 		return
 	}
-	key := storageResetKey(directive)
-	controller.mu.Lock()
-	if _, exists := controller.inflight[key]; exists {
-		controller.mu.Unlock()
+	key, reserved := controller.reserve(directive)
+	if !reserved {
 		return
 	}
-	controller.inflight[key] = struct{}{}
 	controller.wg.Add(1)
-	controller.mu.Unlock()
 	go func() {
 		defer controller.wg.Done()
-		defer func() {
-			controller.mu.Lock()
-			delete(controller.inflight, key)
-			controller.mu.Unlock()
-		}()
-		if err := controller.process(ctx, directive); err != nil && ctx.Err() == nil {
+		defer controller.release(key)
+		if err := controller.run(ctx, directive); err != nil && ctx.Err() == nil {
 			classification := classifyAgentProtocolError(err)
 			if classification.destination == errorDestinationNodeSession {
 				select {

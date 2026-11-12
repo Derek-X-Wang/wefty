@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -22,12 +21,12 @@ type backupController struct {
 	copyRemovalAcknowledged       func(context.Context, l1.ComputerBackupPruneDirective) (bool, error)
 	recordCopyRemovalAcknowledged func(context.Context, l1.ComputerBackupPruneDirective) error
 
-	// now and createRetries pace a Backup creation that keeps failing. The
-	// directive comes back on every heartbeat and on every OCI recovery pass
-	// until L1 settles it, so without a per-copy gate a failure that cannot
-	// clear is retried at whatever rate those passes arrive (#558).
-	now           func() time.Time
-	createRetries map[string]backupCreateRetry
+	// failures reports every failed creation to L1's failure budget and
+	// paces the next one from L1's answer (#1608). The directive comes back
+	// on every heartbeat and on every OCI recovery pass until L1 settles it,
+	// so without that pace a failure that cannot clear is retried at whatever
+	// rate those passes arrive (#558).
+	failures *storageFailureReporter
 	// beforeCreateReservation is a test seam: it runs after a pass has decided
 	// to dispatch a creation and before that creation is reserved.
 	beforeCreateReservation func()
@@ -37,26 +36,13 @@ type backupController struct {
 	wg       sync.WaitGroup
 }
 
-const (
-	// backupCreateRetryBase is one default heartbeat: the first retry lands
-	// where it always did, and each further failure of the same copy doubles
-	// the wait up to backupCreateRetryCeiling.
-	backupCreateRetryBase    = DefaultHeartbeatInterval
-	backupCreateRetryCeiling = 5 * time.Minute
-)
-
-type backupCreateRetry struct {
-	failures  int
-	notBefore time.Time
-}
-
 func newBackupController(client *Client, outbox *evidenceOutbox, backupper workloadrunner.ComputerBackupper, nodeID, bootSessionID, rootInstanceID string, logf func(string, ...any)) *backupController {
 	if backupper == nil {
 		return nil
 	}
 	controller := &backupController{client: client, backupper: backupper, nodeID: nodeID,
-		bootSessionID: bootSessionID, rootInstanceID: rootInstanceID, logf: logf, now: time.Now,
-		createRetries: make(map[string]backupCreateRetry), inflight: make(map[string]struct{})}
+		bootSessionID: bootSessionID, rootInstanceID: rootInstanceID, logf: logf, inflight: make(map[string]struct{}),
+		failures: newStorageFailureReporter(client, nodeID, bootSessionID, logf)}
 	if outbox != nil {
 		controller.copyRemovalAcknowledged = outbox.backupCopyRemovalAcknowledged
 		controller.recordCopyRemovalAcknowledged = outbox.recordBackupCopyRemovalAcknowledged
@@ -69,7 +55,8 @@ func (controller *backupController) processCreate(ctx context.Context, directive
 		return fmt.Errorf("Computer Backup belongs to node %q, not %q", directive.BoundNodeID, controller.nodeID)
 	}
 	if directive.RootInstanceID != controller.rootInstanceID || controller.rootInstanceID == "" {
-		return fmt.Errorf("Computer Backup belongs to managed-root instance %q, not %q", directive.RootInstanceID, controller.rootInstanceID)
+		return refuseStorageOperation("managed_root_instance_mismatch",
+			fmt.Errorf("Computer Backup belongs to managed-root instance %q, not %q", directive.RootInstanceID, controller.rootInstanceID))
 	}
 	receipt, err := controller.backupper.CreateComputerBackup(ctx, workloadrunner.ComputerBackupRequest{
 		BackupID: directive.BackupID, CopyID: directive.CopyID,
@@ -134,10 +121,17 @@ func (controller *backupController) processPrune(ctx context.Context, directive 
 	return nil
 }
 
+// backupOperation names the budget a Backup creation spends.
+func backupOperation(directive l1.ComputerBackupDirective) storageOperationRef {
+	return storageOperationRef{computerID: directive.ComputerID, verb: l1.ComputerStorageOperationBackup,
+		revision: directive.OperationRevision, stage: l1.ComputerStorageOperationPrepare, fence: directive.CleanupFence}
+}
+
 // enqueueCreate dispatches one Backup creation unless the same copy failed
 // recently and its retry is not yet due. A creation that ends in a receipt --
 // published or a positive-absence failure such as source_never_detached -- is
-// L1's to settle, and the directive stops arriving once it has.
+// L1's to settle, and the directive stops arriving once it has. A failed one
+// is reported to L1, which ends the Backup once its budget is spent.
 func (controller *backupController) enqueueCreate(ctx context.Context, directive l1.ComputerBackupDirective, failures chan<- destinationError) {
 	if controller == nil {
 		return
@@ -146,49 +140,19 @@ func (controller *backupController) enqueueCreate(ctx context.Context, directive
 	if controller.beforeCreateReservation != nil {
 		controller.beforeCreateReservation()
 	}
+	operation := backupOperation(directive)
 	// The retry deadline is read in the same critical section that reserves
 	// the copy. Checked beforehand, a creation still in flight could fail and
 	// release its reservation between the check and the reservation, and this
 	// pass would redispatch it with its new deadline unread.
-	controller.enqueueWhen(ctx, key, func() bool { return controller.createDueLocked(key) },
+	controller.enqueueWhen(ctx, key, func() bool { return controller.failures.due(operation) },
 		func(runContext context.Context) error {
 			err := controller.processCreate(runContext, directive)
-			controller.recordCreateOutcome(runContext, key, err)
-			return err
+			if directive.BoundNodeID != controller.nodeID {
+				return err
+			}
+			return controller.failures.settle(runContext, operation, err)
 		}, failures)
-}
-
-func (controller *backupController) clockNow() time.Time {
-	if controller.now == nil {
-		return time.Now()
-	}
-	return controller.now()
-}
-
-// createDueLocked requires controller.mu.
-func (controller *backupController) createDueLocked(key string) bool {
-	retry, failed := controller.createRetries[key]
-	return !failed || !controller.clockNow().Before(retry.notBefore)
-}
-
-func (controller *backupController) recordCreateOutcome(ctx context.Context, key string, err error) {
-	controller.mu.Lock()
-	defer controller.mu.Unlock()
-	if err == nil {
-		delete(controller.createRetries, key)
-		return
-	}
-	// A cancelled pass teaches nothing about this copy.
-	if ctx.Err() != nil {
-		return
-	}
-	if controller.createRetries == nil {
-		controller.createRetries = make(map[string]backupCreateRetry)
-	}
-	retry := controller.createRetries[key]
-	retry.failures++
-	retry.notBefore = controller.clockNow().Add(doublingDelay(backupCreateRetryBase, backupCreateRetryCeiling, retry.failures))
-	controller.createRetries[key] = retry
 }
 
 func (controller *backupController) enqueue(ctx context.Context, key string, run func(context.Context) error, failures chan<- destinationError) {

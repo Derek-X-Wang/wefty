@@ -284,7 +284,7 @@ func TestBackupCreateFailureRecordedMidPassIsHonouredByThatPass(t *testing.T) {
 	creator := &gatedBackupCreator{hold: 2, entered: make(chan struct{}), release: make(chan struct{})}
 	now := time.Date(2026, 9, 28, 21, 12, 45, 0, time.UTC)
 	controller := newBackupController(nil, nil, creator, "node-1", "boot-1", "root-1", t.Logf)
-	controller.now = func() time.Time { return now }
+	controller.failures.now = func() time.Time { return now }
 	directive := l1.ComputerBackupDirective{BackupID: "backup-of-clone", CopyID: "copy-of-clone",
 		ComputerID: "clone", StorageID: "clone-storage", StorageGeneration: 1, AllocatedSize: 128 << 20,
 		BoundNodeID: "node-1", RootInstanceID: "root-1", JobID: "clone-job", OperationRevision: 2,
@@ -293,7 +293,7 @@ func TestBackupCreateFailureRecordedMidPassIsHonouredByThatPass(t *testing.T) {
 	// First failure: the next creation is due one base interval later.
 	controller.enqueueCreate(t.Context(), directive, nil)
 	controller.wait()
-	now = now.Add(backupCreateRetryBase)
+	now = now.Add(storageOperationRetryBase)
 	// The retry is due and stays in flight.
 	controller.enqueueCreate(t.Context(), directive, nil)
 	<-creator.entered
@@ -312,7 +312,7 @@ func TestBackupCreateFailureRecordedMidPassIsHonouredByThatPass(t *testing.T) {
 	}
 
 	// The deadline the failure recorded is the gate, not a permanent block.
-	now = now.Add(2*backupCreateRetryBase - time.Nanosecond)
+	now = now.Add(2*storageOperationRetryBase - time.Nanosecond)
 	controller.enqueueCreate(t.Context(), directive, nil)
 	controller.wait()
 	if creates := creator.count(); creates != 2 {

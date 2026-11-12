@@ -551,17 +551,21 @@ func New(config Config) (*Agent, error) {
 	session.storageResets = newStorageResetController(client, session, computerStorageResetter,
 		config.NodeID, config.BootSessionID, logf)
 	if session.storageResets != nil {
+		session.storageResets.failures.now = clock.Now
 		session.storageResets.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageResets.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
 	session.storageGrows = newStorageGrowController(client, computerStorageGrower, config.NodeID,
 		config.BootSessionID, registration.RootInstanceID, logf)
+	if session.storageGrows != nil {
+		session.storageGrows.failures.now = clock.Now
+	}
 	session.reimagePreflights = newReimagePreflightController(client, computerReimagePreflighter,
 		config.NodeID, config.BootSessionID, registration.RootInstanceID, logf)
 	session.backups = newBackupController(client, outbox, computerBackupper, config.NodeID, config.BootSessionID,
 		registration.RootInstanceID, logf)
 	if session.backups != nil {
-		session.backups.now = clock.Now
+		session.backups.failures.now = clock.Now
 		session.removals.removeBackupCopies = func(ctx context.Context, directives []l1.ComputerBackupPruneDirective) error {
 			for _, directive := range directives {
 				if err := session.backups.processPrune(ctx, directive); err != nil {
@@ -574,6 +578,7 @@ func New(config Config) (*Agent, error) {
 	session.storageCopies = newStorageCopyController(client, computerStorageCopier, computerBackupper,
 		config.NodeID, config.BootSessionID, registration.RootInstanceID, logf)
 	if session.storageCopies != nil {
+		session.storageCopies.failures.now = clock.Now
 		session.storageCopies.finalizeVolumes = session.removals.finalizeVolumes
 		session.storageCopies.attestRuntimeRemoval = session.removals.attestRuntimeRemoval
 	}
