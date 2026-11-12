@@ -311,7 +311,7 @@ func (s *Store) StageNodeGeneration(ctx context.Context, identity string, regist
 	if err != nil {
 		return inventory, err
 	}
-	return inventory, tx.Commit()
+	return inventory, write.commit()
 }
 
 // NodeGenerations reads all sessions, including closed sessions retained for
@@ -590,7 +590,7 @@ func (s *Store) PromoteNodeGeneration(ctx context.Context, identity, nodeID stri
 	if _, err = tx.ExecContext(ctx, `INSERT INTO node_generation_promotions(node_id,operation_id,request_json,result_json) VALUES(?,?,?,?)`, nodeID, request.OperationID, payload, result); err != nil {
 		return inventory, err
 	}
-	return inventory, tx.Commit()
+	return inventory, write.commit()
 }
 
 // HeartbeatRetiringNodeGeneration observes only the original retiring process.
@@ -620,7 +620,7 @@ func (s *Store) HeartbeatRetiringNodeGeneration(ctx context.Context, identity, n
 	if err != nil {
 		return inventory, err
 	}
-	return inventory, tx.Commit()
+	return inventory, write.commit()
 }
 
 // nodeGenerationClosureReady is L1's part of the shared #1176 boundary. An
@@ -688,7 +688,7 @@ func (s *Store) CloseNodeGeneration(ctx context.Context, identity, nodeID, gener
 	if err != nil {
 		return inventory, err
 	}
-	return inventory, tx.Commit()
+	return inventory, write.commit()
 }
 
 func (s *Server) nodeGenerations(w http.ResponseWriter, r *http.Request) {

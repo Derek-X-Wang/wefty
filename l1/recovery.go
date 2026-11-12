@@ -17,11 +17,14 @@ import (
 // runs its own fenced pass. For each class, the winner
 // of an expiry-boundary race fully determines the durable result.
 func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
-	now := canonicalTime(s.clock.Now())
-	write, err := s.beginWriteTransaction(ctx, nil, now)
+	// Sample the pass's wall time only once the write lock is held: a time
+	// taken before a long lock wait would record authority loss before the
+	// lease actually expired (#1632).
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "begin L1 reconciliation")
 	}
+	now := write.at
 	// The DSN's immediate transactions take the write lock at BEGIN.
 	locked := time.Now()
 	tx := write.tx
@@ -226,7 +229,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}
 	s.retentionSweep.save(next)
@@ -344,7 +347,7 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	if err != nil {
 		return Node{}, internalError(err, "read draining node")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit agent drain")
 	}
 	return node, nil
@@ -444,7 +447,7 @@ func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb string
 	if err != nil {
 		return Node{}, internalError(err, "read updated operator intent")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit operator intent mutation")
 	}
 	return node, nil

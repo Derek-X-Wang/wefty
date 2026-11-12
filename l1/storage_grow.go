@@ -200,7 +200,7 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 			return Computer{}, false, internalError(outcomeErr, "read Computer grow replay outcome")
 		}
 		computer.LastGrowOperation = outcome
-		return computer, true, tx.Commit()
+		return computer, true, write.commit()
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer grow replay")
 	}
@@ -239,7 +239,7 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 	if err != nil {
 		return Computer{}, false, internalError(err, "read planned Computer grow")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer grow intent")
 	}
 	s.notifyComputerPolicyChanged()
@@ -354,7 +354,7 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 			!row.AcknowledgementHash.Valid || row.AcknowledgementHash.String != bodyHash {
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer grow acknowledgement conflicts with durable outcome")
 		}
-		return computer, tx.Commit()
+		return computer, write.commit()
 	}
 	if computer.IntentRevision != row.OperationRevision || computer.ReconfigurationPhase != ComputerReconfigurationGrowing ||
 		computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != row.OperationRevision ||
@@ -424,7 +424,7 @@ func (s *Store) AcknowledgeComputerStorageGrow(ctx context.Context, identityNode
 			return Computer{}, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer grow acknowledgement")
 	}
 	s.notifyComputerPolicyChanged()

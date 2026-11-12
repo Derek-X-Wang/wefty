@@ -341,7 +341,7 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return ComputerGrantMutationResult{}, internalError(err, "read replayed Computer revocation")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return ComputerGrantMutationResult{}, internalError(err, "commit Computer grant replay")
 		}
 		if replay.Revocation != nil {
@@ -448,7 +448,7 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 			SubjectFabricID: request.FabricID, SubjectUserID: userID, TargetPermission: request.Permission,
 			State: ComputerPolicyRevocationPending, CreatedAt: now}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerGrantMutationResult{}, internalError(err, "commit Computer grant mutation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -857,7 +857,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		return nil, internalError(err, "read prior Computer policy issuance")
 	}
 	if len(computerIDs) == 0 && !previouslyIssued {
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return nil, internalError(err, "commit empty Computer policy lookup")
 		}
 		return nil, nil
@@ -913,7 +913,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		snapshot.FreshUntil.UnixNano(), snapshot.IssuedAt.UnixNano()); err != nil {
 		return nil, internalError(err, "record Computer policy issuance")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return nil, internalError(err, "commit Computer policy snapshot")
 	}
 	return &snapshot, nil
@@ -983,7 +983,7 @@ func (s *Store) AcknowledgeComputerPolicyInstallation(ctx context.Context, ident
 		request.PolicyGeneration, request.PolicyRevision, request.SnapshotDigest, now.UnixNano()); err != nil {
 		return internalError(err, "record Computer policy installation")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return internalError(err, "commit Computer policy acknowledgement")
 	}
 	return nil

@@ -625,18 +625,23 @@ type writeTransaction struct {
 	tx                  *sql.Tx
 	at                  time.Time
 	actor               *serviceActionActor
+	lock                *writeLockTiming
 }
 
 // A caller that already sampled its write clock supplies it here. This keeps
 // the existing sampling point and prevents a second clock read during migration.
+// The caller names the transaction in slow write-lock diagnostics.
 func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceActionActor, pinned ...time.Time) (*writeTransaction, error) {
 	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
 		return nil, fmt.Errorf("l1: invalid pinned write clock")
 	}
+	lock := s.startWriteLockTiming("main", 2)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		lock.beginFailed()
 		return nil, err
 	}
+	lock.acquired(ctx)
 	var at time.Time
 	if len(pinned) == 1 {
 		at = canonicalTime(pinned[0])
@@ -647,9 +652,10 @@ func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceAction
 	ctx, err = withLeaseSleepGap(ctx, tx, true)
 	if err != nil {
 		_ = tx.Rollback()
+		lock.end("rollback")
 		return nil, err
 	}
-	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
+	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding, lock: lock}, nil
 }
 
 // beginSettlementWriteTransaction is the write door for heartbeat revocation
@@ -659,10 +665,13 @@ func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *ser
 	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
 		return nil, fmt.Errorf("l1: invalid pinned write clock")
 	}
+	lock := s.startWriteLockTiming("settlement", 2)
 	tx, err := s.settlementDB.BeginTx(ctx, nil)
 	if err != nil {
+		lock.beginFailed()
 		return nil, err
 	}
+	lock.acquired(ctx)
 	var at time.Time
 	if len(pinned) == 1 {
 		at = canonicalTime(pinned[0])
@@ -673,9 +682,10 @@ func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *ser
 	ctx, err = withLeaseSleepGap(ctx, tx, true)
 	if err != nil {
 		_ = tx.Rollback()
+		lock.end("rollback")
 		return nil, err
 	}
-	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
+	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding, lock: lock}, nil
 }
 
 func (w *writeTransaction) decisionReads() readModel {
@@ -684,8 +694,21 @@ func (w *writeTransaction) decisionReads() readModel {
 	reads.personDeviceBinding = w.personDeviceBinding
 	return reads
 }
-func (w *writeTransaction) commit() error   { return w.tx.Commit() }
-func (w *writeTransaction) rollback() error { return w.tx.Rollback() }
+func (w *writeTransaction) commit() error {
+	err := w.tx.Commit()
+	if err != nil {
+		w.lock.end("commit_failed")
+	} else {
+		w.lock.end("commit")
+	}
+	return err
+}
+
+func (w *writeTransaction) rollback() error {
+	err := w.tx.Rollback()
+	w.lock.end("rollback")
+	return err
+}
 
 // snapshotReadError keeps typed read-snapshot refusals (unavailable with a
 // read_snapshot_* reason) intact for the caller and labels only raw errors as
