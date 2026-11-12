@@ -394,10 +394,12 @@ func TestReconcileStampsAuthorityLossAfterWriteLock(t *testing.T) {
 }
 
 // #1656: NewServer swaps the store's logger while another server over the same
-// store still commits writes, and every commit's write-lock timing may log.
-// The race detector must see no unsynchronized access to the logger.
+// store still commits writes, and every commit's write-lock timing logs. The
+// race detector must see no unsynchronized access to the logger.
 func TestStoreLoggerSwapsWhileWritesCommit(t *testing.T) {
 	s, _ := snapshotStore(t)
+	// Every commit logs, so every commit reads the logger being swapped.
+	s.writeLockLogThreshold = time.Nanosecond
 	whileCommitting := func(swap func()) {
 		t.Helper()
 		stop := make(chan struct{})
@@ -418,8 +420,15 @@ func TestStoreLoggerSwapsWhileWritesCommit(t *testing.T) {
 				commits.Add(1)
 			}
 		}()
-		// Keep swapping until commits have overlapped the swaps.
-		for commits.Load() < 20 {
+		// Overlap witness: keep swapping until 20 commits have landed after
+		// the first swap, so commits and swaps interleave.
+		swap()
+		for after := commits.Load() + 20; commits.Load() < after; {
+			select {
+			case err := <-writer:
+				t.Fatalf("writer stopped during swaps: %v", err)
+			default:
+			}
 			swap()
 		}
 		close(stop)
@@ -432,9 +441,7 @@ func TestStoreLoggerSwapsWhileWritesCommit(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	// Every commit now logs, through a logger swapped while commits run.
 	log := &writeLockLog{}
-	s.writeLockLogThreshold = time.Nanosecond
 	whileCommitting(func() {
 		s.setLogf(log.logf)
 		s.setLogf(nil)
