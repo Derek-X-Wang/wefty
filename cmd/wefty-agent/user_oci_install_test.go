@@ -257,3 +257,74 @@ func TestPreparedReceiptDoesNotHideRemovedLimaInstance(t *testing.T) {
 		t.Fatalf("missing instance was skipped: preparations=%d", prepares)
 	}
 }
+
+// A recreate replaces the guest, so it must not leave the prepared receipt in
+// place: a cycle that stops after the delete is repaired by the next node
+// start, and the cycle itself reinstalls through the same preparation (#1612).
+func TestRecreateReinstallForgetsPreparedReceiptAndPreparesNewGuest(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	config.ProofDialog = false
+	payload, _ := json.Marshal(config)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var prepared []limarunner.UserInstallConfig
+	prepare := func(_ context.Context, c limarunner.UserInstallConfig, nodeID, bootID string) error {
+		if nodeID != "node" || bootID != "boot" {
+			t.Fatalf("prepare identity = %q/%q", nodeID, bootID)
+		}
+		prepared = append(prepared, c)
+		folder := filepath.Join(c.LimaHome, c.Instance)
+		if err := os.MkdirAll(folder, 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+	}
+	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	receipt := userOCIPreparedPath(config)
+	if _, err := os.Stat(receipt); err != nil {
+		t.Fatalf("first start wrote no prepared receipt: %v", err)
+	}
+	reinstall, err := userOCIRecreateReinstall(path, "node", "boot", prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(receipt); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recreate kept the prepared receipt: %v", err)
+	}
+	if len(prepared) != 1 {
+		t.Fatalf("building the reinstall step prepared the guest: %d", len(prepared))
+	}
+	if err := reinstall(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 2 || prepared[1] != config {
+		t.Fatalf("reinstall preparations = %+v", prepared)
+	}
+	// The instance lima.yaml exists again, but without the receipt the next
+	// start still prepares, which repairs a cycle interrupted after delete.
+	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 3 {
+		t.Fatalf("node start after recreate skipped preparation: %d", len(prepared))
+	}
+}
+
+func TestRecreateReinstallRefusesInterimMacBootstrap(t *testing.T) {
+	called := false
+	reinstall, err := userOCIRecreateReinstall("", "node", "boot", func(context.Context, limarunner.UserInstallConfig, string, string) error {
+		called = true
+		return nil
+	})
+	var control *ocicontrol.ControlError
+	if reinstall != nil || !errors.As(err, &control) || control.Code != ocicontrol.ErrorSetupRequired || !strings.Contains(err.Error(), "cannot reinstall the guest helper") || called {
+		t.Fatalf("interim bootstrap recreate = %v, %v, called=%t", reinstall != nil, err, called)
+	}
+}

@@ -1108,7 +1108,11 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					}
 					var cycleErr error
 					if response.Convergence == ocicontrol.ConvergenceRecreateRequired {
-						cycleErr = supervisedBootBarrier.Recreate(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities, template)
+						reinstall, err := userOCIRecreateReinstall(*ociUserInstall, *nodeID, bootSessionID, limarunner.PrepareUserInstall)
+						if err != nil {
+							return response, err
+						}
+						cycleErr = supervisedBootBarrier.Recreate(setupContext, nodeAgent.StopOCIRuntime, reinstall, nodeAgent.RecoverOCIRuntimeCapabilities, template)
 					} else {
 						cycleErr = supervisedBootBarrier.Restart(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities)
 					}

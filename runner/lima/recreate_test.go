@@ -24,6 +24,10 @@ type recreateFixture struct {
 	state                   InstanceState
 	commands                [][]string
 	quiesced                bool
+	reinstalls              int
+	reinstalledAfter        []string
+	reinstallUnlocked       bool
+	reinstallErr            error
 	recovered               bool
 	inventoryOutput         []byte
 	inventoryErr            error
@@ -124,7 +128,17 @@ esac
 
 func (f *recreateFixture) recreate(t *testing.T) error {
 	t.Helper()
-	return f.barrier.Recreate(t.Context(), func(context.Context) error { f.quiesced = true; return nil }, func(context.Context) error { f.recovered = true; return nil }, TemplateConfig{Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty"})
+	return f.barrier.Recreate(t.Context(), func(context.Context) error { f.quiesced = true; return nil }, func(context.Context) error {
+		f.reinstalls++
+		if len(f.commands) != 0 {
+			f.reinstalledAfter = f.commands[len(f.commands)-1]
+		}
+		if f.barrier.cycleMu.TryLock() {
+			f.barrier.cycleMu.Unlock()
+			f.reinstallUnlocked = true
+		}
+		return f.reinstallErr
+	}, func(context.Context) error { f.recovered = true; return nil }, TemplateConfig{Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty"})
 }
 
 func TestRecreateKeepsStoppedComputerStorageAndBackup(t *testing.T) {
@@ -155,6 +169,43 @@ func TestRecreateKeepsStoppedComputerStorageAndBackup(t *testing.T) {
 	}
 	if f.helperStopped {
 		t.Fatal("refusal left helper socket activation stopped")
+	}
+	if f.reinstalls != 0 || f.recovered {
+		t.Fatalf("refusal reinstalled=%d recovered=%t", f.reinstalls, f.recovered)
+	}
+}
+
+// A new guest has no helper. The cycle installs it after the start and before
+// recovery, still under the cycle lock (#1612).
+func TestRecreateReinstallsGuestHelperBeforeRecovery(t *testing.T) {
+	f := newRecreateFixture(t)
+	if err := f.recreate(t); err != nil || !f.recovered {
+		t.Fatalf("recreate = %v, recovered=%t", err, f.recovered)
+	}
+	last := f.commands[len(f.commands)-1]
+	if f.reinstalls != 1 || len(f.reinstalledAfter) == 0 || f.reinstalledAfter[0] != "start" || last[0] != "start" || f.reinstallUnlocked {
+		t.Fatalf("reinstalls=%d after=%v last command=%v, reinstall outside cycle lock=%t", f.reinstalls, f.reinstalledAfter, last, f.reinstallUnlocked)
+	}
+	if f.barrier.cycleMu.TryLock() {
+		f.barrier.cycleMu.Unlock()
+	} else {
+		t.Fatal("recreate left the cycle lock held")
+	}
+}
+
+func TestRecreateReinstallFailureSkipsRecovery(t *testing.T) {
+	f := newRecreateFixture(t)
+	f.reinstallErr = errors.New("injected helper install failure")
+	if err := f.recreate(t); !errors.Is(err, f.reinstallErr) || f.recovered {
+		t.Fatalf("recreate = %v, recovered=%t", err, f.recovered)
+	}
+}
+
+func TestRecreateWithoutReinstallRefusesBeforeAnyCommand(t *testing.T) {
+	f := newRecreateFixture(t)
+	err := f.barrier.Recreate(t.Context(), func(context.Context) error { f.quiesced = true; return nil }, nil, func(context.Context) error { return nil }, TemplateConfig{Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty"})
+	if err == nil || f.quiesced || len(f.commands) != 0 {
+		t.Fatalf("recreate without reinstall = %v, quiesced=%t, commands=%v", err, f.quiesced, f.commands)
 	}
 }
 
@@ -264,7 +315,7 @@ func TestRecreateRestoresSocketAfterHostSideFailure(t *testing.T) {
 			case "delete fails":
 				f.deleteErr = errors.New("delete refused")
 			}
-			err := f.barrier.Recreate(ctx, func(context.Context) error { return nil }, func(context.Context) error { return nil }, TemplateConfig{Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty"})
+			err := f.barrier.Recreate(ctx, func(context.Context) error { return nil }, func(context.Context) error { return nil }, func(context.Context) error { return nil }, TemplateConfig{Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty"})
 			if err == nil {
 				t.Fatal("expected recreate failure")
 			}

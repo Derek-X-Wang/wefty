@@ -610,7 +610,7 @@ Meaning: sizing differs and requires an authorized restart. Evidence: record old
 
 ## doctor-code-oci-convergence-recreate-required
 
-Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage, Backup copies, service data and Custody write records. First action: obtain explicit operator confirmation, follow the per-blocker recovery action below, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override.
+Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage, Backup copies, service data and Custody write records. First action: obtain explicit operator confirmation, follow the per-blocker recovery action below, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override. The recreate installs the guest helper and probe in the new host VM before recovery. If setup reports an error after the delete, restart the node agent: its startup prepares the new guest. An interim Mac bootstrap node refuses `--recreate` with `oci_setup_required`, because it cannot reinstall the helper; move it to the per-user installation first.
 
 ## host-vm-recreate-blocked
 
