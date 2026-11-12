@@ -243,15 +243,13 @@ type storageOperationFailureRow struct {
 	failedAttempts int64
 	firstFailedNS  sql.NullInt64
 	exhaustedNS    sql.NullInt64
-	reportID       string
-	reportHash     string
 }
 
 func readStorageOperationFailureRow(ctx context.Context, tx *sql.Tx, computerID string, revision int64, stage ComputerStorageOperationStage) (storageOperationFailureRow, bool, error) {
 	var row storageOperationFailureRow
-	err := tx.QueryRowContext(ctx, `SELECT failed_attempts, first_failed_ns, exhausted_ns, last_report_id, last_report_hash
+	err := tx.QueryRowContext(ctx, `SELECT failed_attempts, first_failed_ns, exhausted_ns
 		FROM computer_storage_operation_failures WHERE computer_id=? AND operation_revision=? AND stage=?`,
-		computerID, revision, string(stage)).Scan(&row.failedAttempts, &row.firstFailedNS, &row.exhaustedNS, &row.reportID, &row.reportHash)
+		computerID, revision, string(stage)).Scan(&row.failedAttempts, &row.firstFailedNS, &row.exhaustedNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return row, false, nil
 	}
@@ -305,21 +303,26 @@ func (s *Store) ReportComputerStorageOperationFailure(ctx context.Context, ident
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ComputerStorageOperationFailureResponse{}, internalError(err, "read reported Computer Storage operation")
 	}
-	failures, failuresFound, err := readStorageOperationFailureRow(ctx, tx, computerID, request.OperationRevision, request.Stage)
+	failures, _, err := readStorageOperationFailureRow(ctx, tx, computerID, request.OperationRevision, request.Stage)
 	if err != nil {
 		return ComputerStorageOperationFailureResponse{}, internalError(err, "read Computer Storage operation failure budget")
 	}
-	// A retried report is answered from the durable row, even when the
-	// operation has since ended: the agent that never saw the first answer
-	// must read the same one, and the attempt must not count twice.
-	if failuresFound && failures.reportID == request.ReportID {
+	// Every report_id the budget accepted is kept, so a retried report is
+	// answered from durable state even after later reports or after the
+	// operation ended: the agent that never saw the first answer reads the
+	// same one, and the attempt never counts twice.
+	var storedHash string
+	if err := tx.QueryRowContext(ctx, `SELECT report_hash FROM computer_storage_operation_failure_reports
+		WHERE computer_id=? AND report_id=?`, computerID, request.ReportID).Scan(&storedHash); err == nil {
 		if targetFound && request.NodeID != target.boundNodeID {
 			return ComputerStorageOperationFailureResponse{}, protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this Computer Storage operation")
 		}
-		if failures.reportHash != bodyHash {
+		if storedHash != bodyHash {
 			return ComputerStorageOperationFailureResponse{}, protocolError(contract.ErrorIdempotencyConflict, "Computer Storage operation failure report replay differs from durable evidence")
 		}
 		return storageOperationFailureResponse(ComputerStorageOperationFailureReplayed, failures, target.status), nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return ComputerStorageOperationFailureResponse{}, internalError(err, "read Computer Storage operation failure report replay")
 	}
 	if !targetFound {
 		return ComputerStorageOperationFailureResponse{Disposition: ComputerStorageOperationFailureSuperseded}, nil
@@ -346,13 +349,16 @@ func (s *Store) ReportComputerStorageOperationFailure(ctx context.Context, ident
 		}
 	}
 	nowNS := now.UnixNano()
-	if request.Class != ComputerStorageOperationFailureResumeDeferred {
+	counted := request.Class != ComputerStorageOperationFailureResumeDeferred
+	if counted {
 		failures.failedAttempts++
 		if !failures.firstFailedNS.Valid {
 			failures.firstFailedNS = sql.NullInt64{Int64: nowNS, Valid: true}
 		}
 	}
-	exhausted := storageOperationStageEndsByBudget(request.Verb, request.Stage) &&
+	// Only a counted report can spend the budget, so the operation's
+	// failure_code is always a counted class.
+	exhausted := counted && storageOperationStageEndsByBudget(request.Verb, request.Stage) &&
 		(request.Class == ComputerStorageOperationFailureQuarantined ||
 			(failures.failedAttempts >= MaximumStorageOperationFailures && failures.firstFailedNS.Valid &&
 				now.Sub(time.Unix(0, failures.firstFailedNS.Int64)) >= StorageOperationFailureWindow))
@@ -361,17 +367,22 @@ func (s *Store) ReportComputerStorageOperationFailure(ctx context.Context, ident
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_operation_failures(computer_id, operation_revision, stage, verb,
 		failed_attempts, first_failed_ns, last_failed_ns, last_failure_class, last_failure_code, last_failure_detail,
-		last_helper_generation, last_report_id, last_report_hash, exhausted_ns)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		last_helper_generation, exhausted_ns)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(computer_id, operation_revision, stage) DO UPDATE SET failed_attempts=excluded.failed_attempts,
 		first_failed_ns=excluded.first_failed_ns, last_failed_ns=excluded.last_failed_ns,
 		last_failure_class=excluded.last_failure_class, last_failure_code=excluded.last_failure_code,
 		last_failure_detail=excluded.last_failure_detail, last_helper_generation=excluded.last_helper_generation,
-		last_report_id=excluded.last_report_id, last_report_hash=excluded.last_report_hash, exhausted_ns=excluded.exhausted_ns`,
+		exhausted_ns=excluded.exhausted_ns`,
 		computerID, request.OperationRevision, string(request.Stage), string(request.Verb), failures.failedAttempts,
 		failures.firstFailedNS, nowNS, string(request.Class), request.Code, request.Detail, int64(request.HelperGeneration),
-		request.ReportID, bodyHash, failures.exhaustedNS); err != nil {
+		failures.exhaustedNS); err != nil {
 		return ComputerStorageOperationFailureResponse{}, internalError(err, "record Computer Storage operation failure")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_operation_failure_reports(computer_id, report_id,
+		operation_revision, stage, report_hash, reported_ns) VALUES(?, ?, ?, ?, ?, ?)`, computerID, request.ReportID,
+		request.OperationRevision, string(request.Stage), bodyHash, nowNS); err != nil {
+		return ComputerStorageOperationFailureResponse{}, internalError(err, "record Computer Storage operation failure report")
 	}
 	disposition, status := ComputerStorageOperationFailureCounted, target.status
 	if request.Class == ComputerStorageOperationFailureResumeDeferred {

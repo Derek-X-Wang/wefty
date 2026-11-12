@@ -946,10 +946,17 @@ CREATE TABLE IF NOT EXISTS computer_storage_operation_failures (
   last_failure_code TEXT NOT NULL,
   last_failure_detail TEXT NOT NULL DEFAULT '',
   last_helper_generation INTEGER NOT NULL DEFAULT 0,
-  last_report_id TEXT NOT NULL,
-  last_report_hash TEXT NOT NULL,
   exhausted_ns INTEGER,
   PRIMARY KEY(computer_id, operation_revision, stage)
+);
+CREATE TABLE IF NOT EXISTS computer_storage_operation_failure_reports (
+  computer_id TEXT NOT NULL,
+  report_id TEXT NOT NULL,
+  operation_revision INTEGER NOT NULL CHECK(operation_revision > 0),
+  stage TEXT NOT NULL CHECK(stage IN ('prepare', 'retire')),
+  report_hash TEXT NOT NULL,
+  reported_ns INTEGER NOT NULL,
+  PRIMARY KEY(computer_id, report_id)
 );
 CREATE TABLE IF NOT EXISTS backups (
   backup_id TEXT PRIMARY KEY,

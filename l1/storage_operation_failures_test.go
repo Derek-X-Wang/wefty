@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -670,20 +671,43 @@ func TestStorageOperationFailureReportForUnknownOperationIsSuperseded(t *testing
 // as active, and a second open changes nothing.
 func TestStorageOperationFailureMigrationWidensDurableConstraints(t *testing.T) {
 	ctx := context.Background()
-	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 2)
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
+	// A live clone row, a live reset row, and an abort row populate all
+	// three rebuilt tables.
+	clone, _, err := h.store.BeginComputerClone(ctx, ComputerCloneRequest{BackupID: backup.BackupID,
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), Name: "legacy-clone",
+		DiskBytes: backup.AllocatedSize, IdempotencyKey: "legacy-clone", Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	computer, err = h.store.GetComputer(ctx, computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	directive := beginStoppedReset(t, h, node, computer, "legacy-reset")
-	legacy := []struct{ table, current, old, index string }{
+	if _, err := h.store.db.Exec(`INSERT INTO computer_reconfiguration_aborts(computer_id, aborted_revision, intent_revision,
+		aborted_phase, idempotency_key, request_hash, actor, created_ns) VALUES(?, 40, 41, 'resetting', 'legacy-abort', 'hash', 'operator', 1)`,
+		computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	// The legacy reset table also predates failure_code and completed_ns,
+	// which the open adds back before the rebuild.
+	legacy := []struct {
+		table, index string
+		replacements map[string]string
+	}{
 		{"computer_storage_resets",
-			"status IN ('reserved', 'prepared', 'published', 'retired', 'failed', 'cleanup_owed', 'superseded')",
-			"status IN ('reserved', 'prepared', 'published', 'retired', 'superseded')",
-			`CREATE UNIQUE INDEX computer_storage_reset_active ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded')`},
+			`CREATE UNIQUE INDEX computer_storage_reset_active ON computer_storage_resets(computer_id) WHERE status NOT IN ('retired', 'superseded')`,
+			map[string]string{
+				"status IN ('reserved', 'prepared', 'published', 'retired', 'failed', 'cleanup_owed', 'superseded')": "status IN ('reserved', 'prepared', 'published', 'retired', 'superseded')",
+				"  failure_code TEXT NOT NULL DEFAULT '',\n":                                                         "",
+				"\n  completed_ns INTEGER,":                                                                          "",
+			}},
 		{"computer_storage_copy_operations",
-			"status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'cleanup_owed', 'superseded')",
-			"status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'superseded')",
-			`CREATE UNIQUE INDEX computer_storage_copy_active ON computer_storage_copy_operations(destination_computer_id) WHERE status IN ('reserved', 'prepared', 'published')`},
-		{"computer_reconfiguration_aborts",
-			"'backing_up', 'resetting', 'restoring', 'cloning', 'exporting', 'importing', 'reimaging', 'growing'",
-			"'backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing'", ""},
+			`CREATE UNIQUE INDEX computer_storage_copy_active ON computer_storage_copy_operations(destination_computer_id) WHERE status IN ('reserved', 'prepared', 'published')`,
+			map[string]string{"status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'cleanup_owed', 'superseded')": "status IN ('reserved', 'prepared', 'published', 'retired', 'complete', 'failed', 'superseded')"}},
+		{"computer_reconfiguration_aborts", "",
+			map[string]string{"'backing_up', 'resetting', 'restoring', 'cloning', 'exporting', 'importing', 'reimaging', 'growing'": "'backing_up', 'resetting', 'exporting', 'importing', 'reimaging', 'growing'"}},
 	}
 	connection, err := h.store.db.Conn(ctx)
 	if err != nil {
@@ -697,11 +721,28 @@ func TestStorageOperationFailureMigrationWidensDurableConstraints(t *testing.T) 
 		if err := connection.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table.table).Scan(&current); err != nil {
 			t.Fatal(err)
 		}
-		createSQL, err := migratedSQLiteCreateTable(current, table.table+"_legacy", map[string]string{table.current: table.old})
+		createSQL, err := migratedSQLiteCreateTable(current, table.table+"_legacy", table.replacements)
 		if err != nil {
 			t.Fatalf("fixture error: %v", err)
 		}
-		statements := createSQL + `; INSERT INTO ` + table.table + `_legacy SELECT * FROM ` + table.table + `; DROP TABLE ` + table.table +
+		if _, err := connection.ExecContext(ctx, createSQL); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := connection.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table.table+"_legacy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var columns []string
+		for rows.Next() {
+			var column string
+			if err := rows.Scan(&column); err != nil {
+				t.Fatal(err)
+			}
+			columns = append(columns, column)
+		}
+		rows.Close()
+		list := strings.Join(columns, ", ")
+		statements := `INSERT INTO ` + table.table + `_legacy(` + list + `) SELECT ` + list + ` FROM ` + table.table + `; DROP TABLE ` + table.table +
 			`; ALTER TABLE ` + table.table + `_legacy RENAME TO ` + table.table
 		if table.index != "" {
 			statements += "; " + table.index
@@ -752,10 +793,24 @@ func TestStorageOperationFailureMigrationWidensDurableConstraints(t *testing.T) 
 			t.Fatalf("migrated schema lacks %q:\n%s", want, after)
 		}
 	}
-	var status string
-	if err := migrated.db.QueryRow(`SELECT status FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`,
-		computer.ComputerID, directive.IntentRevision).Scan(&status); err != nil || status != "reserved" {
-		t.Fatalf("live reset after migration = %q err=%v", status, err)
+	var status, failureCode string
+	var completed sql.NullInt64
+	if err := migrated.db.QueryRow(`SELECT status, failure_code, completed_ns FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`,
+		computer.ComputerID, directive.IntentRevision).Scan(&status, &failureCode, &completed); err != nil || status != "reserved" ||
+		failureCode != "" || completed.Valid {
+		t.Fatalf("live reset after migration = %q %q %v err=%v", status, failureCode, completed, err)
+	}
+	if err := migrated.db.QueryRow(`SELECT status FROM computer_storage_copy_operations WHERE destination_computer_id=?`,
+		clone.ComputerID).Scan(&status); err != nil || status != "reserved" {
+		t.Fatalf("live clone after migration = %q err=%v", status, err)
+	}
+	var aborts int
+	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM computer_reconfiguration_aborts WHERE idempotency_key='legacy-abort'`).Scan(&aborts); err != nil || aborts != 1 {
+		t.Fatalf("abort rows after migration = %d err=%v", aborts, err)
+	}
+	if _, err := migrated.db.Exec(`UPDATE computer_storage_copy_operations SET status='cleanup_owed' WHERE destination_computer_id=?`,
+		clone.ComputerID); err != nil {
+		t.Fatalf("migrated copy operations refuse cleanup_owed: %v", err)
 	}
 	if _, err := migrated.db.Exec(`UPDATE computer_storage_resets SET status='failed' WHERE computer_id=? AND intent_revision=?`,
 		computer.ComputerID, directive.IntentRevision); err != nil {
@@ -784,5 +839,133 @@ func TestStorageOperationFailureMigrationWidensDurableConstraints(t *testing.T) 
 	defer again.Close()
 	if reopened := schema(again); reopened != after {
 		t.Fatalf("second open changed the schema:\n%s\nwas:\n%s", reopened, after)
+	}
+}
+
+func beginGrowDirective(t *testing.T, h *integrationHarness, node Node, computer Computer, key string) ComputerStorageGrowDirective {
+	t.Helper()
+	if _, _, err := h.store.BeginComputerGrow(context.Background(), computer.ComputerID, ComputerGrowRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), DiskBytes: computer.DesiredDiskBytes + (1 << 30),
+		IdempotencyKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	directives, err := h.store.ListNodeComputerStorageGrowDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("grow directives = %#v err=%v", directives, err)
+	}
+	return directives[0]
+}
+
+// Every accepted report_id stays replayable, not only the latest: a retry of
+// an older report after newer ones (A, B, A) is answered `replayed` and not
+// counted, also from a restarted L1, and the same report_id with another body
+// is refused.
+func TestStorageOperationFailureReplayOfAnOlderReportIsNotCounted(t *testing.T) {
+	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 2)
+	directive := beginGrowDirective(t, h, node, computer, "replay-grow")
+	reporter := newFailureReporter(t, h, node, computer.ComputerID, ComputerStorageOperationGrow,
+		directive.OperationRevision, ComputerStorageOperationPrepare, directive.OperationFence)
+	a := reporter.request(ComputerStorageOperationFailureEngine)
+	if response, err := reporter.send(a); err != nil || response.FailedAttempts != 1 {
+		t.Fatalf("report A = %#v err=%v", response, err)
+	}
+	reporter.report(ComputerStorageOperationFailureRuntimeLoss, ComputerStorageOperationFailureCounted)
+	if replayed, err := reporter.send(a); err != nil || replayed.Disposition != ComputerStorageOperationFailureReplayed || replayed.FailedAttempts != 2 {
+		t.Fatalf("replay of A after B = %#v err=%v", replayed, err)
+	}
+	changed := a
+	changed.Code = "another_call"
+	if _, err := reporter.send(changed); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("changed replay of A after B = %v", err)
+	}
+	var path string
+	var sequence int
+	var name string
+	if err := h.store.db.QueryRow("PRAGMA database_list").Scan(&sequence, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := openTestStore(t, path, StoreOptions{Clock: h.clock, LeaseDuration: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	reporter.store = resumed
+	if replayed, err := reporter.send(a); err != nil || replayed.Disposition != ComputerStorageOperationFailureReplayed || replayed.FailedAttempts != 2 {
+		t.Fatalf("replay of A after restart = %#v err=%v", replayed, err)
+	}
+}
+
+// A deferral never spends the budget, even when the count and the window are
+// already met: it is recorded, the operation keeps running, and the next
+// counted report ends it with a counted class as failure_code.
+func TestStorageOperationFailureDeferralNeverEndsTheOperation(t *testing.T) {
+	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 2)
+	directive := beginGrowDirective(t, h, node, computer, "deferral-grow")
+	reporter := newFailureReporter(t, h, node, computer.ComputerID, ComputerStorageOperationGrow,
+		directive.OperationRevision, ComputerStorageOperationPrepare, directive.OperationFence)
+	for range MaximumStorageOperationFailures {
+		reporter.report(ComputerStorageOperationFailureEngine, ComputerStorageOperationFailureCounted)
+	}
+	h.clock.Advance(StorageOperationFailureWindow)
+	if deferred := reporter.report(ComputerStorageOperationFailureResumeDeferred, ComputerStorageOperationFailureRecorded); deferred.OperationStatus != "planned" ||
+		deferred.FailedAttempts != MaximumStorageOperationFailures {
+		t.Fatalf("deferral after the window = %#v", deferred)
+	}
+	if exhausted := reporter.report(ComputerStorageOperationFailureAcknowledgementRefused, ComputerStorageOperationFailureExhausted); exhausted.OperationStatus != "failed" {
+		t.Fatalf("counted report after the deferral = %#v", exhausted)
+	}
+	ended, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	if err != nil || ended.LastGrowOperation == nil || ended.LastGrowOperation.FailureCode != "acknowledgement_refused" {
+		t.Fatalf("ended grow = %#v err=%v", ended.LastGrowOperation, err)
+	}
+}
+
+// A reset of a running Computer that published but cannot delete its
+// predecessor ends `cleanup_owed` without resuming: the reset contract
+// resumes only after the predecessor is attested gone. Its service stays
+// desired stopped, and a late retirement acknowledgement changes nothing.
+func TestCleanupOwedResetOfARunningComputerStaysStopped(t *testing.T) {
+	ctx := context.Background()
+	h, node, computer := backupHarness(t, 2, nil)
+	computer, claim := startBackupComputer(t, h, node, computer)
+	if _, _, err := h.store.BeginComputerStorageReset(ctx, computer.ComputerID,
+		ComputerStorageResetRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "running-reset", TerminateSessions: true}); err != nil {
+		t.Fatal(err)
+	}
+	finishBackupQuiescence(t, h, claim, "running-reset-stop")
+	directives, err := h.store.ListNodeComputerStorageResetDirectives(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID)
+	if err != nil || len(directives) != 1 {
+		t.Fatalf("reset directives = %#v err=%v", directives, err)
+	}
+	directive := directives[0]
+	var resume bool
+	if err := h.store.db.QueryRow(`SELECT resume_desired_running FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`,
+		computer.ComputerID, directive.IntentRevision).Scan(&resume); err != nil || !resume {
+		t.Fatalf("reset resume intent = %t err=%v", resume, err)
+	}
+	receipt := resetReceipt(directive)
+	if _, err := h.store.AcknowledgeComputerStorageReset(ctx, "fabric-computer-node", computer.ComputerID,
+		ComputerStorageResetAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			IdempotencyKey: receipt.ReceiptID, Receipt: receipt}); err != nil {
+		t.Fatal(err)
+	}
+	reporter := newFailureReporter(t, h, node, computer.ComputerID, ComputerStorageOperationReset,
+		directive.IntentRevision, ComputerStorageOperationRetire, directive.CleanupFence)
+	reporter.spend(h)
+	late := RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+		RemovalGeneration: uint64(directive.IntentRevision), CleanupFence: directive.CleanupFence,
+		RootInstanceID: directive.RootInstanceID, IdempotencyKey: "late-retired"}
+	if _, err := h.store.AcknowledgeComputerStorageRetirement(ctx, "fabric-computer-node", computer.ComputerID, late); errorCode(err) != contract.ErrorStaleIntentRevision {
+		t.Fatalf("late retirement acknowledgement = %v", err)
+	}
+	ended, err := h.store.GetComputer(ctx, computer.ComputerID)
+	if err != nil || ended.ReconfigurationPhase != ComputerReconfigurationStable || ended.StorageGeneration != directive.NewGeneration ||
+		ended.CurrentJob.State != contract.JobStopped || ended.LastResetOperation == nil || ended.LastResetOperation.Status != "cleanup_owed" {
+		t.Fatalf("cleanup-owed running reset = %#v err=%v", ended, err)
+	}
+	var serviceDesired string
+	if err := h.store.db.QueryRow(`SELECT desired_state FROM service_jobs WHERE job_id=?`, ended.CurrentJobID).Scan(&serviceDesired); err != nil ||
+		serviceDesired != string(contract.ServiceDesiredStopped) {
+		t.Fatalf("cleanup-owed reset service desired state = %q err=%v", serviceDesired, err)
 	}
 }

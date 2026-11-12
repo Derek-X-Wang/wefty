@@ -651,11 +651,13 @@ count; L1 decides.
 The rule: an operation stage ends when it has at least 5 counted failures and
 at least 10 minutes have passed since the first, measured on the L1 clock as
 each report arrives. A `quarantined` report ends it at once, because quarantine
-never clears by itself. A `resume_deferred` report is recorded and not counted:
-the helper already bounds deferral and turns one that never converges into a
-quarantine. Nothing resets the count but the end of the stage. A report whose
-`report_id` repeats is answered `replayed` from the durable row and not counted
-again; the same `report_id` with another body is `idempotency_conflict`. A
+never clears by itself. A `resume_deferred` report is recorded, not counted,
+and never ends the operation, even once the count and window are met: the
+helper already bounds deferral and turns one that never converges into a
+quarantine. Nothing resets the count but the end of the stage. L1 keeps every
+accepted `report_id`, so a retried report is answered `replayed` and not
+counted again even after later reports; the same `report_id` with another body
+is `idempotency_conflict`. A
 report for an operation that no longer exists, has ended, is past the stage, or
 whose revision the Computer no longer holds writes nothing and is answered
 `superseded`. A report from a Node that is not the operation's bound Node is
