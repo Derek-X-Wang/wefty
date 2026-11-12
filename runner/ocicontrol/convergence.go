@@ -50,6 +50,45 @@ func ClassifyConvergence(current, desired SetupState) ConvergenceClass {
 	return ConvergenceLiveSafe
 }
 
+// ConvergenceDifferences names, by their setup-state field names, what differs
+// between the current and desired state, so an operator sees what a
+// restart or recreate would change.
+func ConvergenceDifferences(current, desired SetupState) []string {
+	var fields []string
+	for _, field := range []struct {
+		name    string
+		changed bool
+	}{
+		{"vm_memory", current.VMMemory != desired.VMMemory},
+		{"vm_cpus", current.VMCPUs != desired.VMCPUs},
+		{"vm_disk", current.VMDisk != desired.VMDisk},
+		{"vm_type", current.VMType != desired.VMType},
+		{"host_mount_root", current.HostMountRoot != desired.HostMountRoot},
+		{"probe_digest", current.ProbeDigest != desired.ProbeDigest},
+		{"memory_capacity_bytes", current.MemoryCapacityBytes != desired.MemoryCapacityBytes},
+		{"memory_reserve_bytes", current.MemoryReserveBytes != desired.MemoryReserveBytes},
+		{"systemd_version", current.SystemdVersion != desired.SystemdVersion},
+		{"helper_restart_policy", current.HelperRestartPolicy != desired.HelperRestartPolicy},
+	} {
+		if field.changed {
+			fields = append(fields, field.name)
+		}
+	}
+	return fields
+}
+
+// ConvergenceAction is the operator step a class still needs; unchanged and
+// live-safe states need none.
+func ConvergenceAction(class ConvergenceClass) string {
+	switch class {
+	case ConvergenceRestartRequired:
+		return "rerun setup-oci with --apply-restart"
+	case ConvergenceRecreateRequired:
+		return "rerun setup-oci with --recreate"
+	}
+	return ""
+}
+
 // AuthorizeConvergence checks operator intent and live attempts. Host VM disk
 // absence is a separate mandatory guard at Lima's serialized delete boundary;
 // this authorization alone must never be used as permission to delete a disk.

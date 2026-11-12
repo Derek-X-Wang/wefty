@@ -345,6 +345,9 @@ func runMacBootstrap(arguments []string) error {
 	if err := limarunner.InstallGuestHelper(ctx, guestConfig); err != nil {
 		return err
 	}
+	if err := limarunner.RecordGuestOSAdvisory(ctx, *limaHome, *instance, *limactl, time.Now()); err != nil {
+		return err
+	}
 	if err := limarunner.InstallLaunchDaemon(ctx, launchConfig); err != nil {
 		return err
 	}
@@ -962,6 +965,15 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					}
 					return "", errors.New("installed helper unit inspection is unsupported on this platform")
 				}
+				// A Lima host VM exists only on macOS; an unresolved Lima home
+				// leaves the path empty, which doctor reports as not applicable.
+				var guestOSPath string
+				if runtime.GOOS == "darwin" {
+					guestOSPath, _ = limarunner.GuestOSObservationPath(os.Getenv("LIMA_HOME"), *ociLimaInstance)
+				}
+				guestKernel := func(ctx context.Context) (string, error) {
+					return limarunner.InspectGuestKernel(ctx, *ociLimaInstance, "")
+				}
 				report := ocicontrol.BuildDoctor(doctorContext, ocicontrol.DoctorConfig{
 					HostPlatform: ocicontrol.PlatformFacts{OS: runtime.GOOS, Architecture: runtime.GOARCH},
 					AgentUser:    agentUser, LaunchUnit: os.Getenv("WEFTY_LAUNCH_UNIT"),
@@ -1012,6 +1024,8 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					SetupStatePath:                *ociSetupState,
 					InstalledSystemdVersion:       installedSystemdVersion,
 					InstalledHelperServiceUnit:    installedHelperServiceUnit,
+					GuestOSObservationPath:        guestOSPath,
+					GuestKernel:                   guestKernel,
 					Removals:                      removalRecords,
 				})
 				return report, report.Validate()
@@ -1051,6 +1065,7 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					desired.SystemdVersion = current.SystemdVersion
 					desired.HelperRestartPolicy = current.HelperRestartPolicy
 					response.Convergence = ocicontrol.ClassifyConvergence(current, desired)
+					response.Differences = ocicontrol.ConvergenceDifferences(current, desired)
 				} else if !errors.Is(stateErr, os.ErrNotExist) {
 					return response, stateErr
 				}
@@ -1062,6 +1077,15 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 						response.Runbook = ocicontrol.RunbookPath
 						return response, nil
 					}
+					// The base is advisory: an unobserved or unreadable record
+					// reports no current value and never blocks this run.
+					observationPath, err := limarunner.GuestOSObservationPath(limaHome, *ociLimaInstance)
+					if err != nil {
+						return response, err
+					}
+					observation, observeErr := limarunner.ReadGuestOSObservation(observationPath)
+					base := limarunner.NewHostVMBase(observation, observeErr == nil)
+					response.Base = &base
 					if err := limarunner.UpdateInstanceSizing(filepath.Join(limaHome, *ociLimaInstance, "lima.yaml"),
 						limarunner.Sizing{Memory: request.VMMemory, CPUs: request.VMCPUs, Disk: request.VMDisk}); err != nil {
 						return response, err
@@ -1108,7 +1132,11 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					}
 					var cycleErr error
 					if response.Convergence == ocicontrol.ConvergenceRecreateRequired {
-						cycleErr = supervisedBootBarrier.Recreate(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities, template)
+						reinstall, err := userOCIRecreateReinstall(*ociUserInstall, *nodeID, bootSessionID, limarunner.PrepareUserInstall)
+						if err != nil {
+							return response, err
+						}
+						cycleErr = supervisedBootBarrier.Recreate(setupContext, nodeAgent.StopOCIRuntime, reinstall, nodeAgent.RecoverOCIRuntimeCapabilities, template)
 					} else {
 						cycleErr = supervisedBootBarrier.Restart(setupContext, nodeAgent.StopOCIRuntime, nodeAgent.RecoverOCIRuntimeCapabilities)
 					}

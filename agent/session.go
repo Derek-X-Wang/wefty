@@ -1933,6 +1933,24 @@ func (session *agentSession) reaskRuntimeReap(
 	return verifiedRuntimeReap(jobID, recorded)
 }
 
+// storageOnlyAttemptArmValid reports whether a Storage-only row is exactly one
+// of the three closed arms: absent, prepared (never attached), or detached
+// (once attached, positively detached; #1611).
+func storageOnlyAttemptArmValid(attempt workloadrunner.RuntimeResourceManifest) bool {
+	generation := attempt.ComputerStorage.StorageGeneration
+	switch {
+	case attempt.StorageAbsent:
+		return attempt.StoragePreparation == nil && attempt.StorageDetachment == nil &&
+			contract.ValidStorageAbsentRemovalAttemptID(attempt.AttemptID, generation)
+	case attempt.StorageDetachment != nil:
+		return attempt.StoragePreparation == nil && attempt.StorageDetachment.Valid() &&
+			contract.ValidStorageDetachedRemovalAttemptID(attempt.AttemptID, generation)
+	default:
+		return attempt.StoragePreparation != nil && attempt.StoragePreparation.Valid() &&
+			contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, generation)
+	}
+}
+
 func storageOnlyAttemptsReceipt(jobID, bootSessionID string, attempts []workloadrunner.RuntimeResourceManifest) (workloadrunner.ReapReceipt, bool) {
 	if jobID == "" || bootSessionID == "" || len(attempts) == 0 {
 		return workloadrunner.ReapReceipt{}, false
@@ -1940,10 +1958,7 @@ func storageOnlyAttemptsReceipt(jobID, bootSessionID string, attempts []workload
 	for _, attempt := range attempts {
 		if !attempt.StorageOnly || attempt.NodeID == "" || attempt.BootSessionID != bootSessionID || attempt.JobID != jobID ||
 			attempt.WorkloadClass != contract.JobClassService || attempt.ComputerStorage == nil ||
-			(!attempt.StorageAbsent && (attempt.StoragePreparation == nil || !attempt.StoragePreparation.Valid() ||
-				!contract.ValidStorageOnlyRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration))) ||
-			(attempt.StorageAbsent && (attempt.StoragePreparation != nil ||
-				!contract.ValidStorageAbsentRemovalAttemptID(attempt.AttemptID, attempt.ComputerStorage.StorageGeneration))) {
+			!storageOnlyAttemptArmValid(attempt) {
 			return workloadrunner.ReapReceipt{}, false
 		}
 	}

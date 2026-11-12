@@ -437,6 +437,9 @@ func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput
 		if waitErr == nil {
 			waitErr = awaitedComputerRestoreFailure(observed)
 		}
+		if waitErr == nil {
+			warnComputerRestoreCleanupOwed(stderr, observed)
+		}
 		waitErr = attachStorageProvenance(ctx, clients, computer.ComputerID, &output, waitErr)
 		return writeStorageMutationThenError(stdout, output, jsonOutput, waitErr)
 	}
@@ -517,6 +520,7 @@ func awaitedComputerCloneFailure(computer l1.Computer) error {
 	details := map[string]any{"computer_id": computer.ComputerID, "source_computer_id": outcome.SourceComputerID,
 		"backup_id": outcome.BackupID, "operation_revision": outcome.OperationRevision, "status": outcome.Status,
 		"failure_code": outcome.FailureCode}
+	storageOperationFailureDetails(details, outcome.Failure)
 	// A failed clone latches its own typed failure on the destination Job,
 	// which nothing can start again; its byte counts are the clone's.
 	var failure contract.SpawnFailure
@@ -553,6 +557,7 @@ func awaitedBackupFailure(computerID string, backups l1.BackupList) error {
 	details := map[string]any{"computer_id": computerID, "backup_id": outcome.BackupID,
 		"operation_revision": outcome.OperationRevision, "status": outcome.Status,
 		"failure_code": string(outcome.FailureCode)}
+	storageOperationFailureDetails(details, outcome.Failure)
 	code := contract.ErrorConflict
 	if outcome.FailureCode == l1.ComputerBackupFailureInsufficientDisk {
 		code = contract.ErrorCapacityExhausted
@@ -579,6 +584,7 @@ func awaitedComputerRestoreFailure(computer l1.Computer) error {
 	details := map[string]any{"computer_id": computer.ComputerID, "backup_id": outcome.BackupID,
 		"operation_revision": outcome.OperationRevision, "status": outcome.Status,
 		"failure_code": string(outcome.FailureCode)}
+	storageOperationFailureDetails(details, outcome.Failure)
 	code := contract.ErrorConflict
 	if outcome.FailureCode == l1.ComputerRestoreFailureInsufficientDisk {
 		code = contract.ErrorCapacityExhausted
@@ -590,6 +596,30 @@ func awaitedComputerRestoreFailure(computer l1.Computer) error {
 	return &apiResponseError{Service: "L1", StatusCode: 409, APIError: contract.APIError{
 		Code: code, Message: message, Retryable: false, Details: details,
 	}}
+}
+
+// warnComputerRestoreCleanupOwed reports a restore that switched the data and
+// then could not delete its predecessor within the failure budget (#1608).
+// The restore is done. It says nothing about the Computer's current power
+// state, which may have changed since: only the old bytes stay owed to the
+// Computer's removal.
+func warnComputerRestoreCleanupOwed(stderr io.Writer, computer l1.Computer) {
+	outcome := computer.RestoreOperation
+	if outcome == nil || outcome.Status != "cleanup_owed" {
+		return
+	}
+	_, _ = fmt.Fprintf(stderr, "warning: Computer %s restore %d applied, but its old generation could not be deleted (%s); "+
+		"the old bytes stay on the Node until the Computer is removed\n",
+		computer.ComputerID, outcome.OperationRevision, outcome.FailureCode)
+}
+
+// storageOperationFailureDetails adds L1's failure budget to a typed wait
+// error, so the caller sees how often and since when the operation failed.
+func storageOperationFailureDetails(details map[string]any, failure *l1.ComputerStorageOperationFailure) {
+	if failure == nil {
+		return
+	}
+	details["failure"] = failure
 }
 
 // awaitedCustodyExportFailure does the same for a Custody export whose
@@ -935,7 +965,7 @@ func waitForComputerRestore(ctx context.Context, clients *apiClients, computerID
 			return false, fmt.Errorf("L1 did not return restore operation %d of Computer %q", operationRevision, computerID)
 		}
 		switch observed.RestoreOperation.Status {
-		case "retired", "failed", "superseded":
+		case "retired", "cleanup_owed", "failed", "superseded":
 			return true, nil
 		}
 		return false, nil
@@ -956,7 +986,13 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 			return false, fmt.Errorf("Custody import %q observation revision %d does not match accepted revision %d", importID, observed.OperationRevision, operationRevision)
 		}
 		if observed.Status == "failed" {
-			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportFailed, detail: observed.FailureCode}
+			// The failure budget ends a quarantined import at once (#1608);
+			// it keeps the quarantine exit status it always had.
+			outcome := custodyImportFailed
+			if observed.FailureCode == l1.ComputerStoragePreparationQuarantined {
+				outcome = custodyImportQuarantined
+			}
+			return false, &custodyImportOutcomeError{importID: importID, outcome: outcome, detail: observed.FailureCode}
 		}
 		if observed.Status == "superseded" {
 			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}

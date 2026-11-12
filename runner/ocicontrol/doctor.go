@@ -2,9 +2,11 @@ package ocicontrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -191,6 +193,12 @@ type ConvergenceDoctorFacts struct {
 	Class   ConvergenceClass  `json:"class,omitempty"`
 	State   *SetupState       `json:"state,omitempty"`
 	Desired *SetupState       `json:"desired,omitempty"`
+	// Base is the observed host VM guest OS against the template's. It is
+	// advisory and never part of the class. Absent off Lima.
+	Base *lima.HostVMBase `json:"base,omitempty"`
+	// GuestKernel is read live when the host VM answers. It is shown, never
+	// converged on: it changes inside the guest.
+	GuestKernel string `json:"guest_kernel,omitempty"`
 }
 
 type LimaDoctorFacts struct {
@@ -385,6 +393,10 @@ type DoctorConfig struct {
 	ReadDesiredSetupState      func(string) (SetupState, error)
 	InstalledSystemdVersion    func(context.Context) (int, error)
 	InstalledHelperServiceUnit func(context.Context) (string, error)
+	// GuestOSObservationPath is the Lima instance's recorded guest OS. Empty
+	// means no host VM on this platform.
+	GuestOSObservationPath string
+	GuestKernel            func(context.Context) (string, error)
 	// RetainedResults reads the node-local agent's last retained-results
 	// accounting pass. The second result is false before the first pass has
 	// run, so "not measured yet" never arrives as a node holding nothing.
@@ -491,6 +503,7 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildCapability(config, now, &report)
 	buildLima(config, &report)
 	buildConvergence(ctx, config, &report)
+	buildHostVMBase(ctx, config, &report)
 	buildHelperHandshakeStalls(config, &report)
 	buildHelperStartupBound(config, &report)
 	if report.Lima.Applicable && report.Lima.Facts.ReasonCode == contract.CapabilityReasonHostVMIdle {
@@ -1191,6 +1204,40 @@ func appendMechanicsDependentsNotRun(report *DoctorResponse, cause NotRunCause) 
 	}
 }
 
+// buildHostVMBase reports the host VM guest OS beside convergence. A base
+// difference is advisory: the finding passes, and staying is supported (#1593).
+func buildHostVMBase(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
+	if config.GuestOSObservationPath == "" {
+		report.Findings = append(report.Findings, finding("host-vm-base", diagnosticReceipt{code: "oci_host_vm_base_not_applicable", notRunCause: NotRunNotApplicable,
+			detail: "no Lima host VM is configured for this node; a native Linux node runs OCI on the host OS"}))
+		return
+	}
+	observation, err := lima.ReadGuestOSObservation(config.GuestOSObservationPath)
+	base := lima.NewHostVMBase(observation, err == nil)
+	report.Convergence.Base = &base
+	if err != nil {
+		state := "has not been observed"
+		if !errors.Is(err, os.ErrNotExist) {
+			state = "record is unreadable (" + err.Error() + ")"
+		}
+		report.Findings = append(report.Findings, finding("host-vm-base", diagnosticReceipt{code: "oci_host_vm_base_not_observed", notRunCause: NotRunSourceUnavailable,
+			detail: fmt.Sprintf("the host VM guest OS %s; it is recorded when the node agent next prepares the host VM; template %s", state, base.Desired)}))
+		return
+	}
+	kernel := "not read (host VM stopped or unreachable)"
+	if config.GuestKernel != nil {
+		if release, kernelErr := config.GuestKernel(ctx); kernelErr == nil {
+			report.Convergence.GuestKernel, kernel = release, release
+		}
+	}
+	code, state := "oci_host_vm_base_current", "matches the template"
+	if base.UpgradeAvailable {
+		code, state = "oci_host_vm_base_upgrade_available", "differs from the template: base upgrade available; staying on the current base is supported"
+	}
+	report.Findings = append(report.Findings, finding("host-vm-base", diagnosticReceipt{ran: true, passed: true, code: code,
+		detail: fmt.Sprintf("guest_os=%s observed_at=%s template=%s kernel=%s; %s", base.Current, base.ObservedAt.Format(time.RFC3339), base.Desired, kernel, state)}))
+}
+
 func buildConvergence(ctx context.Context, config DoctorConfig, report *DoctorResponse) {
 	if config.SetupStatePath == "" {
 		report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{code: "oci_convergence_not_read", notRunCause: NotRunNotConfigured, detail: "durable setup convergence state was not configured"}))
@@ -1239,7 +1286,14 @@ func buildConvergence(ctx context.Context, config DoctorConfig, report *DoctorRe
 	}
 	report.Convergence.Outcome = outcomeFor(true, passed)
 	report.Convergence.Class = class
-	report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, passed: passed, code: "oci_convergence_" + string(class), reasonCode: reason, detail: "current and desired durable setup states were compared without applying them"}))
+	detail := "current and desired durable setup states were compared without applying them"
+	if differences := ConvergenceDifferences(current, desired); len(differences) != 0 {
+		detail += "; differs: " + strings.Join(differences, ", ")
+	}
+	if action := ConvergenceAction(class); action != "" {
+		detail += "; to apply, " + action
+	}
+	report.Findings = append(report.Findings, finding("convergence", diagnosticReceipt{ran: true, passed: passed, code: "oci_convergence_" + string(class), reasonCode: reason, detail: detail}))
 	if config.InstalledSystemdVersion == nil {
 		appendHelperRestartPolicyNotRun(report, NotRunSourceUnavailable, "the installed systemd version source was unavailable")
 		return
@@ -1443,6 +1497,7 @@ func StableDoctorCodes() []string {
 		"oci_convergence_not_read", "oci_convergence_state_unavailable", "oci_convergence_desired_not_read",
 		"oci_convergence_unchanged", "oci_convergence_live_safe", "oci_convergence_restart_required", "oci_convergence_recreate_required",
 		"oci_helper_restart_policy_not_read", "oci_helper_restart_policy_current", "oci_helper_restart_policy_drift",
+		"oci_host_vm_base_not_applicable", "oci_host_vm_base_not_observed", "oci_host_vm_base_current", "oci_host_vm_base_upgrade_available",
 		"oci_attempt_ownership_quarantine_not_run", "oci_attempt_ownership_quarantine_unavailable", "oci_attempt_ownership_quarantine_absent", "oci_attempt_ownership_quarantined",
 		"oci_removal_records_not_read", "oci_removal_records_readable", "oci_removal_unreadable", "oci_removal_stalled",
 		"oci_removal_stalled_declared",
@@ -1666,19 +1721,23 @@ func (report DoctorResponse) NoteUnreportedSections() DoctorResponse {
 			"unknown finding code %q, upgrade the CLI to read it; the agent reported: %s", item.Code, item.Detail)
 		noted.Findings[index].Runbook = DoctorRunbookPrefix + "unknown-finding-code"
 	}
-	if report.RetainedResults != nil {
-		return noted
+	reported := func(check string) bool {
+		return slices.ContainsFunc(report.Findings, func(item DiagnosticFinding) bool { return item.Check == check })
 	}
-	for _, item := range report.Findings {
-		if item.Check == "retained-results" {
-			return noted
-		}
+	if report.RetainedResults == nil && !reported("retained-results") {
+		noted.Findings = append(noted.Findings,
+			finding("retained-results", diagnosticReceipt{
+				code: "oci_retained_results_not_read", notRunCause: NotRunPeerDoesNotReport,
+				detail: "the agent that answered does not report retained-results accounting; it predates the measurement",
+			}))
 	}
-	noted.Findings = append(noted.Findings,
-		finding("retained-results", diagnosticReceipt{
-			code: "oci_retained_results_not_read", notRunCause: NotRunPeerDoesNotReport,
-			detail: "the agent that answered does not report retained-results accounting; it predates the measurement",
-		}))
+	if !reported("host-vm-base") {
+		noted.Findings = append(noted.Findings,
+			finding("host-vm-base", diagnosticReceipt{
+				code: "oci_host_vm_base_not_observed", notRunCause: NotRunPeerDoesNotReport,
+				detail: "the agent that answered does not report the host VM base; it predates the observation",
+			}))
+	}
 	return noted
 }
 
