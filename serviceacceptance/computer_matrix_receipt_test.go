@@ -1,6 +1,7 @@
 package serviceacceptance
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"testing"
@@ -112,15 +113,19 @@ func (receipt *linuxComputerMatrixReceipt) begin(id string) {
 
 func (receipt *linuxComputerMatrixReceipt) pass(id string, assertions map[string]bool, evidence map[string]string) error {
 	row := receipt.Rows[id]
-	row.Assertions, row.Evidence = assertions, evidence
+	// The row is complete once its assertions are evaluated, whatever they
+	// say: the receipt gate requires completed_at on a failed row too, so that
+	// a mutation run's one FAIL row is told apart from a row that was begun
+	// and never evaluated (#1646).
+	now := time.Now().UTC()
+	row.Assertions, row.Evidence, row.CompletedAt = assertions, evidence, &now
 	for name, passed := range assertions {
 		if !passed {
 			receipt.Rows[id] = row
 			return fmt.Errorf("Linux Computer matrix row %s assertion %s was false", id, name)
 		}
 	}
-	now := time.Now().UTC()
-	row.Status, row.CompletedAt = "PASS", &now
+	row.Status = "PASS"
 	receipt.Rows[id] = row
 	return nil
 }
@@ -217,6 +222,19 @@ func TestLinuxComputerMatrixMutationToggleFailsExactlyOwningRow(t *testing.T) {
 			}
 			if receipt.Status != "FAIL" || failures != 1 || receipt.Rows[mutated.ID].Status != "FAIL" {
 				t.Fatalf("mutation %s aggregate=%s failures=%d row=%s", mutated.ID, receipt.Status, failures, receipt.Rows[mutated.ID].Status)
+			}
+			// The receipt gate reads the JSON: an evaluated row carries its
+			// completion time there even when it failed.
+			encoded, err := json.Marshal(receipt.Rows[mutated.ID])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]any
+			if err := json.Unmarshal(encoded, &wire); err != nil {
+				t.Fatal(err)
+			}
+			if wire["status"] != "FAIL" || wire["completed_at"] == nil || wire["started_at"] == nil {
+				t.Fatalf("mutated row %s on the wire = %s", mutated.ID, encoded)
 			}
 		})
 	}
