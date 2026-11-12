@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -14,11 +15,14 @@ import (
 // permits another request; reachability failures and definitive refusals do not.
 // The live Computer probe also submits roots through L3. Those POSTs carry a
 // stable idempotency key, so replay cannot create another Run (#163).
+// A service removal POST is also replayed: L1 answers a repeat with the pending
+// removal or the removed service, so a second request changes nothing (#1618).
 // Each retried refusal is logged so lane evidence still shows slow reads.
 // Callers pass t.Context(), which is already cancelled inside t.Cleanup:
 // these helpers are for test bodies, not cleanup.
 func retryHarnessRequest(ctx context.Context, logf func(string, ...any), method, path, key string, call func() (int, []byte, error)) (int, []byte, error) {
-	mayRetry := method == http.MethodGet || method == http.MethodPost && path == "/v1/runs" && key != ""
+	mayRetry := method == http.MethodGet || method == http.MethodPost && (path == "/v1/runs" && key != "" ||
+		strings.HasPrefix(path, "/v1/jobs/") && strings.HasSuffix(path, "/remove"))
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return 0, nil, err

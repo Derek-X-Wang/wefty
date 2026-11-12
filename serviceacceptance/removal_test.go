@@ -444,16 +444,13 @@ func removalJSON(t *testing.T, ctx context.Context, h *acceptanceHarness, method
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := h.client.Do(request)
+	// A slow runner can expire the read that follows a change. The harness
+	// retries that typed answer for reads and for the removal POST (#1618).
+	status, body, err := harnessHTTP(ctx, t.Logf, h.client, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if output != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+	if output != nil && status >= 200 && status < 300 {
 		if err := json.Unmarshal(body, output); err != nil {
 			t.Fatal(err)
 		}
@@ -461,5 +458,23 @@ func removalJSON(t *testing.T, ctx context.Context, h *acceptanceHarness, method
 	if err := ctx.Err(); err != nil {
 		t.Fatal(err)
 	}
-	return response.StatusCode, body
+	return status, body
+}
+
+// The remove request's own read can expire on a slow runner. One typed
+// retryable answer must not fail a removal test (#1618).
+func TestRemovalHelperRetriesExpiredReadSnapshot(t *testing.T) {
+	calls := 0
+	client := &http.Client{Transport: harnessReadTransport(func(request *http.Request) (*http.Response, error) {
+		calls++
+		status, payload := http.StatusAccepted, `{}`
+		if calls == 1 {
+			status, payload = http.StatusServiceUnavailable, `{"error":{"code":"unavailable","message":"read snapshot unavailable","retryable":true,"details":{"reason":"read_snapshot_expired"}}}`
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
+	})}
+	status, body := removalJSON(t, t.Context(), &acceptanceHarness{client: client}, http.MethodPost, "/v1/jobs/job/remove?class=service", nil, nil)
+	if status != http.StatusAccepted || calls != 2 {
+		t.Fatalf("remove after one expired read snapshot: calls=%d status=%d body=%s", calls, status, body)
+	}
 }
