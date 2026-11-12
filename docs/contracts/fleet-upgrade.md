@@ -1,8 +1,11 @@
 # Fleet upgrade
 
-`wefty upgrade [--yes] [--drain-timeout DURATION]` upgrades one recorded
+`wefty upgrade [--yes] [--drain-timeout DURATION] [--commit SHA]` upgrades one recorded
 Mac or Linux fleet installation. Run it separately on each machine, control plane first, in the
-same sitting. There is no mixed-version compatibility promise. Legacy plain
+same sitting. There is no mixed-version compatibility promise. Pass the same
+`--commit SHA` on every machine to install one version even if `main` moves
+during the sitting; its validation and `upgrade_commit_not_on_main` refusal
+are those of [plain upgrade](plain-node-upgrade.md). Legacy plain
 installations retain the behavior and output of [plain upgrade](plain-node-upgrade.md).
 
 ## Role and preparation
@@ -21,7 +24,7 @@ to legacy service rendering.
 
 Upgrade takes setup's installation lock and repeats the read-only role checks
 before recovery, source cleanup, or preparation. It uses the existing owned
-`upgrade-source.git`, exact main export, confined staging, build environment,
+`upgrade-source.git`, exact main export (or the pinned commit on main), confined staging, build environment,
 version checks and bounded preparation. Binaries come only from that export.
 The recorded node-agent login PATH supplies the build tools and service PATH.
 
@@ -204,7 +207,7 @@ service-manager commands.
   access and consistent versions during the attended cutover (#903).
 - **Native Linux upgrade:** use one control plane or joining Linux machine
   installed from the previous build. The candidate must be available on `main`,
-  because upgrade fetches exact public `main`. Build the candidate CLI and use
+  because upgrade fetches exact public `main`; `--commit SHA` pins it. Build the candidate CLI and use
   its full path if the previous CLI still refuses Linux upgrade.
   1. Start a harmless read-only restartable Run and an ordinary one-shot on the
      selected Node. Confirm both have active Attempts before upgrading. Keep
