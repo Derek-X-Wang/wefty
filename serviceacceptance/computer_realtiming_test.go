@@ -97,8 +97,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"l1_node_dead": l1.DefaultNodeDeadAfter.String(),
 		"l3_reconcile": "production-default",
 	}
+	receipt.Timings["l1_storage_failure_count"] = fmt.Sprint(l1.MaximumStorageOperationFailures)
+	receipt.Timings["l1_storage_failure_window"] = acceptanceStorageFailureWindow.String()
 	receipt.Deviations = []linuxComputerDeviation{{ID: "dev.plain_fabric_identity", Status: "DEVIATION",
-		Reason: "secretless Linux CI uses the shipped DEVELOPMENT ONLY self-asserted plain person identity route; attended Fabric identity remains #128"}}
+		Reason: "secretless Linux CI uses the shipped DEVELOPMENT ONLY self-asserted plain person identity route; attended Fabric identity remains #128"},
+		{ID: "dev.short_storage_failure_budget", Status: "DEVIATION",
+			Reason: "the lane's L1 is built with the acceptance_short_storage_budget tag: the Storage operation failure budget keeps its rule and its count, with a " +
+				acceptanceStorageFailureWindow.String() + " window and a 2s to 8s retry pace instead of 10m and 15s to 5m (#1634)"}}
 
 	helperSocket := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_HELPER_SOCKET")
 	helperChecksum := requiredComputerRealtimeEnvironment(t, "WEFTY_OCI_HELPER_CHECKSUM")
@@ -550,6 +555,9 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	ownershipMatchElapsed := time.Since(ownershipMatchStarted)
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
 	detachment := inspectLiveComputerReimageDetachment(t, harness, reimaged)
+	copyAbort := exerciseLiveCopyAbort(t, harness, reference, digest)
+	growBudget := exerciseLiveGrowBudget(t, harness, reference, digest)
+	resetBudget := exerciseLiveResetBudget(t, harness, reference, digest)
 	recordComputerAuthority(receipt, reimaged)
 	completeLinuxComputerRow(t, receipt, "linux.reconfiguration", map[string]bool{
 		"grow_applied_live":            resized.DesiredDiskBytes == 160<<20,
@@ -561,7 +569,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"abort_after_dead_node_live":   abortEvidence.Aborted,
 		"stale_cas_rejected_live":      abortEvidence.StaleCASRejected,
 		"no_automatic_rollback_live":   abortEvidence.NoAutoRollback,
+		"grow_budget_failed_live":      growBudget.Passed,
+		"reset_budget_counted_live":    resetBudget.Passed,
+		"restore_abort_dead_node_live": copyAbort.Restore.Passed,
+		"clone_abort_dead_node_live":   copyAbort.Clone.Passed,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
+		"grow_budget": growBudget.Detail, "reset_budget": resetBudget.Detail,
+		"restore_abort": copyAbort.Restore.Detail, "clone_abort": copyAbort.Clone.Detail,
 		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "reimage_reference": reimageReference,
 		"reimage_digest": reimageDigest, "reimage_chown_elapsed": chownReimageElapsed.String(),
 		"reimage_ownership_match_elapsed": ownershipMatchElapsed.String(), "aborted_computer_id": abortEvidence.ComputerID})
@@ -624,6 +638,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		t.Fatalf("Computer import receipt = %#v", importReceipt)
 	}
 	recordComputerAuthority(receipt, *importOutput.Computer)
+	importBudget := exerciseLiveImportBudget(t, harness, exportOutput.CustodyExport.ExportID, exportDirectory, manifestPath, manifestDigest)
 	if err := os.RemoveAll(exportDirectory); err != nil {
 		t.Fatal(err)
 	}
@@ -669,6 +684,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 			"--expect-current", "--allow-power-off", "--idempotency-key", "linux-native-cap-pressure", "--wait", "4m")
 	}
 	enospc := exerciseLiveComputerENOSPC(t, harness, reference, digest)
+	storageBudgets := exerciseLiveStorageProvenanceBudgets(t, harness, reference, digest)
 	reimaged = runComputerCLI[l1.Computer](t, harness, false, "services", "start", reimaged.ComputerID, "--expect-current")
 	reimaged = waitForComputerCLI(t, harness, reimaged.ComputerID, 3*time.Minute, computerDisplayPublished)
 	restoreOldEndpoint, restoreCurrentEndpoint := retargetTakeoverSessionCapability(t, staleCredential.tokenFile, reimaged.DisplayEndpoint)
@@ -693,8 +709,14 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"restore_token_revocation_live":      restoreTokenRevoked,
 		"prestop_session_lineage_rejected_after_restore_live": preStopSessionRejectedAfterRestore.Error.Code == contract.ErrorTakeoverSessionEnded &&
 			preStopSessionRejectedAfterRestore.Receipt != nil && preStopSessionRejectedAfterRestore.Receipt.SessionEndReason == string(l1.ComputerTakeoverAttemptAuthorityLost),
-		"backup_cap_pressure_live": capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
-		"real_disk_enospc_live":    enospc.Observed,
+		"backup_cap_pressure_live":  capSet.Computer != nil && strings.Contains(capPressure, string(contract.ErrorConflict)),
+		"real_disk_enospc_live":     enospc.Observed,
+		"backup_budget_failed_live": storageBudgets.Backup.Passed && storageBudgets.BackupResumed,
+		"restore_quarantine_failed_live": storageBudgets.RestoreQuarantine.Passed && storageBudgets.RestoreKeptOldGeneration &&
+			storageBudgets.SecondRestoreSucceeded,
+		"clone_budget_failed_live":  storageBudgets.Clone.Passed && storageBudgets.CloneRemoved,
+		"import_budget_failed_live": importBudget.Passed,
+		"restore_cleanup_owed_live": storageBudgets.RestoreCleanupOwed.Passed && storageBudgets.CleanupOwedStarted,
 	}
 	storageEvidence := map[string]string{"backup_id": backup.BackupID, "clone_computer_id": cloneOutput.Computer.ComputerID,
 		"clone_machine_id_before": cloneReceipt.MachineIDBeforeDigest, "clone_machine_id_after": cloneReceipt.MachineIDAfterDigest,
@@ -702,7 +724,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"retained_backups": fmt.Sprint(len(backupInventory.Backups)), "enospc_observation": enospc.Detail,
 		"restore_old_endpoint": restoreOldEndpoint, "restore_current_endpoint": restoreCurrentEndpoint,
 		"restore_admission_job_state":      string(restoreAdmissionState),
-		"restore_token_revocation_receipt": restoreTokenRevocationDetail}
+		"restore_token_revocation_receipt": restoreTokenRevocationDetail,
+		"budget_computer_id":               storageBudgets.ComputerID,
+		"backup_budget":                    storageBudgets.Backup.Detail,
+		"restore_quarantine":               storageBudgets.RestoreQuarantine.Detail,
+		"clone_budget":                     storageBudgets.Clone.Detail,
+		"import_budget":                    importBudget.Detail,
+		"restore_cleanup_owed":             storageBudgets.RestoreCleanupOwed.Detail}
 	completeLinuxComputerRow(t, receipt, "linux.storage_provenance", storageAssertions, storageEvidence)
 
 	receipt.begin("linux.guest_authority")
@@ -808,6 +836,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	for _, target := range []l1.Computer{reimaged, *cloneOutput.Computer} {
 		_ = removeAndWaitComputer(t, harness, target, 4*time.Minute)
 	}
+	rotatedRemoval := exerciseLiveStopReimageRemove(t, harness, controlSocket, reference, digest, reimageReference, reimageDigest)
 	verifiedComputer := createReadyComputer(t, harness, reference, digest, "linux-native-verified-removal", "linux-native-verified-removal-create")
 	recordComputerAuthority(receipt, verifiedComputer)
 	removalCommandIntact := true
@@ -873,8 +902,19 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"operator_bind_source_untouched": archiveBefore == archiveAfter,
 		"shared_image_cache_untouched":   cacheBefore && cacheAfter,
 		"removal_command_intact":         removalCommandIntact,
+		// Stop, reimage, remove (#1611, #1624): the reimage's Job never ran.
+		"stop_reimage_remove_verified_live":   rotatedRemoval.Outcome == "removed_verified",
+		"rotated_job_never_ran_live":          rotatedRemoval.RotatedJobNeverRan,
+		"rotated_removal_residue_absent_live": rotatedRemoval.ResidueAbsent,
+		"rotated_removal_not_pending_live":    rotatedRemoval.NoPendingRemoval,
+		"rotated_removal_helper_session_kept_live": rotatedRemoval.HelperSessionBefore != "" &&
+			rotatedRemoval.HelperSessionBefore == rotatedRemoval.HelperSessionAfter,
 	}, map[string]string{"verified_computer_id": verified.ComputerID, "reduced_computer_id": reduced.ComputerID,
-		"custody_tainted_computer_id": taintedComputerID, "verified_outcome": verified.RemovalOutcome,
+		"rotated_computer_id": rotatedRemoval.ComputerID, "rotated_first_job_id": rotatedRemoval.FirstJobID,
+		"rotated_job_id": rotatedRemoval.RotatedJobID, "rotated_disk_name": rotatedRemoval.DiskName,
+		"rotated_removal_outcome": rotatedRemoval.Outcome, "rotated_helper_session_before": rotatedRemoval.HelperSessionBefore,
+		"rotated_helper_session_after": rotatedRemoval.HelperSessionAfter,
+		"custody_tainted_computer_id":  taintedComputerID, "verified_outcome": verified.RemovalOutcome,
 		"reduced_outcome": reduced.RemovalOutcome, "inventory_source": "helper VerifyNamespaceReadOnly route",
 		"self_gc_classes":                 "managed_volumes:wefty-handoff-volume-,image_spools",
 		"self_gc_removed_managed_volumes": strings.Join(observedGCRemoved.ManagedVolumes, ","),

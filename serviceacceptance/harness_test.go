@@ -56,7 +56,11 @@ func TestMain(main *testing.M) {
 		{name: "run ledger", output: runLedgerPath, pkg: "./cmd/wefty-l3"},
 		{name: "echo service", output: echoServiceBinaryPath, pkg: "./cmd/wefty-echo-service"},
 	} {
-		command := exec.Command("go", "build", "-o", build.output, build.pkg)
+		arguments := []string{"build"}
+		if build.pkg == "./cmd/wefty-l1" && controlPlaneBuildTags != "" {
+			arguments = append(arguments, "-tags", controlPlaneBuildTags)
+		}
+		command := exec.Command("go", append(arguments, "-o", build.output, build.pkg)...)
 		command.Dir = repositoryRoot()
 		if output, buildErr := command.CombinedOutput(); buildErr != nil {
 			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", build.name, buildErr, output)

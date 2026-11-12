@@ -302,23 +302,15 @@ const MinimumServiceRemovalStallAttempts = 3
 // burst of fast failures from ending an operation; the window gives a
 // transient host fault time to clear. They are the values first accepted for
 // restore in #1591, now durable across agent restarts.
-const (
-	MaximumStorageOperationFailures = 5
-	StorageOperationFailureWindow   = 10 * time.Minute
-)
+//
+// The window and the retry pacing live in storage_operation_budget.go. A
+// build tag replaces that file in the L1 binary the acceptance lane runs,
+// never an environment variable or a flag in the product binary.
+const MaximumStorageOperationFailures = 5
 
 // MaximumStorageOperationFailureDetail bounds the free-text context of one
 // Storage operation failure report. The class and code are the facts.
 const MaximumStorageOperationFailureDetail = MaximumServiceRemovalStallDetail
-
-// storageOperationFailureRetryBase and storageOperationFailureRetryCeiling
-// pace the next attempt of a failing Storage operation directive: the delay
-// doubles with each counted failure, so an operation that cannot succeed ends
-// 10 to 15 minutes after its first failure, after about seven calls.
-const (
-	storageOperationFailureRetryBase    = 15 * time.Second
-	storageOperationFailureRetryCeiling = 5 * time.Minute
-)
 
 // MaximumComputerReimagePreflightRefusals is how many consecutive authority
 // refusals of the same reimage preflight acknowledgement L1 admits before the

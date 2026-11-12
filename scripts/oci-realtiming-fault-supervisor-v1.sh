@@ -178,6 +178,82 @@ MANIFEST
           continue
         fi
         ;;
+      freeze-storage-roots|thaw-storage-roots|freeze-backup-roots|thaw-backup-roots)
+        # A Storage failure the helper cannot turn into a receipt (#1634). The
+        # immutable flag makes every create, rename and unlink in the directory
+        # fail with EPERM, for root too, until the matching thaw clears it:
+        # storage-roots refuses a new generation root (restore, clone and
+        # import copy) and backup-roots a new Backup copy.
+        # Failures are recorded, not fatal: under set -e they would take the
+        # shared supervisor down.
+        case "${action#*-}" in
+          storage-roots) fault_directory=/var/lib/wefty/oci/computer-disks ;;
+          backup-roots) fault_directory=/var/lib/wefty/oci/computer-backups ;;
+        esac
+        if [ "${action%%-*}" = freeze ]; then
+          if ! install --directory --owner=root --group=root --mode=0700 "$fault_directory" || ! chattr +i "$fault_directory"; then
+            record_action_failure "could not make $fault_directory immutable"
+            continue
+          fi
+        elif test -e "$fault_directory" && ! chattr -i "$fault_directory"; then
+          record_action_failure "could not clear the immutable flag on $fault_directory"
+          continue
+        fi
+        ;;
+      freeze-computer-disk:wefty-computer-disk-*|thaw-computer-disk:wefty-computer-disk-*)
+        # The same fault on one generation root: the helper can read it and
+        # take its lock, but cannot write a manifest or a grow intent into it
+        # (grow, and reset before the fence) or delete it (predecessor
+        # deletion). The deletion fails with a permission error, which the
+        # adapter does not retry and so never turns into a cleanup quarantine.
+        name="${action#*:}"
+        case "${name#wefty-computer-disk-}" in ''|*[!0-9a-f]*) exit 64 ;; esac
+        disk_root="/var/lib/wefty/oci/computer-disks/$name"
+        if [ "${action%%-*}" = freeze ]; then
+          if ! test -d "$disk_root" || ! chattr +i "$disk_root"; then
+            record_action_failure "could not make generation root $name immutable"
+            continue
+          fi
+        elif test -e "$disk_root" && ! chattr -i "$disk_root"; then
+          record_action_failure "could not clear the immutable flag on generation root $name"
+          continue
+        fi
+        ;;
+      quarantine-computer-storage:wefty-computer-disk-*:*:*:[1-9]*)
+        # Manufacture the helper's own cleanup-quarantine record for a
+        # generation that does not exist yet, so the next copy into it is
+        # refused as quarantined. name:computer_id:storage_id:generation.
+        fields="${action#*:}"
+        name="${fields%%:*}"
+        fields="${fields#*:}"
+        computer_id="${fields%%:*}"
+        fields="${fields#*:}"
+        storage_id="${fields%%:*}"
+        generation="${fields#*:}"
+        case "${name#wefty-computer-disk-}" in ''|*[!0-9a-f]*) exit 64 ;; esac
+        case "$computer_id$storage_id" in ''|*[!A-Za-z0-9_-]*) exit 64 ;; esac
+        case "$generation" in *[!0-9]*) exit 64 ;; esac
+        quarantine_root=/var/lib/wefty/oci/computer-disk-quarantine
+        if ! install --directory --owner=root --group=root --mode=0700 "$quarantine_root" ||
+          ! jq -n --arg computer "$computer_id" --arg storage "$storage_id" --argjson generation "$generation" \
+            '{kind:"managed_volume_cleanup_quarantined", receipt_id:"acceptance-manufactured-quarantine",
+              volume_kind:"computer_disk",
+              computer_storage:{computer_id:$computer, storage_id:$storage, storage_generation:$generation},
+              removal:{removal_generation:1}, attempts:1}' \
+            > "$quarantine_root/.acceptance-$name.tmp" ||
+          ! mv "$quarantine_root/.acceptance-$name.tmp" "$quarantine_root/$name-cleanup-1.json"; then
+          record_action_failure "could not write the quarantine record for $name"
+          continue
+        fi
+        ;;
+      clear-computer-storage-quarantine:wefty-computer-disk-*)
+        name="${action#*:}"
+        case "${name#wefty-computer-disk-}" in ''|*[!0-9a-f]*) exit 64 ;; esac
+        if ! rm -f "/var/lib/wefty/oci/computer-disk-quarantine/$name-cleanup-1.json"; then
+          record_action_failure "could not remove the quarantine record for $name"
+          continue
+        fi
+        ;;
       *) exit 64 ;;
     esac
     touch "/tmp/wefty-oci-faults/$action.done"
