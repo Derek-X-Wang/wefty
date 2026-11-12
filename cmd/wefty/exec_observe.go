@@ -22,10 +22,12 @@ import (
 // growing gap, so a loaded host is not asked again every second (#1629).
 // stillFollowing runs once per read, when the next try starts past the restart
 // window, so a silent follow does not look hung. Without it every failure shares the
-// restart window: a known verdict is not held back for a busy service.
+// restart window and the fixed gap: a known verdict is not held back for a
+// busy service.
 func readExec[T any](caller context.Context, clients *apiClients, stillFollowing func(), read func(context.Context) (T, error)) (T, error) {
+	following := stillFollowing != nil
 	budget := execReadRecoveryBudget
-	if stillFollowing != nil {
+	if following {
 		budget = execReadOverloadBudget
 	}
 	ctx, stop := context.WithTimeout(withoutClientRetry(caller), budget)
@@ -49,7 +51,9 @@ func readExec[T any](caller context.Context, clients *apiClients, stillFollowing
 		gap := execPollInterval
 		if timedOut || (errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable) {
 			unreachableSince = time.Time{}
-			gap, busyGap = busyGap, min(2*busyGap, execReadOverloadGapLimit*execPollInterval)
+			if following {
+				gap, busyGap = busyGap, min(2*busyGap, execReadOverloadGapLimit*execPollInterval)
+			}
 			if stillFollowing != nil && time.Since(started)+gap >= execReadRecoveryBudget {
 				stillFollowing()
 				stillFollowing = nil

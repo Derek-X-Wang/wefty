@@ -92,11 +92,16 @@ func TestExecReadOutlastsBusyServiceButNotUnreachableOne(t *testing.T) {
 		t.Run(name+" ends at the restart window when not following", func(t *testing.T) {
 			setExecReadWindows(t, 50*time.Millisecond, time.Minute, 5*time.Millisecond)
 			started := time.Now()
-			_, err := readExec(t.Context(), &apiClients{wait: waitForContext}, nil, func(ctx context.Context) (int, error) {
+			var gaps []time.Duration
+			clients := &apiClients{wait: func(ctx context.Context, gap time.Duration) error {
+				gaps = append(gaps, gap)
+				return waitForContext(ctx, gap)
+			}}
+			_, err := readExec(t.Context(), clients, nil, func(ctx context.Context) (int, error) {
 				return 0, failure(ctx)
 			})
-			if err == nil || time.Since(started) > 10*time.Second {
-				t.Fatalf("read without a follow: err=%v after %v", err, time.Since(started))
+			if err == nil || time.Since(started) > 10*time.Second || slices.ContainsFunc(gaps, func(gap time.Duration) bool { return gap != 5*time.Millisecond }) {
+				t.Fatalf("read without a follow: err=%v after %v gaps=%v", err, time.Since(started), gaps)
 			}
 		})
 	}
