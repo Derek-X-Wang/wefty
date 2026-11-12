@@ -1008,9 +1008,11 @@ func waitForCustodyImportReporting(ctx context.Context, clients *apiClients, imp
 		if observed.Status == "superseded" {
 			return false, &custodyImportOutcomeError{importID: importID, outcome: custodyImportSuperseded, detail: observed.FailureCode}
 		}
-		// A deferral or a quarantine the helper recorded keeps its own exit
-		// status: neither clears within a wait. An interrupted outcome does
-		// not end the wait while the import is still running.
+		// A deferral or a quarantine the helper recorded keeps its documented
+		// exit status. A quarantine never clears; a deferral may still clear
+		// on a later attempt, so its exit says "deferred", not "failed". An
+		// interrupted outcome does not end the wait while the import is still
+		// running: L1 counts it and retries.
 		if outcome := observed.PreparationOutcome; outcome != nil && outcome.Code != l1.ComputerStoragePreparationInterrupted {
 			exit := custodyImportDeferred
 			if outcome.Code == l1.ComputerStoragePreparationQuarantined {
@@ -1021,7 +1023,7 @@ func waitForCustodyImportReporting(ctx context.Context, clients *apiClients, imp
 		if observed.Status == "reserved" {
 			if failure := observed.Failure; failure != nil && progress != nil && failure.FailedAttempts != reportedAttempts {
 				reportedAttempts = failure.FailedAttempts
-				_, _ = fmt.Fprintf(progress, "Custody import %s: %d failed attempts so far (last %s/%s); L1 retries it until it completes or its failure budget ends it\n",
+				_, _ = fmt.Fprintf(progress, "Custody import %s: failed attempts so far: %d (last %s/%s); L1 retries it until it completes or its failure budget ends it\n",
 					importID, failure.FailedAttempts, failure.Class, failure.Code)
 			}
 			return false, nil

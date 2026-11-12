@@ -671,7 +671,7 @@ func TestRuntimeLossImportWaitFollowsTheFailureBudget(t *testing.T) {
 	}
 	var outcome *custodyImportOutcomeError
 	if err == nil || errors.As(err, &outcome) || !strings.Contains(err.Error(), "timed out") || elapsed < waitBudget ||
-		!strings.Contains(stderr.String(), "1 failed attempts so far (last runtime_loss/") ||
+		!strings.Contains(stderr.String(), "failed attempts so far: 1 (last runtime_loss/") ||
 		!bytes.Contains(stdout.Bytes(), []byte(`"status": "reserved"`)) {
 		t.Fatalf("runtime-loss import stdout=%s stderr=%s elapsed=%s err=%v", stdout.String(), stderr.String(), elapsed, err)
 	}
