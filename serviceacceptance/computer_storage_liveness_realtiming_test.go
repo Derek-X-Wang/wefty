@@ -617,21 +617,23 @@ func exerciseLiveCopyAbort(t *testing.T, harness *acceptanceHarness, reference, 
 			cloneStatus == "superseded" && cloneCode == string(l1.ComputerRestoreFailureAbortedDeadNode),
 		Detail: fmt.Sprintf("before_phase=%s aborted_phase=%s name=%s operation=%s/%s", cloneBefore.ReconfigurationPhase,
 			cloneAborted.ReconfigurationPhase, cloneAborted.Name, cloneStatus, cloneCode)}
-	// The Node facts behind the L1 fields: the restored Computer runs on its
-	// old generation, and neither copy left a generation root behind.
+	// The Node facts behind the L1 fields: neither copy left a generation root
+	// behind, and the restored Computer runs on its old generation. Both clone
+	// Computers go first: the aborted destination still holds a Slot, and the
+	// acceptance Node has only two.
+	cloneRoot := filepath.Join(liveStorageRuntimeRoot, "computer-disks", liveComputerDiskName(t, cloneAborted))
+	removedClone := removeAndWaitComputer(t, harness, cloneAborted, 5*time.Minute)
+	cloneRootAbsent := nodePathAbsent(t, cloneRoot)
+	evidence.Clone.Passed = evidence.Clone.Passed && cloneRootAbsent
+	evidence.Clone.Detail += fmt.Sprintf(" removal_outcome=%s destination_root_absent=%t", removedClone.RemovalOutcome, cloneRootAbsent)
+	_ = removeAndWaitComputer(t, harness, cloneSource, 5*time.Minute)
 	restarted := startLiveStorageComputer(t, harness, restoreAborted)
 	staging := restoreTarget
 	staging.StorageGeneration++
 	stagingAbsent := nodePathAbsent(t, filepath.Join(liveStorageRuntimeRoot, "computer-disks", liveComputerDiskName(t, staging)))
 	evidence.Restore.Passed = evidence.Restore.Passed && restarted.StorageGeneration == restoreTarget.StorageGeneration && stagingAbsent
 	evidence.Restore.Detail += fmt.Sprintf(" started_generation=%d staging_root_absent=%t", restarted.StorageGeneration, stagingAbsent)
-	cloneRoot := filepath.Join(liveStorageRuntimeRoot, "computer-disks", liveComputerDiskName(t, cloneAborted))
-	removedClone := removeAndWaitComputer(t, harness, cloneAborted, 5*time.Minute)
-	cloneRootAbsent := nodePathAbsent(t, cloneRoot)
-	evidence.Clone.Passed = evidence.Clone.Passed && cloneRootAbsent
-	evidence.Clone.Detail += fmt.Sprintf(" removal_outcome=%s destination_root_absent=%t", removedClone.RemovalOutcome, cloneRootAbsent)
 	removedRestore := removeAndWaitComputer(t, harness, restarted, 5*time.Minute)
 	evidence.Restore.Detail += " removal_outcome=" + removedRestore.RemovalOutcome
-	_ = removeAndWaitComputer(t, harness, cloneSource, 5*time.Minute)
 	return evidence
 }
