@@ -25,6 +25,7 @@ func TestHarnessHTTPRetry(t *testing.T) {
 	}{
 		{"read recovers", "GET", "/v1/jobs/job", "", unavailable, 2, 3, 200},
 		{"keyed root submission recovers", "POST", "/v1/runs", "same-root", unavailable, 2, 3, 200},
+		{"service removal recovers", "POST", "/v1/jobs/job/remove", "", unavailable, 2, 3, 200},
 		{"retry exhaustion preserves refusal", "GET", "/v1/computers/id", "", unavailable, 10, 4, 503},
 		{"definitive unavailable", "GET", "/v1/jobs/job", "", `{"error":{"code":"unavailable","retryable":false}}`, 1, 1, 503},
 		{"other retryable code", "GET", "/v1/jobs/job", "", `{"error":{"code":"internal","retryable":true}}`, 1, 1, 503},
