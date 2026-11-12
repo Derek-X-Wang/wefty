@@ -479,7 +479,7 @@ func (s *Store) ensureLogUsageCounters(ctx context.Context) error {
 			SELECT 1, COALESCE(SUM(LENGTH(bytes)), 0) FROM log_events;`); err != nil {
 		return fmt.Errorf("l1: seed log usage counters: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return fmt.Errorf("l1: commit log usage seed: %w", err)
 	}
 	return nil

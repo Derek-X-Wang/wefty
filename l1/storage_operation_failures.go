@@ -396,7 +396,7 @@ func (s *Store) ReportComputerStorageOperationFailure(ctx context.Context, ident
 		}
 		disposition = ComputerStorageOperationFailureExhausted
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerStorageOperationFailureResponse{}, internalError(err, "commit Computer Storage operation failure report")
 	}
 	if exhausted {

@@ -3,6 +3,10 @@ package l1
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -107,10 +111,117 @@ func TestSlowWriteLockLogsHolderAndWaiter(t *testing.T) {
 	}
 }
 
+func commitThenWorkForTest(s *Store, work time.Duration) error {
+	write, err := s.beginWriteTransaction(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer write.rollback()
+	if err := write.commit(); err != nil {
+		return err
+	}
+	time.Sleep(work)
+	return nil
+}
+
+// The hold ends at commit: work after it, such as Reconcile's Seat-life pass,
+// is not charged to the transaction that released the lock.
+func TestWriteLockHoldEndsAtCommit(t *testing.T) {
+	s, _ := snapshotStore(t)
+	log := &writeLockLog{}
+	s.logf = log.logf
+	s.writeLockLogThreshold = 100 * time.Millisecond
+	if err := commitThenWorkForTest(s, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if lines := log.slow("l1.commitThenWorkForTest"); len(lines) != 0 {
+		t.Fatalf("post-commit work counted as lock hold: %q", lines)
+	}
+}
+
+// Every function that opens a write transaction ends it through
+// writeTransaction.commit or rollback. A raw Commit or Rollback on its
+// *sql.Tx would leave the hold running until the deferred rollback, charging
+// later work to the lock.
+func TestWriteTransactionsEndThroughTheirTiming(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			writes, aliases := map[string]bool{}, map[string]bool{}
+			ast.Inspect(function.Body, func(n ast.Node) bool {
+				assign, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, rhs := range assign.Rhs {
+					if i >= len(assign.Lhs) {
+						break
+					}
+					left, ok := assign.Lhs[i].(*ast.Ident)
+					if !ok {
+						continue
+					}
+					if call, ok := rhs.(*ast.CallExpr); ok {
+						if selector, ok := call.Fun.(*ast.SelectorExpr); ok && (selector.Sel.Name == "beginWriteTransaction" || selector.Sel.Name == "beginSettlementWriteTransaction") {
+							writes[left.Name] = true
+						}
+					}
+					if selector, ok := rhs.(*ast.SelectorExpr); ok && selector.Sel.Name == "tx" {
+						if owner, ok := selector.X.(*ast.Ident); ok && writes[owner.Name] {
+							aliases[left.Name] = true
+						}
+					}
+				}
+				return true
+			})
+			ast.Inspect(function.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "Commit" && selector.Sel.Name != "Rollback" {
+					return true
+				}
+				raw := false
+				switch receiver := selector.X.(type) {
+				case *ast.Ident:
+					raw = aliases[receiver.Name]
+				case *ast.SelectorExpr:
+					owner, ok := receiver.X.(*ast.Ident)
+					raw = ok && receiver.Sel.Name == "tx" && writes[owner.Name]
+				}
+				if raw {
+					t.Errorf("%s: %s calls %s on a write transaction's raw tx; use its %s()", fset.Position(call.Pos()), function.Name.Name, selector.Sel.Name, strings.ToLower(selector.Sel.Name))
+				}
+				return true
+			})
+		}
+	}
+}
+
 // #1632: Reconcile samples its wall time after it holds the write lock, so
 // authority_lost_at cannot precede the moment the pass could act.
 func TestReconcileStampsAuthorityLossAfterWriteLock(t *testing.T) {
-	h := newIntegrationHarness(t, map[string][]string{"node-1": {"linux"}})
+	// No background pass may expire the attempt before the explicit one.
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{
+		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots},
+	}, true, time.Hour)
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "fabric-node-1", Tags: []string{DefaultAgentPrincipalTag}})
 	h.register(agent, "node-1")
@@ -131,7 +242,14 @@ func TestReconcileStampsAuthorityLossAfterWriteLock(t *testing.T) {
 		}
 		done <- err
 	}()
-	time.Sleep(300 * time.Millisecond)
+	// Reconcile has a pool connection once it is in BeginTx, waiting for the
+	// lock; any clock sample before BeginTx has happened by then.
+	for started := time.Now(); h.store.db.Stats().InUse < 2; {
+		if time.Since(started) > 10*time.Second {
+			t.Fatalf("Reconcile never reached the write lock: %+v", h.store.db.Stats())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	h.clock.Advance(3 * time.Second)
 	unblocked := h.clock.Now()
 	if err := blocker.Rollback(); err != nil {

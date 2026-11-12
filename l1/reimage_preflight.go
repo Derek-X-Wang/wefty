@@ -346,7 +346,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		if (row.Status == "preflight_verified" || row.Status == "completed" || row.Status == "failed") && row.AcknowledgementKey.Valid &&
 			row.AcknowledgementKey.String == request.IdempotencyKey && row.AcknowledgementHash.Valid &&
 			row.AcknowledgementHash.String == bodyHash {
-			return computer, tx.Commit()
+			return computer, write.commit()
 		}
 		return Computer{}, protocolError(contract.ErrorIdempotencyConflict,
 			"Computer reimage preflight acknowledgement conflicts with durable outcome")
@@ -364,7 +364,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 			if err != nil {
 				return Computer{}, err
 			}
-			if err := tx.Commit(); err != nil {
+			if err := write.commit(); err != nil {
 				return Computer{}, internalError(err, "commit refused Computer reimage preflight")
 			}
 			if !refused {
@@ -383,7 +383,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		if err != nil {
 			return Computer{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit Computer reimage preflight failure")
 		}
 		s.notifyComputerPolicyChanged()
@@ -404,7 +404,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 			if failureErr != nil {
 				return Computer{}, failureErr
 			}
-			if commitErr := tx.Commit(); commitErr != nil {
+			if commitErr := write.commit(); commitErr != nil {
 				return Computer{}, internalError(commitErr, "commit Computer reimage acknowledgement refusal")
 			}
 			s.notifyComputerPolicyChanged()
@@ -416,7 +416,7 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 	if err != nil {
 		return Computer{}, internalError(err, "read completed Computer reimage")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer reimage preflight")
 	}
 	s.notifyComputerPolicyChanged()

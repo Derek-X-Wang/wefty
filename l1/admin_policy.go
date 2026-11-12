@@ -254,7 +254,7 @@ func (s *Store) InitiateAdminBootstrap(ctx context.Context) (AdminBootstrapChall
 		authorityGeneration, now.UnixNano(), expiresAt.UnixNano()); err != nil {
 		return AdminBootstrapChallenge{}, internalError(err, "store admin bootstrap challenge")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AdminBootstrapChallenge{}, internalError(err, "commit admin bootstrap initiation")
 	}
 	return AdminBootstrapChallenge{Nonce: nonce, ExpiresAt: expiresAt}, nil
@@ -335,7 +335,7 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "read bootstrapped admin policy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin bootstrap")
 	}
 	s.notifyComputerPolicyChanged()
@@ -612,7 +612,7 @@ func (s *Store) mutateAdmin(
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "read mutated admin policy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin policy mutation")
 	}
 	policy.Revocations = revocations
@@ -768,7 +768,7 @@ func (s *Store) ResetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "read reset admin policy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return AdminPolicy{}, internalError(err, "commit admin policy reset")
 	}
 	policy.Revocations = revocations

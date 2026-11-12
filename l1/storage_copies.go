@@ -404,7 +404,7 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	if err != nil {
 		return Computer{}, false, internalError(err, "read reserved Computer restore")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer restore reservation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -696,7 +696,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	if err != nil {
 		return Computer{}, false, internalError(err, "read staged cloned Computer")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer clone reservation")
 	}
 	s.notifyComputerPolicyChanged()
@@ -863,7 +863,7 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 				return protocolError(contract.ErrorConflict, "Computer restore has inconsistent prior revocation evidence")
 			}
 			// Preserve the first committed bound receipt on same-operation replay.
-			if err := tx.Commit(); err != nil {
+			if err := write.commit(); err != nil {
 				return internalError(err, "commit restore authority revocation replay")
 			}
 			return nil
@@ -897,7 +897,7 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 	if affected != 1 {
 		return protocolError(contract.ErrorStaleIntentRevision, "Computer restore no longer owns authority revocation")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return internalError(err, "commit restore authority revocation receipt")
 	}
 	return nil
@@ -1425,7 +1425,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		if err := abortRestoreForFailedPredecessorCopy(ctx, tx, row, *request.OldBackupReceipt, now); err != nil {
 			return Computer{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit failed restore predecessor copy outcome")
 		}
 		return Computer{}, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
@@ -1443,7 +1443,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict, "Computer Storage copy acknowledgement differs from durable evidence")
 		}
 		if row.Status == "prepared" {
-			if err := tx.Rollback(); err != nil {
+			if err := write.rollback(); err != nil {
 				return Computer{}, internalError(err, "close verified Computer Storage copy replay")
 			}
 			return s.publishVerifiedComputerStorageCopy(ctx, destinationComputerID, row.OperationRevision)
@@ -1465,7 +1465,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		if err != nil {
 			return Computer{}, internalError(err, "read refused Computer clone authority")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit refused Computer clone")
 		}
 		s.notifyComputerPolicyChanged()
@@ -1486,7 +1486,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		request.IdempotencyKey, bodyHash, now.UnixNano(), destinationComputerID); err != nil {
 		return Computer{}, internalError(err, "record Computer Storage copy verification")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage copy verification")
 	}
 	return s.publishVerifiedComputerStorageCopy(ctx, destinationComputerID, row.OperationRevision)
@@ -1621,7 +1621,7 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 	if err != nil {
 		return Computer{}, internalError(err, "read published Computer Storage copy")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer Storage copy publication")
 	}
 	s.notifyComputerPolicyChanged()
@@ -1796,7 +1796,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		if err != nil {
 			return Computer{}, internalError(err, "read quarantined restore cleanup")
 		}
-		if err := tx.Commit(); err != nil {
+		if err := write.commit(); err != nil {
 			return Computer{}, internalError(err, "commit restore cleanup quarantine")
 		}
 		return computer, nil
@@ -1838,7 +1838,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 	if err != nil {
 		return Computer{}, internalError(err, "read completed Computer restore")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer restore retirement")
 	}
 	return computer, nil

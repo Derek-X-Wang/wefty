@@ -245,7 +245,7 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	if err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "read recorded Custody export")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "commit Custody export before external bytes")
 	}
 	return export, false, nil
@@ -528,7 +528,7 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 	if err != nil {
 		return ComputerCustodyExport{}, internalError(err, "read completed Custody export")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyExport{}, internalError(err, "commit Custody export acknowledgement")
 	}
 	return export, nil
@@ -776,7 +776,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		OperationRevision:    1,
 		DestinationStorageID: storageID, DestinationName: request.Name, DestinationSize: request.DiskBytes,
 		Status: "reserved", RequestedAt: now, Network: network, NetworkNote: networkNote}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "commit Custody import reservation")
 	}
 	return value, false, nil

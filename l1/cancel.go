@@ -136,7 +136,7 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 	default:
 		return Job{}, protocolErrorWithDetails(contract.ErrorCancelNotQueued, map[string]any{"state": job.State}, "job does not support cancellation in this state")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit job cancellation")
 	}
 	return job, nil

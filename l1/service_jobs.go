@@ -236,7 +236,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	if err != nil {
 		return Job{}, internalError(err, "read latched service image reconciliation job")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Job{}, internalError(err, "commit service image reconciliation failure")
 	}
 	return job, nil

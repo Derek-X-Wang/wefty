@@ -229,7 +229,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}
 	s.retentionSweep.save(next)
@@ -347,7 +347,7 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	if err != nil {
 		return Node{}, internalError(err, "read draining node")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit agent drain")
 	}
 	return node, nil
@@ -447,7 +447,7 @@ func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb string
 	if err != nil {
 		return Node{}, internalError(err, "read updated operator intent")
 	}
-	if err := tx.Commit(); err != nil {
+	if err := write.commit(); err != nil {
 		return Node{}, internalError(err, "commit operator intent mutation")
 	}
 	return node, nil
