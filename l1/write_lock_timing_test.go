@@ -155,9 +155,10 @@ func holdThenCancelForTest(s *Store, held chan<- struct{}, released <-chan struc
 	return nil
 }
 
-// When the transaction's context ends, database/sql rolls back and releases
-// the lock at once. The owner's later return is not lock hold.
-func TestWriteLockHoldEndsAtCancellation(t *testing.T) {
+// When the transaction's context ends, database/sql rolls back on its own and
+// another writer can take the lock. The owner cannot see when that finished,
+// so the line keeps the upper bound and says when the context ended.
+func TestWriteLockCancellationKeepsUpperBoundAndMarksIt(t *testing.T) {
 	s, _ := snapshotStore(t)
 	log := &writeLockLog{}
 	s.logf = log.logf
@@ -177,8 +178,11 @@ func TestWriteLockHoldEndsAtCancellation(t *testing.T) {
 	if len(lines) != 1 || !strings.Contains(lines[0], " outcome=canceled ") {
 		t.Fatalf("canceled holder lines = %q (all %q)", lines, log.lines)
 	}
-	if hold := writeLockField(t, lines[0], "hold_ms"); hold < 150*time.Millisecond || hold >= 300*time.Millisecond {
-		t.Fatalf("canceled hold = %s, want the 150ms before cancellation, not the owner's return", hold)
+	if canceled := writeLockField(t, lines[0], "canceled_after_ms"); canceled < 150*time.Millisecond || canceled >= 300*time.Millisecond {
+		t.Fatalf("canceled_after = %s, want about the 150ms before cancellation", canceled)
+	}
+	if hold := writeLockField(t, lines[0], "hold_ms"); hold < 450*time.Millisecond {
+		t.Fatalf("hold upper bound = %s, want it to include the owner's 300ms return", hold)
 	}
 }
 

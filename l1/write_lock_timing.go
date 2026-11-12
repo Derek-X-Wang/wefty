@@ -19,9 +19,11 @@ const defaultWriteLockLogThreshold = 2 * time.Second
 // checkout included) and the hold runs from BEGIN to commit or rollback,
 // including the commit's fsync. One goroutine owns a transaction, and only
 // its first end is recorded: a deferred rollback after commit is ignored.
-// When the transaction's context ends first, database/sql rolls it back and
-// releases the lock at once; the hold then ends at that moment, not when the
-// owner returns.
+// When the transaction's context ends first, database/sql rolls it back on its
+// own, after any in-flight statement returns. The owner cannot see when that
+// rollback finished, so such a line says outcome=canceled, keeps hold_ms as
+// the upper bound (up to the owner's end), and adds canceled_after_ms, when
+// the context ended. A slow holder is never hidden by an early cancellation.
 type writeLockTiming struct {
 	store      *Store
 	name       string
@@ -75,20 +77,33 @@ func (t *writeLockTiming) end(outcome string) {
 	// A commit that succeeded released the lock itself, even if the context
 	// ended during it.
 	if canceled := t.canceledAt.Load(); canceled != 0 && outcome != "commit" {
-		outcome = "canceled"
-		held = min(held, time.Unix(0, canceled).Sub(t.locked))
+		t.logCanceled(held, time.Unix(0, canceled).Sub(t.locked))
+		return
 	}
 	t.log(outcome, held)
 }
 
-func (t *writeLockTiming) log(outcome string, held time.Duration) {
-	threshold := t.store.writeLockLogThreshold
-	if threshold <= 0 {
-		threshold = defaultWriteLockLogThreshold
+func (t *writeLockTiming) threshold() time.Duration {
+	if t.store.writeLockLogThreshold > 0 {
+		return t.store.writeLockLogThreshold
 	}
+	return defaultWriteLockLogThreshold
+}
+
+func (t *writeLockTiming) log(outcome string, held time.Duration) {
+	threshold := t.threshold()
 	if t.store.logf == nil || t.waited < threshold && held < threshold {
 		return
 	}
 	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=%s wait_ms=%d hold_ms=%d threshold_ms=%d",
 		t.name, t.pool, outcome, t.waited.Milliseconds(), held.Milliseconds(), threshold.Milliseconds())
+}
+
+func (t *writeLockTiming) logCanceled(heldAtMost, canceledAfter time.Duration) {
+	threshold := t.threshold()
+	if t.store.logf == nil || t.waited < threshold && heldAtMost < threshold {
+		return
+	}
+	t.store.logf("event=l1_write_lock_slow tx=%s pool=%s outcome=canceled wait_ms=%d hold_ms=%d canceled_after_ms=%d threshold_ms=%d",
+		t.name, t.pool, t.waited.Milliseconds(), heldAtMost.Milliseconds(), canceledAfter.Milliseconds(), threshold.Milliseconds())
 }
