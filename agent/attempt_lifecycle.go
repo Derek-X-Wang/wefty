@@ -2763,16 +2763,23 @@ func renewalDelay(remaining, configured time.Duration) time.Duration {
 	return halfRemaining
 }
 
+// renewalRequestTimeout lets one renewal wait for nearly all remaining
+// authority, keeping a reserve of half of it, capped at one second, before the
+// local deadline. A loaded L1 can need its whole five-second SQLite busy wait to
+// take the write lock; halving the timeout on every retry gave each request
+// less than that near the end, so none could succeed (#1524). The reserve keeps
+// every request strictly inside local authority, which the request checkpoint
+// and watchdog still enforce on their own.
 func renewalRequestTimeout(remaining, operationTimeout time.Duration) time.Duration {
-	timeout := remaining / 2
-	if operationTimeout < timeout {
-		timeout = operationTimeout
-	}
-	if timeout <= 0 {
+	reserve := min(remaining/2, renewalRequestReserve)
+	if reserve <= 0 {
 		return 0
 	}
-	return timeout
+	return min(operationTimeout, remaining-reserve)
 }
+
+// renewalRequestReserve is the most authority a renewal request leaves unused.
+const renewalRequestReserve = time.Second
 
 // completionRequest is the single place an attempt's outcome becomes its L1
 // completion, so the request sent now and the one replayed from the spool

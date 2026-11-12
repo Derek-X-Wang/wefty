@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -26,8 +27,11 @@ type authorityTestClock struct {
 	*manualClock
 	boot, awake                    time.Duration
 	bootErr, awakeErr, identityErr error
-	// Model descheduling inside a bracket without inventing sleep.
+	// Model descheduling inside a bracket without inventing sleep. The
+	// watchdog and the renewal loop sample concurrently, so the bracket
+	// toggle is guarded.
 	bracketWidth time.Duration
+	bracketMu    sync.Mutex
 	bracketEnd   bool
 }
 
@@ -37,8 +41,11 @@ func newAuthorityTestClock() *authorityTestClock {
 func (c *authorityTestClock) BootIdentity() (string, error)       { return sleepTestBoot, c.identityErr }
 func (c *authorityTestClock) BootElapsed() (time.Duration, error) { return c.boot, c.bootErr }
 func (c *authorityTestClock) AwakeElapsed() (time.Duration, error) {
+	c.bracketMu.Lock()
 	c.bracketEnd = !c.bracketEnd
-	if !c.bracketEnd {
+	end := c.bracketEnd
+	c.bracketMu.Unlock()
+	if !end {
 		return c.awake + c.bracketWidth, c.awakeErr
 	}
 	return c.awake, c.awakeErr
