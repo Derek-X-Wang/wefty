@@ -5,6 +5,7 @@ package serviceacceptance
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -345,7 +346,6 @@ func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference
 func exerciseLiveImportBudget(t *testing.T, harness *acceptanceHarness, exportID, exportDirectory, manifestPath, manifestDigest string) liveStorageBudgetEvidence {
 	t.Helper()
 	thaw := liveStorageFault(t, harness, "freeze-storage-roots", "thaw-storage-roots")
-	started := time.Now()
 	outcome := runComputerCLI[storageCLIOutcome](t, harness, false, "services", "custody", "import", exportID,
 		"--name", "linux-native-import-budget", "--disk-bytes", fmt.Sprint(160<<20), "--node", "acceptance-node",
 		"--path", exportDirectory, "--manifest", manifestPath, "--manifest-digest", manifestDigest,
@@ -357,18 +357,50 @@ func exerciseLiveImportBudget(t *testing.T, harness *acceptanceHarness, exportID
 		_, _, _, _, latched := latchedStorageOperationFailure(current)
 		return latched && current.ReconfigurationPhase == l1.ComputerReconfigurationStable
 	})
-	elapsed := time.Since(started)
 	thaw()
 	verb, stage, attempts, class, _ := latchedStorageOperationFailure(destination)
+	budget := readLiveStorageOperationBudget(t, harness, destination.ComputerID, l1.ComputerStorageOperationPrepare)
 	evidence := liveStorageBudgetEvidence{
 		Passed: verb == string(l1.ComputerStorageOperationImport) && stage == string(l1.ComputerStorageOperationPrepare) &&
 			class == string(l1.ComputerStorageOperationFailureEngine) && attempts >= l1.MaximumStorageOperationFailures &&
-			elapsed >= acceptanceStorageFailureWindow,
-		Detail: fmt.Sprintf("verb=%s stage=%s class=%s failed_attempts=%d latched_after=%s",
-			verb, stage, class, attempts, elapsed.Round(time.Second))}
+			storageBudgetSpent(budget, l1.ComputerStorageOperationPrepare),
+		Detail: fmt.Sprintf("latched verb=%s stage=%s class=%s failed_attempts=%d; %s",
+			verb, stage, class, attempts, storageBudgetDetail(budget))}
 	removed := removeAndWaitComputer(t, harness, destination, 5*time.Minute)
 	evidence.Detail += " removal_outcome=" + removed.RemovalOutcome
 	return evidence
+}
+
+// readLiveStorageOperationBudget reads one operation stage's failure budget
+// from L1's own table. No CLI read carries a Custody import's budget, and the
+// awaited import ends too early to be the witness, so the lane reads the
+// durable row the way it reads the reimage preflight receipt.
+func readLiveStorageOperationBudget(t *testing.T, harness *acceptanceHarness, computerID string, stage l1.ComputerStorageOperationStage) *l1.ComputerStorageOperationFailure {
+	t.Helper()
+	database, err := sql.Open("sqlite", harness.l1Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var class, code string
+	var attempts, lastNS int64
+	var firstNS sql.NullInt64
+	err = database.QueryRow(`SELECT last_failure_class, last_failure_code, failed_attempts, first_failed_ns, last_failed_ns
+		FROM computer_storage_operation_failures WHERE computer_id=? AND stage=? ORDER BY operation_revision DESC LIMIT 1`,
+		computerID, string(stage)).Scan(&class, &code, &attempts, &firstNS, &lastNS)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read the Storage operation failure budget of %s: %v", computerID, err)
+	}
+	failure := &l1.ComputerStorageOperationFailure{Stage: stage, Class: l1.ComputerStorageOperationFailureClass(class), Code: code,
+		FailedAttempts: attempts, LastFailedAt: time.Unix(0, lastNS)}
+	if firstNS.Valid {
+		first := time.Unix(0, firstNS.Int64)
+		failure.FirstFailedAt = &first
+	}
+	return failure
 }
 
 type liveStorageProvenanceBudgets struct {
@@ -459,7 +491,9 @@ func exerciseLiveStorageProvenanceBudgets(t *testing.T, harness *acceptanceHarne
 		result.RestoreQuarantine = liveStorageBudgetEvidence{
 			Passed: quarantinedRestore.Failed && operation.Status == "failed" &&
 				operation.FailureCode == l1.ComputerRestoreFailureQuarantined && operation.Failure != nil &&
-				operation.Failure.Class == l1.ComputerStorageOperationFailureQuarantined,
+				operation.Failure.Class == l1.ComputerStorageOperationFailureQuarantined &&
+				// One report: the quarantine ended it, not the spent budget.
+				operation.Failure.Stage == l1.ComputerStorageOperationPrepare && operation.Failure.FailedAttempts == 1,
 			Detail: fmt.Sprintf("status=%s failure_code=%s %s", operation.Status, operation.FailureCode, storageBudgetDetail(operation.Failure))}
 	}
 	onOldGeneration := startLiveStorageComputer(t, harness, stopped)
