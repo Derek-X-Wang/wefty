@@ -3092,7 +3092,9 @@ The payload keeps running; mailbox and output use the same local authority.
 The monotonic deadline already excludes system sleep on Darwin and Linux and
 is never extended by a failed, uncertain, or lost renewal reply. Transient and
 uncertain errors retry only within that deadline; each request timeout uses
-`renewalRequestTimeout` with the remaining credited authority. A refusal ends
+`renewalRequestTimeout` with the remaining credited authority: a request may
+wait for all of it but a reserve of half, capped at one second, so one renewal
+can outlast L1's busy wait near the end (#1524). A refusal ends
 the Attempt's grants at once: no further renewal is issued or accepted.
 For a non-service payload, cancellation is immediate. For a service, durable
 removal preparation runs first; the payload is cancelled when that preparation
