@@ -48,7 +48,9 @@ required_rows='[
 # Computer Storage liveness proofs (#1624, #1634). A row that passes on other
 # assertions alone has not run them.
 required_assertions='{
-  "linux.reconfiguration": ["grow_budget_failed_live","reset_budget_counted_live"],
+  "linux.reconfiguration": [
+    "grow_budget_failed_live","reset_budget_counted_live","restore_abort_dead_node_live","clone_abort_dead_node_live"
+  ],
   "linux.storage_provenance": [
     "backup_budget_failed_live","restore_quarantine_failed_live","clone_budget_failed_live",
     "import_budget_failed_live","restore_cleanup_owed_live"

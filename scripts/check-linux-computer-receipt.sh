@@ -212,7 +212,9 @@ jq -e --arg candidate "$candidate_sha" --arg image "$expected_image" --arg mutat
    else
     .rows["linux.reconfiguration"].status == "PASS" and
     .rows["linux.reconfiguration"].assertions.grow_budget_failed_live and
-    .rows["linux.reconfiguration"].assertions.reset_budget_counted_live
+    .rows["linux.reconfiguration"].assertions.reset_budget_counted_live and
+    .rows["linux.reconfiguration"].assertions.restore_abort_dead_node_live and
+    .rows["linux.reconfiguration"].assertions.clone_abort_dead_node_live
    end) and
   (if $mutated == "linux.removal" then
     .rows["linux.removal"].status == "FAIL"

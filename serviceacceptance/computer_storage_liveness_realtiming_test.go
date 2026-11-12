@@ -536,3 +536,102 @@ func exerciseLiveStorageProvenanceBudgets(t *testing.T, harness *acceptanceHarne
 		nodePathAbsent(t, filepath.Join(liveStorageRuntimeRoot, "computer-disks", predecessorName))
 	return result
 }
+
+// readLiveStorageCopyOperation reads how L1 recorded a Computer's latest
+// restore or clone: its status and failure code.
+func readLiveStorageCopyOperation(t *testing.T, harness *acceptanceHarness, destinationComputerID, operation string) (status, failureCode string) {
+	t.Helper()
+	database, err := sql.Open("sqlite", harness.l1Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var code sql.NullString
+	err = database.QueryRow(`SELECT status, failure_code FROM computer_storage_copy_operations
+		WHERE destination_computer_id=? AND operation=? ORDER BY operation_revision DESC LIMIT 1`,
+		destinationComputerID, operation).Scan(&status, &code)
+	if err != nil {
+		t.Fatalf("read the %s operation of %s: %v", operation, destinationComputerID, err)
+	}
+	return status, code.String
+}
+
+func createLiveStorageBackup(t *testing.T, harness *acceptanceHarness, computer l1.Computer, key string) string {
+	t.Helper()
+	created := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "backup", "create", computer.ComputerID,
+		"--expect-current", "--allow-power-off", "--idempotency-key", key, "--wait", "4m")
+	if created.Backups != nil {
+		for _, candidate := range created.Backups.Backups {
+			if candidate.Status == "available" {
+				return candidate.BackupID
+			}
+		}
+	}
+	t.Fatalf("Computer %s has no available Backup: %#v", computer.ComputerID, created)
+	return ""
+}
+
+type liveCopyAbortEvidence struct {
+	Restore, Clone liveStorageBudgetEvidence
+}
+
+// exerciseLiveCopyAbort proves the dead-Node abort of a restore and of a
+// clone (#1608 PR3). Both copies are held unfinished by refusing new
+// generation roots, then the agent is killed so the Node goes dead with both
+// operations in flight. Abort must return the restore's Computer to its old
+// generation, and leave the clone's destination renamed and removable.
+func exerciseLiveCopyAbort(t *testing.T, harness *acceptanceHarness, reference, digest string) liveCopyAbortEvidence {
+	t.Helper()
+	restoreTarget := createLiveStorageComputer(t, harness, reference, digest, "linux-native-restore-abort")
+	restoreBackup := createLiveStorageBackup(t, harness, restoreTarget, "linux-native-restore-abort-backup")
+	restoreTarget = waitForComputerCLI(t, harness, restoreTarget.ComputerID, 3*time.Minute, computerDisplayPublished)
+	restoreTarget = stopLiveStorageComputer(t, harness, restoreTarget)
+	cloneSource := createLiveStorageComputer(t, harness, reference, digest, "linux-native-clone-abort-source")
+	cloneBackup := createLiveStorageBackup(t, harness, cloneSource, "linux-native-clone-abort-backup")
+	cloneSource = waitForComputerCLI(t, harness, cloneSource.ComputerID, 3*time.Minute, computerDisplayPublished)
+
+	thaw := liveStorageFault(t, harness, "freeze-storage-roots", "thaw-storage-roots")
+	cloning := runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "clone", cloneSource.ComputerID, cloneBackup,
+		"--name", "linux-native-clone-abort", "--disk-bytes", fmt.Sprint(liveStorageDiskBytes), "--expect-current",
+		"--idempotency-key", "linux-native-clone-abort")
+	if cloning.Computer == nil || cloning.Computer.ComputerID == "" || cloning.Computer.ComputerID == cloneSource.ComputerID {
+		t.Fatalf("clone printed no destination: %#v", cloning)
+	}
+	_ = runComputerCLI[storageCLIMutationReceipt](t, harness, false, "services", "restore", restoreTarget.ComputerID, restoreBackup,
+		"--retire-old", "--expect-current", "--idempotency-key", "linux-native-restore-abort")
+	harness.agent.kill(t)
+	thaw()
+	time.Sleep(l1.DefaultNodeDeadAfter + 5*time.Second)
+
+	restoreBefore := runComputerCLI[l1.Computer](t, harness, false, "services", "status", restoreTarget.ComputerID)
+	cloneBefore := runComputerCLI[l1.Computer](t, harness, false, "services", "status", cloning.Computer.ComputerID)
+	restoreAborted := runComputerCLI[l1.Computer](t, harness, false, "services", "abort", restoreTarget.ComputerID,
+		"--expect-current", "--idempotency-key", "linux-native-restore-abort-abort")
+	cloneAborted := runComputerCLI[l1.Computer](t, harness, false, "services", "abort", cloning.Computer.ComputerID,
+		"--expect-current", "--idempotency-key", "linux-native-clone-abort-abort")
+	harness.restartAgent(t)
+
+	restoreStatus, restoreCode := readLiveStorageCopyOperation(t, harness, restoreTarget.ComputerID, "restore")
+	cloneStatus, cloneCode := readLiveStorageCopyOperation(t, harness, cloning.Computer.ComputerID, "clone")
+	var evidence liveCopyAbortEvidence
+	evidence.Restore = liveStorageBudgetEvidence{
+		Passed: restoreBefore.ReconfigurationPhase == l1.ComputerReconfigurationRestoring &&
+			restoreAborted.ReconfigurationPhase == l1.ComputerReconfigurationStable &&
+			restoreAborted.StorageGeneration == restoreTarget.StorageGeneration &&
+			restoreStatus == "superseded" && restoreCode == string(l1.ComputerRestoreFailureAbortedDeadNode),
+		Detail: fmt.Sprintf("before_phase=%s aborted_phase=%s generation=%d->%d operation=%s/%s", restoreBefore.ReconfigurationPhase,
+			restoreAborted.ReconfigurationPhase, restoreTarget.StorageGeneration, restoreAborted.StorageGeneration, restoreStatus, restoreCode)}
+	evidence.Clone = liveStorageBudgetEvidence{
+		Passed: cloneBefore.ReconfigurationPhase == l1.ComputerReconfigurationCloning &&
+			cloneAborted.ReconfigurationPhase == l1.ComputerReconfigurationStable &&
+			cloneAborted.Name == "aborted-clone-"+cloneAborted.ComputerID &&
+			cloneStatus == "superseded" && cloneCode == string(l1.ComputerRestoreFailureAbortedDeadNode),
+		Detail: fmt.Sprintf("before_phase=%s aborted_phase=%s name=%s operation=%s/%s", cloneBefore.ReconfigurationPhase,
+			cloneAborted.ReconfigurationPhase, cloneAborted.Name, cloneStatus, cloneCode)}
+	removedClone := removeAndWaitComputer(t, harness, cloneAborted, 5*time.Minute)
+	evidence.Clone.Detail += " removal_outcome=" + removedClone.RemovalOutcome
+	removedRestore := removeAndWaitComputer(t, harness, restoreAborted, 5*time.Minute)
+	evidence.Restore.Detail += " removal_outcome=" + removedRestore.RemovalOutcome
+	_ = removeAndWaitComputer(t, harness, cloneSource, 5*time.Minute)
+	return evidence
+}

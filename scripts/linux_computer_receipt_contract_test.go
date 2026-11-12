@@ -117,6 +117,12 @@ func TestLinuxComputerReceiptGate(t *testing.T) {
 		"missing reset budget assertion": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any)["linux.reconfiguration"].(map[string]any)["assertions"].(map[string]bool), "reset_budget_counted_live")
 		},
+		"missing restore dead-Node abort assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.reconfiguration"].(map[string]any)["assertions"].(map[string]bool), "restore_abort_dead_node_live")
+		},
+		"missing clone dead-Node abort assertion": func(receipt map[string]any) {
+			delete(receipt["rows"].(map[string]any)["linux.reconfiguration"].(map[string]any)["assertions"].(map[string]bool), "clone_abort_dead_node_live")
+		},
 		"missing stop, reimage, remove assertion": func(receipt map[string]any) {
 			delete(receipt["rows"].(map[string]any)["linux.removal"].(map[string]any)["assertions"].(map[string]bool), "stop_reimage_remove_verified_live")
 		},
@@ -352,7 +358,8 @@ func conformantLinuxComputerReceipt(candidate, variant string) map[string]any {
 		"restore_quarantine_failed_live": true, "clone_budget_failed_live": true, "import_budget_failed_live": true,
 		"restore_cleanup_owed_live": true}
 	rows["linux.reconfiguration"].(map[string]any)["assertions"] = map[string]bool{"live_product_path": true,
-		"grow_budget_failed_live": true, "reset_budget_counted_live": true}
+		"grow_budget_failed_live": true, "reset_budget_counted_live": true, "restore_abort_dead_node_live": true,
+		"clone_abort_dead_node_live": true}
 	rows["linux.removal"].(map[string]any)["assertions"] = map[string]bool{"live_product_path": true,
 		"stop_reimage_remove_verified_live": true, "rotated_job_never_ran_live": true,
 		"rotated_removal_residue_absent_live": true, "rotated_removal_not_pending_live": true,

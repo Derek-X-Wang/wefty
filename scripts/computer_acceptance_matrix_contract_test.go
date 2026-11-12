@@ -484,7 +484,8 @@ func copyComputerMatrix(t *testing.T, matrix map[string]any) map[string]any {
 // computerMatrixLinuxLivenessAssertions are the Computer Storage liveness
 // assertions the matrix gate requires of a passing Linux row (#1624, #1634).
 var computerMatrixLinuxLivenessAssertions = map[string][]string{
-	"linux.reconfiguration": {"grow_budget_failed_live", "reset_budget_counted_live"},
+	"linux.reconfiguration": {"grow_budget_failed_live", "reset_budget_counted_live", "restore_abort_dead_node_live",
+		"clone_abort_dead_node_live"},
 	"linux.storage_provenance": {"backup_budget_failed_live", "restore_quarantine_failed_live", "clone_budget_failed_live",
 		"import_budget_failed_live", "restore_cleanup_owed_live"},
 	"linux.removal": {"stop_reimage_remove_verified_live", "rotated_job_never_ran_live", "rotated_removal_residue_absent_live",

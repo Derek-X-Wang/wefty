@@ -555,6 +555,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	ownershipMatchElapsed := time.Since(ownershipMatchStarted)
 	abortEvidence := exerciseLiveReconfigurationAbort(t, harness, reference, digest)
 	detachment := inspectLiveComputerReimageDetachment(t, harness, reimaged)
+	copyAbort := exerciseLiveCopyAbort(t, harness, reference, digest)
 	growBudget := exerciseLiveGrowBudget(t, harness, reference, digest)
 	resetBudget := exerciseLiveResetBudget(t, harness, reference, digest)
 	recordComputerAuthority(receipt, reimaged)
@@ -570,8 +571,11 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"no_automatic_rollback_live":   abortEvidence.NoAutoRollback,
 		"grow_budget_failed_live":      growBudget.Passed,
 		"reset_budget_counted_live":    resetBudget.Passed,
+		"restore_abort_dead_node_live": copyAbort.Restore.Passed,
+		"clone_abort_dead_node_live":   copyAbort.Clone.Passed,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
 		"grow_budget": growBudget.Detail, "reset_budget": resetBudget.Detail,
+		"restore_abort": copyAbort.Restore.Detail, "clone_abort": copyAbort.Clone.Detail,
 		"storage_generation": fmt.Sprint(reimaged.StorageGeneration), "reimage_reference": reimageReference,
 		"reimage_digest": reimageDigest, "reimage_chown_elapsed": chownReimageElapsed.String(),
 		"reimage_ownership_match_elapsed": ownershipMatchElapsed.String(), "aborted_computer_id": abortEvidence.ComputerID})
