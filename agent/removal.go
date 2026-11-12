@@ -474,7 +474,8 @@ func (controller *removalController) reconstructAndPersistRuntimeRemoval(ctx con
 	requests := []*workloadrunner.ComputerStorage{nil}
 	if len(computerStorages) != 0 {
 		// Inventory runtime authorities once, then ask per generation only for
-		// prepared/never-attached or already-deleted Storage evidence.
+		// prepared/never-attached, detached (#1611), or already-deleted
+		// Storage evidence.
 		requests = append(requests, computerStorages...)
 	}
 	seenAttempts := make(map[string]workloadrunner.RuntimeResourceManifest)
