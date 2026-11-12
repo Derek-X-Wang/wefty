@@ -303,9 +303,12 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, op, profile, resultErr)
 	}()
-	if err := recoverUpgradeDrain(ctx, op, paths, profile, warnings); err != nil {
+	recovered, err := recoverUpgradeDrain(ctx, op, paths, profile, warnings)
+	if err != nil {
 		return report, err
 	}
+	unchanged := upgradePreparationLeft(recovered)
+	report = recoveredUpgradeReport(report, recovered)
 	if err := manager.preflightUpgrade(ctx, paths, role); err != nil {
 		return report, err
 	}
@@ -350,10 +353,10 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	defer cancel()
 	commit, err := fetchUpgradeSource(prep, op, paths, source, loginPATH, warnings)
 	if err != nil {
-		return report, fmt.Errorf("upgrade fetch failed; installed stack unchanged: %w", err)
+		return report, fmt.Errorf("upgrade fetch failed; %s: %w", unchanged, err)
 	}
 	if err := op.build(prep, source, dest, commit, loginPATH); err != nil {
-		return report, fmt.Errorf("upgrade build failed; installed stack unchanged: %w", err)
+		return report, fmt.Errorf("upgrade build failed; %s: %w", unchanged, err)
 	}
 	names := fleetUpgradeBinaries(plan)
 	digests := map[string]string{}
@@ -365,7 +368,7 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		digests[name] = digest
 		output, err := op.command(prep, stage, upgradeEnvironment(loginPATH), filepath.Join(dest, name), "--version")
 		if err != nil || strings.TrimSpace(string(output)) != commit {
-			return report, fmt.Errorf("upgrade version check failed for %s; installed stack unchanged", name)
+			return report, fmt.Errorf("upgrade version check failed for %s; %s", name, unchanged)
 		}
 	}
 	if err := checkFleetUpgradeBinaries(prep, op, paths, role, dest, loginPATH, names); err != nil {
@@ -393,10 +396,10 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 			path := filepath.Join(paths.data, []string{"l1.sqlite", "l3.sqlite"}[i])
 			temporary := filepath.Join(stage, fmt.Sprintf("preflight-%d.sqlite", i))
 			if err := upgradestate.Snapshot(prep, path, temporary); err != nil {
-				return report, fmt.Errorf("upgrade state snapshot failed; installed stack unchanged: %w", err)
+				return report, fmt.Errorf("upgrade state snapshot failed; %s: %w", unchanged, err)
 			}
 			if _, err := op.command(prep, stage, upgradeEnvironment(loginPATH), filepath.Join(dest, name), "--state-preflight", "--db="+temporary); err != nil {
-				return report, fmt.Errorf("upgrade state preflight failed; installed stack unchanged: %w", err)
+				return report, fmt.Errorf("upgrade state preflight failed; %s: %w", unchanged, err)
 			}
 			live = append(live, path)
 		}

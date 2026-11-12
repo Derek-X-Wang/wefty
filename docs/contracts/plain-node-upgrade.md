@@ -92,6 +92,15 @@ checkout without `-buildvcs=false`, because Go then stamps VCS details into
 the binary. A development build reports `dev`, which is never a commit, so it
 never makes upgrade skip.
 
+A failed preparation says what it left alone. Its message ends the failed
+step with `installed stack unchanged`: fetch, build, version check, state
+snapshot or state preflight. When interrupted-drain recovery completed earlier
+in the same command, the stack did change, so the message says
+`interrupted-upgrade recovery ran first and keeps its effects; installed files
+unchanged` in that place. The upgrade report on stdout in JSON mode then
+carries that recovery's `restarted_services` and `claims_remain_disabled`.
+This holds for the plain Mac upgrade and the fleet upgrade.
+
 ## Running work and activation
 
 Upgrade reads this node and run ledger through their public Fabric APIs.
