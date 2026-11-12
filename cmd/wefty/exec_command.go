@@ -53,9 +53,9 @@ func execHeartbeatSchedule() (tick string, ticks int) {
 // Outlast the phase-1 service restart, which must complete in under 30 seconds.
 var execReadRecoveryBudget = 40 * time.Second
 
-// A busy service is still there, so its reads get longer than a restart does.
-// Under sustained host load one production read stayed unanswered for the
-// whole restart window while the run went on (#1629).
+// A busy service is still there, so a read that follows a live run gives it
+// longer than a restart needs. Under sustained host load one production read
+// stayed unanswered for the whole restart window while the run went on (#1629).
 var execReadOverloadBudget = 5 * time.Minute
 
 // The gap between reads of a busy service doubles from the poll interval up to
@@ -475,7 +475,7 @@ func cancelExecRun(clients *apiClients, runID, storage string, cause error, stde
 		if err = clients.wait(ctx, 100*time.Millisecond); err != nil {
 			break
 		}
-		record, err = readExec(ctx, clients, func(readCtx context.Context) (contract.RunRecord, error) {
+		record, err = readExec(ctx, clients, nil, func(readCtx context.Context) (contract.RunRecord, error) {
 			return clients.getRun(readCtx, runID)
 		})
 		if err != nil {

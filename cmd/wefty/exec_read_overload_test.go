@@ -42,15 +42,17 @@ func TestExecReadOutlastsBusyServiceButNotUnreachableOne(t *testing.T) {
 			return nil
 		}}
 		reads := 0
-		value, err := readExec(t.Context(), clients, func(context.Context) (int, error) {
+		notices := 0
+		value, err := readExec(t.Context(), clients, func() { notices++ }, func(context.Context) (int, error) {
 			if reads++; reads <= 6 {
 				return 0, busy
 			}
 			return 7, nil
 		})
 		want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
-		if err != nil || value != 7 || !slices.Equal(gaps, want) {
-			t.Fatalf("busy read: value=%d err=%v gaps=%v", value, err, gaps)
+		// The restart window has not passed, so the read stays quiet.
+		if err != nil || value != 7 || !slices.Equal(gaps, want) || notices != 0 {
+			t.Fatalf("busy read: value=%d err=%v gaps=%v notices=%d", value, err, gaps, notices)
 		}
 	})
 
@@ -64,27 +66,61 @@ func TestExecReadOutlastsBusyServiceButNotUnreachableOne(t *testing.T) {
 		t.Run(name+" outlasts the restart window", func(t *testing.T) {
 			setExecReadWindows(t, 50*time.Millisecond, time.Minute, 5*time.Millisecond)
 			started := time.Now()
-			value, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func(ctx context.Context) (int, error) {
+			notices := 0
+			value, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func() { notices++ }, func(ctx context.Context) (int, error) {
 				if time.Since(started) < 250*time.Millisecond {
 					return 0, failure(ctx)
 				}
 				return 7, nil
 			})
-			if err != nil || value != 7 {
-				t.Fatalf("read gave up on a busy service: value=%d err=%v", value, err)
+			if err != nil || value != 7 || notices != 1 {
+				t.Fatalf("read gave up on a busy service: value=%d err=%v notices=%d", value, err, notices)
 			}
 		})
 		t.Run(name+" ends at the overload window", func(t *testing.T) {
 			setExecReadWindows(t, 50*time.Millisecond, 250*time.Millisecond, 5*time.Millisecond)
 			started := time.Now()
-			_, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func(ctx context.Context) (int, error) {
+			_, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func() {}, func(ctx context.Context) (int, error) {
 				return 0, failure(ctx)
 			})
 			if err == nil || time.Since(started) < 250*time.Millisecond {
 				t.Fatalf("persistent loss: err=%v after %v", err, time.Since(started))
 			}
 		})
+		// A read that does not follow a live run, such as the drain after a
+		// known verdict, gives a busy service the restart window only.
+		t.Run(name+" ends at the restart window when not following", func(t *testing.T) {
+			setExecReadWindows(t, 50*time.Millisecond, time.Minute, 5*time.Millisecond)
+			started := time.Now()
+			_, err := readExec(t.Context(), &apiClients{wait: waitForContext}, nil, func(ctx context.Context) (int, error) {
+				return 0, failure(ctx)
+			})
+			if err == nil || time.Since(started) > 10*time.Second {
+				t.Fatalf("read without a follow: err=%v after %v", err, time.Since(started))
+			}
+		})
 	}
+
+	// The restart window starts at the first unreachable failure in a row,
+	// not at the start of a read that was busy before.
+	t.Run("unreachable after busy still gets the restart window", func(t *testing.T) {
+		setExecReadWindows(t, 200*time.Millisecond, time.Minute, 5*time.Millisecond)
+		started := time.Now()
+		sawUnreachable := false
+		value, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func() {}, func(context.Context) (int, error) {
+			switch elapsed := time.Since(started); {
+			case elapsed < 300*time.Millisecond:
+				return 0, busy
+			case !sawUnreachable:
+				sawUnreachable = true
+				return 0, unreachable
+			}
+			return 7, nil
+		})
+		if err != nil || value != 7 || !sawUnreachable {
+			t.Fatalf("unreachable after busy: value=%d err=%v unreachable=%v", value, err, sawUnreachable)
+		}
+	})
 
 	t.Run("unreachable ends at the restart window", func(t *testing.T) {
 		setExecReadWindows(t, 50*time.Millisecond, time.Minute, 5*time.Millisecond)
@@ -94,9 +130,10 @@ func TestExecReadOutlastsBusyServiceButNotUnreachableOne(t *testing.T) {
 			return waitForContext(ctx, gap)
 		}}
 		started := time.Now()
-		_, err := readExec(t.Context(), clients, func(context.Context) (int, error) { return 0, unreachable })
-		if !errors.Is(err, unreachable) || time.Since(started) > 10*time.Second {
-			t.Fatalf("unreachable read: err=%v after %v", err, time.Since(started))
+		notices := 0
+		_, err := readExec(t.Context(), clients, func() { notices++ }, func(context.Context) (int, error) { return 0, unreachable })
+		if !errors.Is(err, unreachable) || time.Since(started) > 10*time.Second || notices != 0 {
+			t.Fatalf("unreachable read: err=%v after %v notices=%d", err, time.Since(started), notices)
 		}
 		for _, gap := range gaps {
 			if gap != 5*time.Millisecond {
@@ -156,7 +193,8 @@ func TestExecOutlastsBusyLogReadsFromRealBinary(t *testing.T) {
 		"--node-config="+stack.clients.nodeConfigPath, "exec", "--", "/bin/sh", "-c", "printf 'tail-output\\n'; exit 7")
 	mu.Lock()
 	defer mu.Unlock()
-	if code != 10 || strings.Count(out, "tail-output\n") != 1 || strings.Contains(out, "lost observation") || time.Since(started) < busyFor || refused < 2 {
+	if code != 10 || strings.Count(out, "tail-output\n") != 1 || strings.Contains(out, "lost observation") ||
+		strings.Count(out, "wefty: control plane busy; still following run ") != 1 || time.Since(started) < busyFor || refused < 2 {
 		t.Fatalf("busy log reads: code=%d refused=%d after %v output=%s", code, refused, time.Since(started), out)
 	}
 }
