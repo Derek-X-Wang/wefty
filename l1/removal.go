@@ -401,7 +401,8 @@ func listComputerRemovalStorageGenerations(ctx context.Context, q nodeQueryer, c
 		UNION
 		SELECT destination_computer_id, destination_storage_id, destination_generation, destination_size
 		FROM computer_storage_copy_operations
-		WHERE source_computer_id=? AND operation='clone' AND status='superseded'
+		WHERE source_computer_id=? AND operation='clone'
+			AND (status='superseded' OR (status='failed' AND failure_code='source_removed'))
 		ORDER BY storage_generation`, computerID, computerID)
 	if err != nil {
 		return nil, internalError(err, "list Computer Storage removal generations")

@@ -136,6 +136,40 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		if _, err := tx.ExecContext(ctx, `UPDATE computers SET name='aborted-import-' || computer_id WHERE computer_id=?`, computerID); err != nil {
 			return Computer{}, false, internalError(err, "release aborted Custody import name")
 		}
+	case ComputerReconfigurationRestoring:
+		// Before publication the old generation is still current and the
+		// staging generation is retired; after publication the restored
+		// generation is already current and stays so. Either way the shared
+		// tail below holds the Computer stopped until an explicit start. The
+		// tokens the restore revoked stay revoked (#1608).
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+			WHERE computer_id=? AND phase='staging' AND storage_generation=(
+				SELECT destination_generation FROM computer_storage_copy_operations
+				WHERE destination_computer_id=? AND operation_revision=? AND operation='restore')`,
+			now.UnixNano(), computerID, computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "retire aborted Computer restore staging generation")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded',
+			failure_code='aborted_dead_node', completed_ns=? WHERE destination_computer_id=? AND operation_revision=?
+			AND operation='restore' AND status IN ('reserved', 'prepared', 'published')`,
+			now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "supersede aborted Computer restore")
+		}
+	case ComputerReconfigurationCloning:
+		// The destination never published a generation, so it cannot start;
+		// its name is released and the owner removes it (#1608).
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded',
+			failure_code='aborted_dead_node', completed_ns=? WHERE destination_computer_id=? AND operation_revision=?
+			AND operation='clone' AND status IN ('reserved', 'prepared')`, now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "supersede aborted Computer clone")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_generations SET phase='retired', retired_ns=?
+			WHERE computer_id=? AND reset_revision=? AND phase='staging'`, now.UnixNano(), computerID, abortedRevision); err != nil {
+			return Computer{}, false, internalError(err, "retire aborted Computer clone staging generation")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computers SET name='aborted-clone-' || computer_id WHERE computer_id=?`, computerID); err != nil {
+			return Computer{}, false, internalError(err, "release aborted Computer clone name")
+		}
 	}
 	if err := s.reconfigurationCheckpoint("abort_artifacts_superseded"); err != nil {
 		return Computer{}, false, err

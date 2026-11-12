@@ -228,7 +228,8 @@ func computerAbortDecision(ctx context.Context, tx readModel, computer Computer,
 	}
 	switch computer.ReconfigurationPhase {
 	case ComputerReconfigurationBackingUp, ComputerReconfigurationResetting, ComputerReconfigurationReimaging,
-		ComputerReconfigurationGrowing, ComputerReconfigurationExporting, ComputerReconfigurationImporting:
+		ComputerReconfigurationGrowing, ComputerReconfigurationExporting, ComputerReconfigurationImporting,
+		ComputerReconfigurationRestoring, ComputerReconfigurationCloning:
 	default:
 		return "", protocolError(contract.ErrorConflict,
 			"Computer %q reconfiguration phase %q is not abortable", computerID, computer.ReconfigurationPhase)
@@ -552,6 +553,10 @@ func (r *databaseReads) operationNode(ctx context.Context, computer Computer) (s
 		query = `SELECT bound_node_id FROM computer_custody_exports WHERE computer_id=? AND operation_revision=?`
 	case ComputerReconfigurationImporting:
 		query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='import'`
+	case ComputerReconfigurationRestoring:
+		query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'`
+	case ComputerReconfigurationCloning:
+		query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='clone'`
 	}
 	if query != "" {
 		if err := r.q.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {

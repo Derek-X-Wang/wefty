@@ -37,6 +37,9 @@ const (
 	ComputerRestoreFailureQuarantined            ComputerRestoreFailureCode = "computer_storage_quarantined"
 	ComputerRestoreFailureAcknowledgementRefused ComputerRestoreFailureCode = "acknowledgement_refused"
 	ComputerRestoreFailureAgentRefused           ComputerRestoreFailureCode = "agent_refused"
+	// A restore whose bound Node died and the owner aborted (#1608). It ends
+	// `superseded`, not `failed`.
+	ComputerRestoreFailureAbortedDeadNode ComputerRestoreFailureCode = "aborted_dead_node"
 )
 
 type ComputerRestoreRequest struct {
@@ -1848,3 +1851,62 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 func (directive ComputerStorageCopyDirective) String() string {
 	return fmt.Sprintf("%s:%s@%d", directive.Operation, directive.DestinationComputerID, directive.OperationRevision)
 }
+
+// endClonesOfRemovedSource ends every clone still copying from a Computer
+// that is being removed (#1608). Each ends `failed` with source_removed
+// through the clone end: its staging generation is retired and the
+// destination is latched failed, so it leaves `cloning` instead of waiting
+// for a copy that can no longer finish, and the owner removes it. A clone
+// whose destination already left `cloning` at that revision is superseded as
+// before. The source's removal still claims each destination's staging
+// generation (listComputerRemovalStorageGenerations).
+func endClonesOfRemovedSource(ctx context.Context, tx *sql.Tx, sourceComputerID string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT `+storageCopyColumns+` FROM computer_storage_copy_operations
+		WHERE source_computer_id=? AND operation='clone' AND status IN ('reserved', 'prepared')`, sourceComputerID)
+	if err != nil {
+		return internalError(err, "list clones sourced by removed Computer")
+	}
+	var clones []computerStorageCopyRow
+	for rows.Next() {
+		row, err := scanComputerStorageCopy(rows)
+		if err != nil {
+			rows.Close()
+			return internalError(err, "scan clone sourced by removed Computer")
+		}
+		clones = append(clones, row)
+	}
+	if err := rows.Close(); err != nil {
+		return internalError(err, "close clones sourced by removed Computer")
+	}
+	for _, row := range clones {
+		var phase string
+		var revision int64
+		if err := tx.QueryRowContext(ctx, `SELECT reconfiguration_phase, intent_revision FROM computers WHERE computer_id=?`,
+			row.DestinationComputerID).Scan(&phase, &revision); err != nil {
+			return internalError(err, "read clone destination of removed source")
+		}
+		if phase != string(ComputerReconfigurationCloning) || revision != row.OperationRevision {
+			if _, err := tx.ExecContext(ctx, `UPDATE computer_storage_copy_operations SET status='superseded'
+				WHERE destination_computer_id=? AND operation_revision=? AND status IN ('reserved', 'prepared')`,
+				row.DestinationComputerID, row.OperationRevision); err != nil {
+				return internalError(err, "supersede clone sourced by removed Computer")
+			}
+			continue
+		}
+		latchedFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureCode(ComputerCloneFailureSourceRemoved),
+			Message: "Computer clone source was removed before the copy finished", NodeID: row.BoundNodeID,
+			RequestedBytes: row.DestinationSize})
+		if err != nil {
+			return internalError(err, "encode removed clone source failure")
+		}
+		if err := endComputerStorageCopyLatched(ctx, tx, row, ComputerReconfigurationCloning,
+			ComputerCloneFailureSourceRemoved, latchedFailure, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ComputerCloneFailureSourceRemoved is the failure_code of a clone whose
+// source Computer was removed before the copy finished (#1608).
+const ComputerCloneFailureSourceRemoved = "source_removed"
