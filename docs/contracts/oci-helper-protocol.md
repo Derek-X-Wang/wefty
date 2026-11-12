@@ -2034,9 +2034,20 @@ authority names the refusing Job. It is absence
 evidence, not preparation evidence, and does not create a missing root.
 Every result remains bound to the authenticated current helper session and
 durable removal fence. Malformed, anomalous, or identity-mismatched disks still
-fail closed; historical attachment cannot become preparation evidence. A detached
-generation without eligible preparation evidence returns `no_storage_evidence` with no attempts; it does not
-assert runtime absence. The Job-scoped runtime scan remains the sole runtime
+fail closed; historical attachment cannot become preparation evidence. A
+once-attached generation is instead the detached arm (#1611) when, under the
+generation flock, its manifest holds no `attached` or `pending` authority and
+no loop device, its single detach slot holds a valid record for this Storage,
+Node, and boot (a same-boot reap of this boot, or a sweep receipt with its
+epoch), and the kernel shows no mount and no loop for it. The slot is always
+the latest attach/detach record, so a detach followed by any newer attach is
+never read as detached. The witness copies the record's last attachment and
+kind; the server stamps it with the helper session generation that proved
+absence, and the response is bound to that session. Any other detached
+generation returns `no_storage_evidence` with no attempts; it does not assert
+runtime absence. A per-generation inventory is fenced by any live attempt on
+the same Storage, whatever its Job, because after a Job rotation the attaching
+Job can differ from the one being removed. The Job-scoped runtime scan remains the sole runtime
 authority, and reconstruction refuses only when neither scan proves authority.
 
 Frozen `storage_absent` evidence is carried as a restrictive precondition through

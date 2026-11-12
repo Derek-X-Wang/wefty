@@ -2409,7 +2409,44 @@ func (engine *ContainerdEngine) inventoryComputerStorageRemoval(ctx context.Cont
 	} else if eligible {
 		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
 	}
+	// A once-attached generation whose current Job never ran (#1611): its
+	// own latest detach record, re-proven here under the flock.
+	if attempt, eligible, attemptErr := detachedComputerStorageRemovalAttempt(engine.computerDiskSystem(), engine.config.RuntimeRoot, request, root, name, manifest); attemptErr != nil {
+		return InventoryRemovalResponse{}, attemptErr
+	} else if eligible {
+		return InventoryRemovalResponse{Attempts: []RemovalAttemptManifest{attempt}}, nil
+	}
 	return InventoryRemovalResponse{NoStorageEvidence: true}, nil
+}
+
+// detachedComputerStorageRemovalAttempt is the third Storage-only removal
+// arm (#1611). The witness's HelperGeneration is stamped by the server, which
+// knows the session this inventory ran in.
+func detachedComputerStorageRemovalAttempt(system computerDiskSystem, runtimeRoot string, request InventoryRemovalRequest, root, name string, manifest computerDiskManifest) (RemovalAttemptManifest, bool, error) {
+	detached, err := detachedComputerStorageFacts(system, runtimeRoot, root, name, manifest, request.Removal.NodeID, request.Removal.BootSessionID)
+	if err != nil || !detached {
+		return RemovalAttemptManifest{}, false, err
+	}
+	storage, evidence := manifest.Storage, manifest.PreviousDetachment
+	authority := AttemptAuthority{
+		NodeID: request.Removal.NodeID, BootSessionID: request.Removal.BootSessionID, JobID: request.Removal.JobID,
+		AttemptID: contract.StorageDetachedRemovalAttemptID(storage.StorageGeneration), FencingToken: request.Removal.CleanupFence,
+		Class: contract.JobClassService, RemovalGeneration: fmt.Sprint(request.Removal.RemovalGeneration),
+	}
+	if err := authority.validate(); err != nil {
+		return RemovalAttemptManifest{}, false, err
+	}
+	return RemovalAttemptManifest{
+		Authority: authority, ComputerStorage: &storage, StorageOnly: true,
+		StorageDetachment: &contract.ComputerStorageDetachmentWitness{
+			Kind: contract.ComputerStorageDetachedKind, EvidenceKind: evidence.Kind, ReceiptID: evidence.ReceiptID,
+			NodeID: evidence.NodeID, ComputerID: evidence.ComputerID, StorageID: evidence.StorageID,
+			StorageGeneration: evidence.StorageGeneration, AttachedJobID: evidence.JobID,
+			AttachedAttemptID: evidence.AttemptID, AttachedBootSessionID: evidence.BootSessionID,
+			SweepEpoch: evidence.SweepEpoch,
+		},
+		Resources: expectedComputerStorageRemovalResources(&storage),
+	}, true, nil
 }
 
 func absentComputerStorageRemovalAttempt(request InventoryRemovalRequest, storage ComputerStorageReference) (RemovalAttemptManifest, error) {
