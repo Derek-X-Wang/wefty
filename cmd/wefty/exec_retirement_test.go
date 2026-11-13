@@ -485,10 +485,10 @@ func TestExecRetirementTempLinkSafety(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitExecPath(t, storage, false)
-			if kind == "symlink-parent" || kind == "outside-root" {
-				// Wait for the deleter before asserting that outside data survived.
-				waitExecStorageEmpty(t, filepath.Dir(storage))
-			}
+			// Wait for the background deleter in every case: it must finish before
+			// asserting that outside data survived, and before t.TempDir cleanup,
+			// which fails on a folder the deleter is still emptying.
+			waitExecStorageEmpty(t, filepath.Dir(storage))
 			waitExecPath(t, link, kind != "owned" && kind != "legacy")
 			waitExecPath(t, allocation, kind == "owner-mismatch" || kind == "symlink-parent" || kind == "outside-root")
 			if kind == "owner-mismatch" || kind == "symlink-parent" || kind == "outside-root" {
