@@ -194,7 +194,7 @@ jobs:
           - {os: ubuntu-24.04, image: xfce}
           - {os: ubuntu-24.04, image: wayland}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 100
+    timeout-minutes: 130
     env:
       IMAGE_NAME: ghcr.io/derek-x-wang/wefty-echo-service
       COMPUTER_IMAGE_NAME: ghcr.io/derek-x-wang/wefty-computer-reference

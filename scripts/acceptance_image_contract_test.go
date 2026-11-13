@@ -349,8 +349,8 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		faultText := fixture.text + "\n" + faultSupervisorText
 		jobTimeout := fixture.workflow.Jobs["service-acceptance-realtiming"].TimeoutMinutes
 		goTimeout := workflowGoTestTimeoutMinutes(t, name, fixture.text, "service_acceptance_realtiming")
-		if jobTimeout != 100 || jobTimeout < goTimeout+15 {
-			t.Fatalf("%s realtiming timeouts: job=%dm go=%dm, want job=100m and at least 15m outer margin", name, jobTimeout, goTimeout)
+		if jobTimeout != 130 || jobTimeout < goTimeout+15 {
+			t.Fatalf("%s realtiming timeouts: job=%dm go=%dm, want job=130m and at least 15m outer margin", name, jobTimeout, goTimeout)
 		}
 		for _, required := range []string{
 			"StandardError=append:/tmp/wefty-oci-helper-realtiming.stderr",
