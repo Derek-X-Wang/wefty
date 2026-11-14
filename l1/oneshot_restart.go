@@ -139,7 +139,8 @@ func (s *Store) InterruptRestartableAttempt(ctx context.Context, nodeID, attempt
 		return Job{}, false, err
 	}
 	if leaseExpired {
-		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
+		// Only a restartable process one-shot reaches here, never a Computer.
+		if _, err := expireAttemptLease(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, false, err
 		}
 		if err := write.commit(); err != nil {

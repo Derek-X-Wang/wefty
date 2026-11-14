@@ -5294,14 +5294,29 @@ func terminalResourceFailure(job Job, result ProcessResult, nodeID string) *cont
 	return nil
 }
 
+// expireAttempt settles a lease expiry and, for a Computer whose host VM the
+// owner turned off, ends that Attempt's Seats (#1671).
 func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, now time.Time, jitter func(time.Duration) time.Duration) error {
+	changed, err := expireAttemptLease(ctx, tx, attempt, now, jitter)
+	if err != nil || !changed {
+		return err
+	}
+	if err := endHostVMOffSeats(ctx, tx, attempt.nodeID, attempt.jobID, attempt.attemptID, now); err != nil {
+		return internalError(err, "end Seats of a host VM turned off")
+	}
+	return nil
+}
+
+// expireAttemptLease settles only the lease and Job state. Callers that can
+// never hold a Computer Attempt use it directly and so reach no Seat SQL.
+func expireAttemptLease(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, now time.Time, jitter func(time.Duration) time.Duration) (bool, error) {
 	result, err := invalidateAttempts(ctx, tx, attempt.attemptID, invalidateLeaseSettlement, now)
 	if err != nil {
-		return internalError(err, "mark attempt lost")
+		return false, internalError(err, "mark attempt lost")
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return internalError(err, "read attempt expiry result")
+		return false, internalError(err, "read attempt expiry result")
 	}
 	if changed > 0 {
 		var jobState contract.JobState
@@ -5312,22 +5327,22 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 			WHERE jobs.job_id=? AND jobs.current_attempt_id=?`, attempt.jobID, attempt.attemptID).
 			Scan(&jobState, &desiredState, &leaseLossCount)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return true, nil
 		}
 		if err != nil {
-			return internalError(err, "read job after lease expiry")
+			return false, internalError(err, "read job after lease expiry")
 		}
 
 		canceled, _, err := cancellationDeadline(ctx, tx, attempt.jobID)
 		if err != nil {
-			return err
+			return false, err
 		}
 		nextState := contract.JobFailed
 		if !canceled && desiredState.Valid && contract.ServiceDesiredState(desiredState.String) == contract.ServiceDesiredRunning &&
 			(jobState == contract.JobClaimed || jobState == contract.JobRunning) {
 			directive, err := readAttemptDirective(ctx, tx, attempt.jobID, attempt.attemptID)
 			if err != nil {
-				return err
+				return false, err
 			}
 			// Running alone is not start evidence for process attempts: renewal
 			// and logs retain their legacy promotion without setting started_ns.
@@ -5338,19 +5353,19 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 		if !canceled && attempt.spec.Restartable && !desiredState.Valid {
 			nextState, err = recoverOneshot(ctx, tx, attempt, InterruptionLeaseExpired, now, jitter)
 			if err != nil {
-				return err
+				return false, err
 			}
 			if _, err := tx.ExecContext(ctx, "UPDATE attempts SET interruption_reason=? WHERE attempt_id=?", InterruptionLeaseExpired, attempt.attemptID); err != nil {
-				return internalError(err, "record lost one-shot interruption")
+				return false, internalError(err, "record lost one-shot interruption")
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
 			WHERE job_id=? AND current_attempt_id=?`, nextState, now.UnixNano(), attempt.jobID, attempt.attemptID); err != nil {
-			return internalError(err, "transition job after lease expiry")
+			return false, internalError(err, "transition job after lease expiry")
 		}
 		if attempt.spec.Restartable && nextState == contract.JobQueued {
 			if err := detachAttempt(ctx, tx, attempt.jobID, "", detachOneshotRecovery); err != nil {
-				return internalError(err, "detach lost restartable attempt")
+				return false, internalError(err, "detach lost restartable attempt")
 			}
 		}
 		if desiredState.Valid {
@@ -5366,11 +5381,11 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 				SET lease_loss_count=lease_loss_count+1, next_restart_at=?,
 					healthy_since_ns=NULL, published_attempt_id=NULL
 				WHERE job_id=?`, nextRestartNS, attempt.jobID); err != nil {
-				return internalError(err, "clear service authority after lease expiry")
+				return false, internalError(err, "clear service authority after lease expiry")
 			}
 		}
 	}
-	return nil
+	return changed > 0, nil
 }
 
 func validateJobSpec(spec *contract.JobSpec) error {

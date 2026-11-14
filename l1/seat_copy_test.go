@@ -15,7 +15,23 @@ import (
 
 func liveSeatForCopy(t *testing.T) (*seatLifecycleFixture, string, string, SeatCopyAuthorityInput) {
 	t.Helper()
+	return liveSeatWithLease(t, 0)
+}
+
+// liveSeatWithLease reopens the fixture with a lease shorter than the Seat
+// idle wait when lease is positive, so lease expiry happens first.
+func liveSeatWithLease(t *testing.T, lease time.Duration) (*seatLifecycleFixture, string, string, SeatCopyAuthorityInput) {
+	t.Helper()
 	f := newSeatLifecycleFixture(t)
+	if lease > 0 {
+		if err := f.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		if f.store, err = openTestStore(t, f.path, StoreOptions{Clock: f.clock, LeaseDuration: lease}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	id := "seat_00000000000000000000000000000001"
 	if _, err := f.store.CreateSeatCall(t.Context(), "cli", SeatCallInput{SeatID: id, NodeID: f.node.NodeID, Harness: "test", Folder: "/workspace", Form: "any", Network: "none"}); err != nil {
 		t.Fatal(err)
