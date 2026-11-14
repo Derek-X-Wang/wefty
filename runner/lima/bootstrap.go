@@ -312,6 +312,19 @@ func GuestHelperRestartPolicyName(systemdVersion int) string {
 	return systemdpolicy.Name(systemdVersion)
 }
 
+// parseGuestSystemdVersion reads the first line of `systemctl --version`.
+func parseGuestSystemdVersion(output []byte) (int, error) {
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return 0, errors.New("cannot parse Lima guest systemd version")
+	}
+	version, err := strconv.Atoi(fields[1])
+	if err != nil || version <= 0 {
+		return 0, errors.New("cannot parse Lima guest systemd version")
+	}
+	return version, nil
+}
+
 func systemdQuote(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `"`, `\"`)

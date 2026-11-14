@@ -1141,6 +1141,16 @@ func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context,
 					}
 					response.RestartApplied = true
 					response.RecreateApplied = response.Convergence == ocicontrol.ConvergenceRecreateRequired
+					if response.RecreateApplied {
+						// The reinstall recorded the new guest's systemd facts;
+						// the state write below must not restore the old guest's.
+						reinstalled, err := ocicontrol.ReadSetupState(*ociSetupState)
+						if err != nil {
+							return response, err
+						}
+						desired.SystemdVersion = reinstalled.SystemdVersion
+						desired.HelperRestartPolicy = reinstalled.HelperRestartPolicy
+					}
 					if response.RecreateApplied && observationPath != "" {
 						// The delete removed the old record; the reinstall
 						// recorded the new guest, or left it unobserved.
