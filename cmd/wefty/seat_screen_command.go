@@ -57,19 +57,37 @@ type seatScreenStartKey struct{}
 // before each write on a Seat screen stream.
 type seatScreenWriteHookKey struct{}
 
-type seatScreenHookedWriter struct {
+// seatScreenStreamError marks a failure of the Seat screen stream itself, as
+// opposed to a local file, encoding, output or RFB protocol error.
+type seatScreenStreamError struct{ err error }
+
+func (e *seatScreenStreamError) Error() string { return e.err.Error() }
+func (e *seatScreenStreamError) Unwrap() error { return e.err }
+
+type seatScreenStreamWriter struct {
 	io.Writer
 	hook func([]byte)
 }
 
-func (w seatScreenHookedWriter) Write(p []byte) (int, error) {
-	w.hook(p)
-	return w.Writer.Write(p)
+func (w seatScreenStreamWriter) Write(p []byte) (int, error) {
+	if w.hook != nil {
+		w.hook(p)
+	}
+	n, err := w.Writer.Write(p)
+	if err != nil {
+		err = &seatScreenStreamError{err}
+	}
+	return n, err
 }
+
+// seatScreenReceiveLimit bounds one WebSocket message and the bytes the
+// receiver holds ahead of the RFB client. A full 1280x800 frame is 4 MiB.
+const seatScreenReceiveLimit = 128 << 20
 
 // seatScreenReceiver reads every WebSocket frame as it arrives, so a take's
 // typed close (#1680) is seen even while the CLI only writes input. RFB reads
-// drain its buffer; the first read error ends it.
+// drain its buffer; the first read error ends it. It holds at most limit
+// bytes; a node that sends more ends the stream with an error.
 type seatScreenReceiver struct {
 	mu   sync.Mutex
 	more *sync.Cond
@@ -78,9 +96,12 @@ type seatScreenReceiver struct {
 	done chan struct{}
 }
 
-func receiveSeatScreen(ctx context.Context, c *websocket.Conn) *seatScreenReceiver {
+// receiveSeatScreen must run after websocket.NetConn, which removes the
+// connection's read limit.
+func receiveSeatScreen(ctx context.Context, c *websocket.Conn, limit int) *seatScreenReceiver {
 	r := &seatScreenReceiver{done: make(chan struct{})}
 	r.more = sync.NewCond(&r.mu)
+	c.SetReadLimit(int64(limit))
 	go func() {
 		defer close(r.done)
 		for {
@@ -90,6 +111,10 @@ func receiveSeatScreen(ctx context.Context, c *websocket.Conn) *seatScreenReceiv
 				_ = c.CloseNow()
 			}
 			r.mu.Lock()
+			if err == nil && r.buf.Len()+len(data) > limit {
+				err = fmt.Errorf("Seat screen sent more than %d bytes ahead of the client", limit)
+				_ = c.CloseNow()
+			}
 			if err != nil {
 				r.err = err
 			} else {
@@ -121,16 +146,25 @@ func (r *seatScreenReceiver) Read(p []byte) (int, error) {
 	return 0, r.err
 }
 
-// takeClosed reports whether the stream ended with a take's typed close. A
-// write can fail first, as a broken pipe, once the node drops the stream.
-// Call it after closing the connection, which ends the receiver.
-func (r *seatScreenReceiver) takeClosed() bool {
-	select {
-	case <-r.done:
-	case <-time.After(time.Second):
-		return false
+// seatScreenTakeFailure reports a take's typed close (#1680) as the
+// person_driving refusal. A stream write can fail first, as a broken pipe,
+// once the node drops the stream; the receiver then holds the close. Other
+// failures keep their own error. Call it after closing the connection, which
+// ends the receiver.
+func seatScreenTakeFailure(err error, r *seatScreenReceiver) error {
+	taken := websocket.CloseStatus(err) == contract.SeatInputPersonDrivingClose
+	var stream *seatScreenStreamError
+	if !taken && r != nil && errors.As(err, &stream) {
+		select {
+		case <-r.done:
+			taken = websocket.CloseStatus(r.err) == contract.SeatInputPersonDrivingClose
+		case <-time.After(time.Second):
+		}
 	}
-	return websocket.CloseStatus(r.err) == contract.SeatInputPersonDrivingClose
+	if !taken {
+		return err
+	}
+	return &apiResponseError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: seatErrorPersonDriving, Message: "a person is driving"}}
 }
 
 type seatScreenArgs struct {
@@ -381,11 +415,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	phase := "input synchronization"
 	defer func() {
 		if resultErr != nil {
-			// A take that lands on an open input stream closes it with a
-			// typed close (#1680); it ends like a refused input.
-			if websocket.CloseStatus(resultErr) == contract.SeatInputPersonDrivingClose || receiver != nil && receiver.takeClosed() {
-				resultErr = &apiResponseError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: seatErrorPersonDriving, Message: "a person is driving"}}
-			}
+			resultErr = seatScreenTakeFailure(resultErr, receiver)
 			if actionDone {
 				prefix := a.command + " done; " + phase + " failed: "
 				var api *apiResponseError
@@ -457,7 +487,6 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			close()
 			return nil, nil, fmt.Errorf("Seat screen did not negotiate binary WebSocket")
 		}
-		c.SetReadLimit(128 << 20)
 		if count, e := strconv.Atoi(response.Header.Get("Wefty-Seat-Unread-Events")); e == nil && count >= 0 {
 			unread = count
 		}
@@ -472,11 +501,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				return nil, nil, e
 			}
 		}
-		var writer io.Writer = websocket.NetConn(ctx, c, websocket.MessageBinary)
-		if hook, ok := ctx.Value(seatScreenWriteHookKey{}).(func([]byte)); ok {
-			writer = seatScreenHookedWriter{writer, hook}
-		}
-		receiver = receiveSeatScreen(ctx, c)
+		hook, _ := ctx.Value(seatScreenWriteHookKey{}).(func([]byte))
+		writer := seatScreenStreamWriter{websocket.NetConn(ctx, c, websocket.MessageBinary), hook}
+		receiver = receiveSeatScreen(ctx, c, seatScreenReceiveLimit)
 		wire := &seatScreenBannerWire{ReadWriter: struct {
 			io.Reader
 			io.Writer
