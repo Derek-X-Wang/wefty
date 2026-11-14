@@ -44,6 +44,9 @@ type seatScreenConfig struct {
 	authority         ocihelper.AttemptAuthority
 	fatal             func(error)
 	logFailure        func(error)
+	// beforeUpgrade is a test seam between the input stream's final door
+	// check and its WebSocket upgrade. It is nil in production.
+	beforeUpgrade func(context.Context)
 }
 type seatScreenHandler struct {
 	config seatScreenConfig
@@ -559,9 +562,14 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(err)
 			return
 		}
+		// The point of no return: a take after this check finds the
+		// stream open, and it ends as a transport failure.
 		if err = seat.gate.open(ctx); err != nil {
 			writeSeatScreenError(w, err)
 			return
+		}
+		if h.config.beforeUpgrade != nil {
+			h.config.beforeUpgrade(ctx)
 		}
 	}
 	if binding.ReleaseNote != "" {

@@ -335,6 +335,9 @@ func TestSeatScreenTakeRefusesInFlightInputAndStampsSwitchTime(t *testing.T) {
 		{name: "take cancels the input write", outcome: "", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
 		{name: "take lands after the input write, before the upgrade", outcome: "stored", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
 		{name: "an outage keeps its own error", outcome: "outage", status: http.StatusServiceUnavailable, code: contract.ErrorUnavailable, message: "L1 outage"},
+		// The documented limit: past the final door check the stream is
+		// open, and a take then ends it as a transport failure.
+		{name: "take lands after the final door check", outcome: "opened", status: http.StatusSwitchingProtocols},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testSeatScreenTakeDuringInput(t, tc.outcome, tc.status, tc.code, tc.message)
@@ -364,11 +367,20 @@ func testSeatScreenTakeDuringInput(t *testing.T, outcome string, status int, cod
 	}
 	defer runtime.view.Close()
 	defer runtime.control.Close()
-	control := &screenControlFixture{holdInput: make(chan struct{}), holdInputOutcome: outcome}
-	entered := control.holdInput
+	control := &screenControlFixture{}
+	entered := make(chan struct{})
+	var beforeUpgrade func(context.Context)
+	if outcome == "opened" {
+		beforeUpgrade = func(ctx context.Context) {
+			close(entered)
+			<-ctx.Done()
+		}
+	} else {
+		control.holdInput, control.holdInputOutcome = entered, outcome
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	handler, err := newSeatScreenHandler(seatScreenConfig{ctx: ctx, fabric: fixture.identity, authorizer: cache, clock: fixture.clock, runtime: runtime, control: control, fatal: func(error) { cancel() }, computer: "computer-1", storage: "storage-1", storageGeneration: 1, authority: ocihelper.AttemptAuthority{NodeID: "node-1", BootSessionID: "boot-1", JobID: "job-1", AttemptID: "attempt-1", FencingToken: "fence-1"}})
+	handler, err := newSeatScreenHandler(seatScreenConfig{ctx: ctx, fabric: fixture.identity, authorizer: cache, clock: fixture.clock, runtime: runtime, control: control, fatal: func(error) { cancel() }, beforeUpgrade: beforeUpgrade, computer: "computer-1", storage: "storage-1", storageGeneration: 1, authority: ocihelper.AttemptAuthority{NodeID: "node-1", BootSessionID: "boot-1", JobID: "job-1", AttemptID: "attempt-1", FencingToken: "fence-1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,18 +428,31 @@ func testSeatScreenTakeDuringInput(t *testing.T, outcome string, status int, cod
 		t.Fatalf("take status=%d", status)
 	}
 	got := testwait.Receive(t, "in-flight AI agent input refusal", inFlight)
-	if got.conn != nil {
+	if status == http.StatusSwitchingProtocols {
+		if got.err != nil || got.conn == nil {
+			t.Fatalf("open input stream: %v", got.err)
+		}
+		defer got.conn.CloseNow()
+		var readErr error
+		for readErr == nil {
+			_, _, readErr = got.conn.Read(ctx)
+		}
+		if ctx.Err() != nil || websocket.CloseStatus(readErr) != -1 {
+			t.Fatalf("open input stream after take: %v (want a transport failure)", readErr)
+		}
+	} else if got.conn != nil {
 		got.conn.CloseNow()
 		t.Fatal("in-flight AI agent input survived take")
-	}
-	if got.err == nil || got.reply == nil || got.reply.StatusCode != status {
+	} else if got.err == nil || got.reply == nil || got.reply.StatusCode != status {
 		t.Fatalf("in-flight input: %v %+v", got.err, got.reply)
 	}
-	var failure contract.ErrorResponse
-	decodeErr := json.NewDecoder(got.reply.Body).Decode(&failure)
-	got.reply.Body.Close()
-	if decodeErr != nil || failure.Error.Code != code || failure.Error.Message != message || failure.Error.Retryable != (status != http.StatusConflict) {
-		t.Fatalf("in-flight failure=%+v decode=%v", failure, decodeErr)
+	if status != http.StatusSwitchingProtocols {
+		var failure contract.ErrorResponse
+		decodeErr := json.NewDecoder(got.reply.Body).Decode(&failure)
+		got.reply.Body.Close()
+		if decodeErr != nil || failure.Error.Code != code || failure.Error.Message != message || failure.Error.Retryable != (status != http.StatusConflict) {
+			t.Fatalf("in-flight failure=%+v decode=%v", failure, decodeErr)
+		}
 	}
 
 	control.mu.Lock()
