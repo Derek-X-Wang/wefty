@@ -66,24 +66,29 @@ type seatScreenGate struct {
 	streams map[*seatScreenStream]struct{}
 }
 type seatScreenStream struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	done   chan struct{}
 }
+
+// errSeatPersonDriving is the cancel cause of an admitted AI agent input
+// stream that a person's take closed. Its request reports person_driving,
+// not a retryable outage (#1672).
+var errSeatPersonDriving = &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "person_driving", Message: "a person is driving"}}
 
 func (g *seatScreenGate) admit(ctx context.Context) (context.Context, func(), error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.driving {
-		return nil, nil, &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "person_driving", Message: "a person is driving"}}
+		return nil, nil, errSeatPersonDriving
 	}
 	if g.streams == nil {
 		g.streams = map[*seatScreenStream]struct{}{}
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	stream := &seatScreenStream{cancel: cancel, done: make(chan struct{})}
 	g.streams[stream] = struct{}{}
 	return ctx, func() {
-		cancel()
+		cancel(nil)
 		g.mu.Lock()
 		delete(g.streams, stream)
 		close(stream.done)
@@ -99,7 +104,7 @@ func (g *seatScreenGate) block(ctx context.Context) error {
 	}
 	g.mu.Unlock()
 	for _, s := range streams {
-		s.cancel()
+		s.cancel(errSeatPersonDriving)
 	}
 	for _, s := range streams {
 		select {
@@ -432,6 +437,11 @@ func (a seatScreenAuditor) AppendComputerTakeoverAudit(ctx context.Context, _, _
 		note = ""
 	}
 	e := l1.SeatLogEvent{EventID: r.Event.EventID, Kind: kind, Reason: string(r.Event.Reason), Note: note, Audit: &r.Event}
+	if kind == l1.SeatEventControlTaken {
+		// The node supplies the switch time: the control door refused AI
+		// agent input from then, before this write reached L1 (#1672).
+		e.OccurredAt = r.Event.OccurredAt
+	}
 	receipt, err := a.handler.record(ctx, a.id, e)
 	if err != nil {
 		return l1.ComputerTakeoverAuditReceipt{}, err
@@ -489,11 +499,21 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	finish := func() {}
+	fail := func(err error) { writeSeatScreenError(w, err) }
 	if input {
 		ctx, finish, err = seat.gate.admit(ctx)
 		if err != nil {
 			writeSeatScreenError(w, err)
 			return
+		}
+		admitted := ctx
+		fail = func(err error) {
+			// An input that lost the control door to a person's take
+			// fails because of that take, whatever the cancel broke.
+			if cause := context.Cause(admitted); errors.Is(cause, errSeatPersonDriving) {
+				err = cause
+			}
+			writeSeatScreenError(w, err)
 		}
 	}
 	defer finish()
@@ -507,7 +527,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	backend, backendWS, banner, err := dialComputerBackend(ctx, func(ctx context.Context, _ string) (net.Conn, error) { return h.dial(ctx, binding, kind) }, kind)
 	if err != nil {
-		writeSeatScreenError(w, err)
+		fail(err)
 		return
 	}
 	timing("backend_banner_received")
@@ -517,7 +537,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer stopBackend()
 	if input {
 		if _, err = h.record(ctx, id, l1.SeatLogEvent{EventID: rand.Text(), Kind: l1.SeatEventScreenInput, Reason: "ai_agent"}); err != nil {
-			writeSeatScreenError(w, err)
+			fail(err)
 			return
 		}
 	}
