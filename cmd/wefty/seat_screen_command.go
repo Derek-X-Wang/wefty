@@ -298,6 +298,11 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	phase := "input synchronization"
 	defer func() {
 		if resultErr != nil {
+			// A take that lands on an open input stream closes it with a
+			// typed close (#1680); it ends like a refused input.
+			if websocket.CloseStatus(resultErr) == contract.SeatInputPersonDrivingClose {
+				resultErr = &apiResponseError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: seatErrorPersonDriving, Message: "a person is driving"}}
+			}
 			if actionDone {
 				prefix := a.command + " done; " + phase + " failed: "
 				var api *apiResponseError

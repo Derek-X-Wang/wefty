@@ -75,6 +75,10 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 			return
 		}
 		defer ws.CloseNow()
+		if failure == "take-open" && isInput {
+			_ = ws.Close(contract.SeatInputPersonDrivingClose, "person_driving")
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		events := 0
@@ -102,11 +106,15 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 			if !isInput && (width != 1280 || height != 800) {
 				t.Errorf("screenshot requested %dx%d instead of full screen", width, height)
 			}
-			if isInput && events > 0 && (failure == "sync" || failure == "wait" && incremental || failure == "frame" && !incremental && (width != 1 || height != 1)) {
+			if isInput && events > 0 && (failure == "sync" || failure == "take" || failure == "wait" && incremental || failure == "frame" && !incremental && (width != 1 || height != 1)) {
 				if events != 2 {
 					t.Errorf("sync failure before click press and release: events=%d", events)
 				}
-				_ = ws.CloseNow()
+				if failure == "take" {
+					_ = ws.Close(contract.SeatInputPersonDrivingClose, "person_driving")
+				} else {
+					_ = ws.CloseNow()
+				}
 				return io.EOF
 			}
 			return settleUpdate(conn, width, height, false)
@@ -214,6 +222,38 @@ func TestSeatScreenSyncFailureReportsActionDone(t *testing.T) {
 			var value contract.ErrorResponse
 			if e := json.Unmarshal(rendered.Bytes(), &value); e != nil || value.Error.Details["action_done"] != true || value.Error.Retryable {
 				t.Fatalf("JSON lost completed action: %s", rendered.String())
+			}
+		})
+	}
+}
+
+// TestSeatScreenTakeOnOpenStreamIsPersonDriving is #1680: a take that lands
+// on an open input stream closes it with the typed close, and the CLI reports
+// person_driving (exit 5, not retryable), not a transport failure. After the
+// input was written, the error still says the action was done.
+func TestSeatScreenTakeOnOpenStreamIsPersonDriving(t *testing.T) {
+	for _, test := range []struct {
+		failure    string
+		actionDone bool
+	}{
+		{"take-open", false},
+		{"take", true},
+	} {
+		t.Run(test.failure, func(t *testing.T) {
+			clients, id, input := seatScreenReworkFixture(t, test.failure)
+			err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2"}, io.Discard, io.Discard)
+			var api *apiResponseError
+			if !errors.As(err, &api) || api.StatusCode != http.StatusConflict || api.APIError.Code != seatErrorPersonDriving || api.APIError.Retryable || !strings.HasSuffix(api.APIError.Message, "a person is driving") {
+				t.Fatalf("take on an open stream = %v, want person_driving", err)
+			}
+			if done := api.APIError.Details["action_done"] == true; done != test.actionDone {
+				t.Fatalf("action_done=%t, want %t: %v", done, test.actionDone, err)
+			}
+			if code := commandExitCode(err); code != exitConflict {
+				t.Fatalf("exit=%d, want %d", code, exitConflict)
+			}
+			if input.Load() != 1 {
+				t.Fatalf("input calls=%d", input.Load())
 			}
 		})
 	}

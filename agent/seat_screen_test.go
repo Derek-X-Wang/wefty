@@ -335,8 +335,8 @@ func TestSeatScreenTakeRefusesInFlightInputAndStampsSwitchTime(t *testing.T) {
 		{name: "take cancels the input write", outcome: "", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
 		{name: "take lands after the input write, before the upgrade", outcome: "stored", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
 		{name: "an outage keeps its own error", outcome: "outage", status: http.StatusServiceUnavailable, code: contract.ErrorUnavailable, message: "L1 outage"},
-		// The documented limit: past the final door check the stream is
-		// open, and a take then ends it as a transport failure.
+		// Past the final door check the stream is open; a take then ends it
+		// with the typed person_driving close (#1680).
 		{name: "take lands after the final door check", outcome: "opened", status: http.StatusSwitchingProtocols},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -424,8 +424,14 @@ func testSeatScreenTakeDuringInput(t *testing.T, outcome string, status int, cod
 	testwait.Receive(t, "in-flight AI agent input admission", entered)
 
 	token := response.Header.Get(computerControlTokenHeader)
+	takeStarted := time.Now()
 	if status := postComputerControl(t, server.URL, "/v1/seats/"+one+"/person"+computerControlTakePath, token); status != 200 {
 		t.Fatalf("take status=%d", status)
+	}
+	// The agent below reads only after the take returns, so an open stream's
+	// typed close waits on it: the take must not wait past the bound.
+	if took := time.Since(takeStarted); took > seatTakeCloseLimit+2*time.Second {
+		t.Fatalf("take took %v; the person's control waited on the agent's connection", took)
 	}
 	got := testwait.Receive(t, "in-flight AI agent input refusal", inFlight)
 	if status == http.StatusSwitchingProtocols {
@@ -437,8 +443,9 @@ func testSeatScreenTakeDuringInput(t *testing.T, outcome string, status int, cod
 		for readErr == nil {
 			_, _, readErr = got.conn.Read(ctx)
 		}
-		if ctx.Err() != nil || websocket.CloseStatus(readErr) != -1 {
-			t.Fatalf("open input stream after take: %v (want a transport failure)", readErr)
+		var closed websocket.CloseError
+		if ctx.Err() != nil || !errors.As(readErr, &closed) || closed.Code != contract.SeatInputPersonDrivingClose || closed.Reason != "person_driving" {
+			t.Fatalf("open input stream after take: %v (want the person_driving close)", readErr)
 		}
 	} else if got.conn != nil {
 		got.conn.CloseNow()
