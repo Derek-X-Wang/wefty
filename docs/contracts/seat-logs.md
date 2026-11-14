@@ -274,8 +274,9 @@ closes the door before that check makes the stream fail with `person_driving`
 cancellation becomes `person_driving`; an outage, or an earlier cancellation of
 another cause, keeps its own error. A take after the check finds the stream
 open: the upgrade can still complete, and the node then ends the stream with
-WebSocket close code 4409, reason `person_driving` (#1680). The CLI reports
-that close as `person_driving` (exit 5, not retryable); after the input bytes
+WebSocket close code 4409, reason `person_driving` (#1680). The CLI reads the
+stream while it writes input, and reports that close as `person_driving`
+(exit 5, not retryable) even when a later write fails first; after the input bytes
 were written, the error also carries `action_done: true`. The node waits at
 most 500 ms for that close handshake, so the person's control never waits
 longer on the agent's connection. An agent connection too backed up to take

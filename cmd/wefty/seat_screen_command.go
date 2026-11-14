@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -50,6 +52,86 @@ Default PNG files go to the system temp folder. --json includes elapsed_ms.
 `
 
 type seatScreenStartKey struct{}
+
+// seatScreenWriteHookKey is a test seam: a func([]byte) in the context runs
+// before each write on a Seat screen stream.
+type seatScreenWriteHookKey struct{}
+
+type seatScreenHookedWriter struct {
+	io.Writer
+	hook func([]byte)
+}
+
+func (w seatScreenHookedWriter) Write(p []byte) (int, error) {
+	w.hook(p)
+	return w.Writer.Write(p)
+}
+
+// seatScreenReceiver reads every WebSocket frame as it arrives, so a take's
+// typed close (#1680) is seen even while the CLI only writes input. RFB reads
+// drain its buffer; the first read error ends it.
+type seatScreenReceiver struct {
+	mu   sync.Mutex
+	more *sync.Cond
+	buf  bytes.Buffer
+	err  error
+	done chan struct{}
+}
+
+func receiveSeatScreen(ctx context.Context, c *websocket.Conn) *seatScreenReceiver {
+	r := &seatScreenReceiver{done: make(chan struct{})}
+	r.more = sync.NewCond(&r.mu)
+	go func() {
+		defer close(r.done)
+		for {
+			typ, data, err := c.Read(ctx)
+			if err == nil && typ != websocket.MessageBinary {
+				err = fmt.Errorf("Seat screen sent a non-binary WebSocket message")
+				_ = c.CloseNow()
+			}
+			r.mu.Lock()
+			if err != nil {
+				r.err = err
+			} else {
+				r.buf.Write(data)
+			}
+			r.more.Broadcast()
+			r.mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return r
+}
+
+func (r *seatScreenReceiver) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.buf.Len() == 0 && r.err == nil {
+		r.more.Wait()
+	}
+	if r.buf.Len() > 0 {
+		return r.buf.Read(p)
+	}
+	switch websocket.CloseStatus(r.err) {
+	case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+		return 0, io.EOF
+	}
+	return 0, r.err
+}
+
+// takeClosed reports whether the stream ended with a take's typed close. A
+// write can fail first, as a broken pipe, once the node drops the stream.
+// Call it after closing the connection, which ends the receiver.
+func (r *seatScreenReceiver) takeClosed() bool {
+	select {
+	case <-r.done:
+	case <-time.After(time.Second):
+		return false
+	}
+	return websocket.CloseStatus(r.err) == contract.SeatInputPersonDrivingClose
+}
 
 type seatScreenArgs struct {
 	command, id, output, button, text string
@@ -295,12 +377,13 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	timing.mark("l1_discovery")
 	unread := target.Unread
 	actionDone, replied := false, false
+	var receiver *seatScreenReceiver
 	phase := "input synchronization"
 	defer func() {
 		if resultErr != nil {
 			// A take that lands on an open input stream closes it with a
 			// typed close (#1680); it ends like a refused input.
-			if websocket.CloseStatus(resultErr) == contract.SeatInputPersonDrivingClose {
+			if websocket.CloseStatus(resultErr) == contract.SeatInputPersonDrivingClose || receiver != nil && receiver.takeClosed() {
 				resultErr = &apiResponseError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: seatErrorPersonDriving, Message: "a person is driving"}}
 			}
 			if actionDone {
@@ -389,7 +472,15 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				return nil, nil, e
 			}
 		}
-		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(ctx, c, websocket.MessageBinary), remaining: 12, received: func() { timing.mark("rfb_banner") }}
+		var writer io.Writer = websocket.NetConn(ctx, c, websocket.MessageBinary)
+		if hook, ok := ctx.Value(seatScreenWriteHookKey{}).(func([]byte)); ok {
+			writer = seatScreenHookedWriter{writer, hook}
+		}
+		receiver = receiveSeatScreen(ctx, c)
+		wire := &seatScreenBannerWire{ReadWriter: struct {
+			io.Reader
+			io.Writer
+		}{receiver, writer}, remaining: 12, received: func() { timing.mark("rfb_banner") }}
 		client, e := rfbclient.Open(wire)
 		if e != nil {
 			close()
