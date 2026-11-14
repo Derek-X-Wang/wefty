@@ -139,12 +139,18 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 		displacedSessionID = prior.session.id
 	}
 	signalTrue := override
+	// acquiredAt is when AI agent input starts to be refused. A fresh take
+	// reads it just before the control door switches, so control_acquired
+	// is never later than the first refusal (#1672). An override keeps the
+	// door closed from the prior tenure and uses its record time.
+	var acquiredAt time.Time
 	if override {
 		tenure.detachControl(prior)
 		if err := tenure.record(prior.session, prior.serial, l1.ComputerTakeoverControlReleased, l1.ComputerTakeoverControllerOverridden); err != nil {
 			return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
 		}
 	} else {
+		acquiredAt = wallNow(tenure.config.clock)
 		if err := tenure.config.setControlState(operationContext, true); err != nil {
 			tenure.finishOperation(operation, nil)
 			// A connection_limit refusal changed no helper state, so it
@@ -180,7 +186,7 @@ func (tenure *controllerTenure) take(ctx context.Context, sessionID string) (net
 			return nil, displacedSessionID, tenure.failTake(operation, session, serial, true, signalTrue, false, err)
 		}
 	}
-	if err := tenure.record(session, serial, l1.ComputerTakeoverControlAcquired, ""); err != nil {
+	if err := tenure.recordAt(session, serial, l1.ComputerTakeoverControlAcquired, "", acquiredAt); err != nil {
 		managed.closeAndWait()
 		return nil, displacedSessionID, tenure.failTake(operation, session, serial, override, signalTrue, false, err)
 	}
@@ -539,11 +545,25 @@ func (tenure *controllerTenure) record(
 	kind l1.ComputerTakeoverAuditEventKind,
 	reason l1.ComputerTakeoverReason,
 ) error {
+	return tenure.recordAt(session, serial, kind, reason, time.Time{})
+}
+
+// recordAt records an event that occurred at a supplied time; zero means now.
+func (tenure *controllerTenure) recordAt(
+	session controlTenureSession,
+	serial uint64,
+	kind l1.ComputerTakeoverAuditEventKind,
+	reason l1.ComputerTakeoverReason,
+	at time.Time,
+) error {
+	if at.IsZero() {
+		at = wallNow(tenure.config.clock)
+	}
 	event := session.event
 	event.EventID = fmt.Sprintf("%s:control:%d:%s", session.id, serial, kind)
 	event.Kind = kind
 	event.AdmittedMode = l1.ComputerAdmittedController
-	event.OccurredAt = wallNow(tenure.config.clock).UTC().Round(0)
+	event.OccurredAt = at.UTC().Round(0)
 	event.Reason = reason
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(session.context), controllerTenureFinalizationLimit)
 	defer cancel()

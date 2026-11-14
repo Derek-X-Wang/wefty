@@ -34,6 +34,12 @@ type screenControlFixture struct {
 	sessionFailure                  error
 	sessionFailureKind              l1.ComputerTakeoverAuditEventKind
 	sessionAttempts                 chan struct{}
+	// holdInput, when set, holds the next AI agent screen_input write until
+	// its request context ends, and is closed when that write starts. The
+	// held write then returns holdInputOutcome: "" the context error,
+	// "outage" an L1 outage, "stored" a stored event.
+	holdInput        chan struct{}
+	holdInputOutcome string
 }
 
 func (f *screenControlFixture) AuthorizeSeatScreen(_ context.Context, id string, r l1.SeatScreenAuthorityInput) (l1.SeatScreenAuthority, error) {
@@ -74,8 +80,25 @@ func (f *screenControlFixture) AuthorizeSeatScreen(_ context.Context, id string,
 	f.mu.Unlock()
 	return l1.SeatScreenAuthority{SeatCopyAuthority: l1.SeatCopyAuthority{Place: place, Generation: generation}, ReleaseNote: note}, nil
 }
-func (f *screenControlFixture) RecordSeatScreenEvent(_ context.Context, _ string, r l1.SeatScreenEventRequest) (l1.SeatScreenEventReceipt, error) {
+func (f *screenControlFixture) RecordSeatScreenEvent(ctx context.Context, _ string, r l1.SeatScreenEventRequest) (l1.SeatScreenEventReceipt, error) {
 	f.mu.Lock()
+	if hold := f.holdInput; hold != nil && r.Event.Kind == l1.SeatEventScreenInput {
+		f.holdInput = nil
+		outcome := f.holdInputOutcome
+		if outcome == "stored" {
+			f.events = append(f.events, r.Event)
+		}
+		f.mu.Unlock()
+		close(hold)
+		<-ctx.Done()
+		switch outcome {
+		case "stored":
+			return l1.SeatScreenEventReceipt{Event: r.Event}, nil
+		case "outage":
+			return l1.SeatScreenEventReceipt{}, &ProtocolError{StatusCode: http.StatusServiceUnavailable, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "L1 outage", Retryable: true}}
+		}
+		return l1.SeatScreenEventReceipt{}, fmt.Errorf("record screen input: %w", ctx.Err())
+	}
 	defer f.mu.Unlock()
 	if strings.HasSuffix(r.Event.SeatID, "1") && r.Event.Kind == l1.SeatEventControlTaken && f.takeFailure != nil {
 		var protocol *ProtocolError
@@ -123,6 +146,7 @@ type screenRuntimeFixture struct {
 	hidePlaceOne       bool
 	changedObservation bool
 	endpointLookup     bool
+	onDriver           func(humanDriving bool)
 }
 
 func (f *screenRuntimeFixture) ObserveComputerSeats(_ context.Context, r ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error) {
@@ -159,6 +183,9 @@ func (f *screenRuntimeFixture) DialSeatEndpoint(ctx context.Context, r ocihelper
 func (f *screenRuntimeFixture) SetSeatDriver(_ context.Context, r ocihelper.SetSeatDriverRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onDriver != nil {
+		f.onDriver(r.HumanDriving)
+	}
 	generation := f.generation
 	if generation == 0 {
 		generation = 1
@@ -289,6 +316,223 @@ func TestSeatScreenFrontDoorPersonWinsOnlyOwnSeat(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if runtime.drivers[1] || runtime.drivers[2] {
 		t.Fatalf("driver signal=%v", runtime.drivers)
+	}
+}
+
+// #1672: an AI agent input already admitted when a person takes control
+// fails with the typed person_driving refusal, not a retryable outage, both
+// when the take breaks its screen_input write and when the take lands after
+// that write but before the upgrade. An outage the take did not cause keeps
+// its own error. control_taken carries the time the control door switched,
+// not the later time its write reached L1.
+func TestSeatScreenTakeRefusesInFlightInputAndStampsSwitchTime(t *testing.T) {
+	for _, tc := range []struct {
+		name, outcome string
+		status        int
+		code          contract.ErrorCode
+		message       string
+	}{
+		{name: "take cancels the input write", outcome: "", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
+		{name: "take lands after the input write, before the upgrade", outcome: "stored", status: http.StatusConflict, code: "person_driving", message: "a person is driving"},
+		{name: "an outage keeps its own error", outcome: "outage", status: http.StatusServiceUnavailable, code: contract.ErrorUnavailable, message: "L1 outage"},
+		// The documented limit: past the final door check the stream is
+		// open, and a take then ends it as a transport failure.
+		{name: "take lands after the final door check", outcome: "opened", status: http.StatusSwitchingProtocols},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testSeatScreenTakeDuringInput(t, tc.outcome, tc.status, tc.code, tc.message)
+		})
+	}
+}
+
+func testSeatScreenTakeDuringInput(t *testing.T, outcome string, status int, code contract.ErrorCode, message string) {
+	fixture, cache, _, _, oldServer, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+	oldServer.Close()
+	snapshot := policySnapshot(t, fixture.clock.Now(), 1, 2, []l1.ComputerPolicyAdmin{{FabricID: identity.FabricID, UserID: identity.UserID}})
+	if _, err := cache.Install(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	var switchedAt time.Time
+	runtime := &screenRuntimeFixture{view: newComputerBackend(t, computerBackendOptions{}), control: newComputerBackend(t, computerBackendOptions{rfbHandshake: true}), drivers: map[int]bool{}}
+	runtime.onDriver = func(humanDriving bool) {
+		if !humanDriving || !switchedAt.IsZero() {
+			return
+		}
+		// The door already refuses AI agent input here. Move only the wall
+		// clock, so any later stamp differs from the switch time.
+		fixture.clock.mu.Lock()
+		switchedAt = fixture.clock.wall
+		fixture.clock.wall = fixture.clock.wall.Add(time.Second)
+		fixture.clock.mu.Unlock()
+	}
+	defer runtime.view.Close()
+	defer runtime.control.Close()
+	control := &screenControlFixture{}
+	entered := make(chan struct{})
+	var beforeUpgrade func(context.Context)
+	if outcome == "opened" {
+		beforeUpgrade = func(ctx context.Context) {
+			close(entered)
+			<-ctx.Done()
+		}
+	} else {
+		control.holdInput, control.holdInputOutcome = entered, outcome
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	handler, err := newSeatScreenHandler(seatScreenConfig{ctx: ctx, fabric: fixture.identity, authorizer: cache, clock: fixture.clock, runtime: runtime, control: control, fatal: func(error) { cancel() }, beforeUpgrade: beforeUpgrade, computer: "computer-1", storage: "storage-1", storageGeneration: 1, authority: ocihelper.AttemptAuthority{NodeID: "node-1", BootSessionID: "boot-1", JobID: "job-1", AttemptID: "attempt-1", FencingToken: "fence-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	door := newSeatFrontDoor(fixture.identity)
+	registration, err := door.register(ctx, "computer-1", "attempt-1", handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registration.close()
+	one := "seat_00000000000000000000000000000001"
+	if err = registration.bind([]string{one}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(door)
+	defer server.Close()
+	dial := func(kind, credential string) (*websocket.Conn, *http.Response, error) {
+		headers := http.Header{}
+		if credential != "" {
+			headers.Set(l1.SeatCredentialHeader, credential)
+		}
+		return websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/seats/"+one+"/"+kind, &websocket.DialOptions{Subprotocols: []string{"binary"}, HTTPHeader: headers})
+	}
+	person, response, err := dial("person/websockify", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer person.CloseNow()
+	if _, _, err = person.Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	type dialResult struct {
+		conn  *websocket.Conn
+		reply *http.Response
+		err   error
+	}
+	inFlight := make(chan dialResult, 1)
+	go func() {
+		conn, reply, err := dial("screen/input", one)
+		inFlight <- dialResult{conn, reply, err}
+	}()
+	testwait.Receive(t, "in-flight AI agent input admission", entered)
+
+	token := response.Header.Get(computerControlTokenHeader)
+	if status := postComputerControl(t, server.URL, "/v1/seats/"+one+"/person"+computerControlTakePath, token); status != 200 {
+		t.Fatalf("take status=%d", status)
+	}
+	got := testwait.Receive(t, "in-flight AI agent input refusal", inFlight)
+	if status == http.StatusSwitchingProtocols {
+		if got.err != nil || got.conn == nil {
+			t.Fatalf("open input stream: %v", got.err)
+		}
+		defer got.conn.CloseNow()
+		var readErr error
+		for readErr == nil {
+			_, _, readErr = got.conn.Read(ctx)
+		}
+		if ctx.Err() != nil || websocket.CloseStatus(readErr) != -1 {
+			t.Fatalf("open input stream after take: %v (want a transport failure)", readErr)
+		}
+	} else if got.conn != nil {
+		got.conn.CloseNow()
+		t.Fatal("in-flight AI agent input survived take")
+	} else if got.err == nil || got.reply == nil || got.reply.StatusCode != status {
+		t.Fatalf("in-flight input: %v %+v", got.err, got.reply)
+	}
+	if status != http.StatusSwitchingProtocols {
+		var failure contract.ErrorResponse
+		decodeErr := json.NewDecoder(got.reply.Body).Decode(&failure)
+		got.reply.Body.Close()
+		if decodeErr != nil || failure.Error.Code != code || failure.Error.Message != message || failure.Error.Retryable != (status != http.StatusConflict) {
+			t.Fatalf("in-flight failure=%+v decode=%v", failure, decodeErr)
+		}
+	}
+
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	var taken *l1.SeatLogEvent
+	for i := range control.events {
+		if control.events[i].Kind == l1.SeatEventControlTaken {
+			taken = &control.events[i]
+		}
+	}
+	if switchedAt.IsZero() || taken == nil || taken.Audit == nil {
+		t.Fatalf("switch=%v control_taken=%+v", switchedAt, taken)
+	}
+	want := switchedAt.UTC().Round(0)
+	if !taken.OccurredAt.Equal(want) || !taken.Audit.OccurredAt.Equal(want) {
+		t.Fatalf("control_taken at %v (audit %v), want switch time %v", taken.OccurredAt, taken.Audit.OccurredAt, want)
+	}
+}
+
+// #1672: only the take's own cancellation, observed on the request's
+// effective context, becomes person_driving.
+func TestSeatInputFailureKeepsCausesTheTakeDidNotMake(t *testing.T) {
+	type contexts struct {
+		admitted       context.Context
+		take           context.CancelCauseFunc
+		effective      context.Context
+		cancelLifetime context.CancelFunc
+	}
+	fresh := func() contexts {
+		admitted, take := context.WithCancelCause(context.Background())
+		effective, cancelLifetime := context.WithCancel(admitted)
+		t.Cleanup(func() { take(nil); cancelLifetime() })
+		return contexts{admitted, take, effective, cancelLifetime}
+	}
+	outage := &ProtocolError{StatusCode: http.StatusServiceUnavailable, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "L1 outage", Retryable: true}}
+	canceled := fmt.Errorf("record screen input: %w", context.Canceled)
+
+	c := fresh()
+	c.take(errSeatPersonDriving)
+	if got := seatInputFailure(c.effective, canceled); got != errSeatPersonDriving {
+		t.Fatalf("take cancellation = %v, want person_driving", got)
+	}
+	if got := seatInputFailure(c.effective, outage); got != outage {
+		t.Fatalf("outage after a take = %v, want the outage", got)
+	}
+
+	c = fresh()
+	c.cancelLifetime()
+	c.take(errSeatPersonDriving)
+	if got := seatInputFailure(c.effective, canceled); got != canceled {
+		t.Fatalf("Seat lifetime cancellation before a take = %v, want its own error", got)
+	}
+
+	c = fresh()
+	if got := seatInputFailure(c.effective, canceled); got != canceled {
+		t.Fatalf("no take = %v, want its own error", got)
+	}
+
+	var gate seatScreenGate
+	ctx, finish, err := gate.admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer finish()
+	effective, cancelLifetime := context.WithCancel(ctx)
+	defer cancelLifetime()
+	if err = gate.open(effective); err != nil {
+		t.Fatalf("open with no take = %v", err)
+	}
+	cancelLifetime()
+	if err = gate.open(effective); !errors.Is(err, context.Canceled) || errors.Is(err, errSeatPersonDriving) {
+		t.Fatalf("open after a Seat lifetime cancellation = %v, want its own error", err)
+	}
+	gate.mu.Lock()
+	gate.driving = true
+	gate.mu.Unlock()
+	live, finishLive, _ := (&seatScreenGate{}).admit(context.Background())
+	defer finishLive()
+	if err = gate.open(live); err != errSeatPersonDriving {
+		t.Fatalf("open while the door is closing = %v, want person_driving", err)
 	}
 }
 
