@@ -428,8 +428,10 @@ exit code. A stopped or lost watch reports `queued` or `running` when that
 status is known, and `observation_lost` otherwise. Terminal cancellation reports
 `cancelled`. The Run state itself stays `failed`; `inspect` and `runs list`
 show it as `failed (cancelled)`, and their JSON is unchanged. Right after
-`wefty cancel`, a Run that is still stopping shows `running (cancelling)`;
-the cancel was accepted, so do not cancel again.
+`wefty cancel`, a Run that is still stopping shows `<status> (cancelling)`,
+for example `running (cancelling)`; the cancel was accepted, so do not cancel
+again. `<status> (cancel refused)` means it was not accepted; the reason
+column says why.
 Exec exits 0 on pass, 10 on run failure, and 13 when infrastructure or lost
 observation prevents a command verdict. Wrapper liveness appears once per
 minute, so a quiet command does not hit the no-output limit. It proves the
