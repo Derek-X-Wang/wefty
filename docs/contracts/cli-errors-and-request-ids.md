@@ -446,7 +446,13 @@ helper's separate 60-second endpoint deadline still applies.
 
 The switch at *off* refuses before any dialog or start with `seat_host_off` and
 `the host VM is off`; *on demand* permits the cold start and *always on* keeps
-its running behavior. Idle shutdown itself is never a start-failure verdict;
+its running behavior. Turning the switch *off* under a running Computer
+suppresses its Attempt's completion, so L1 ends that Attempt's Seats when the
+lease expires while the node still reports `oci_intent_disabled`: a Live Seat
+ends with `the owner turned the host VM off`, and a Seat still starting is
+refused with `seat_host_off` and the same message. A host VM restart keeps
+OCI intent on, so its Seats still end with `the Computer restarted` (#1671).
+Idle shutdown itself is never a start-failure verdict;
 its pending request retains the same Seat ID and waits through recovery.
 Refusals use the common
 JSON error document on stderr, with `details.seat_id` and these codes:
