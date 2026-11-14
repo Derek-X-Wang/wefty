@@ -213,6 +213,12 @@ func TestCancelSlowForcedStopKeepsLeaseAndResult(t *testing.T) {
 			// TestHeartbeatCancelKeepsRenewingThroughSlowStop; here only
 			// renewal can deliver it.
 			heartbeatInterval := time.Hour
+			// The node has free slots, so it polls for claims all through the
+			// forced stop, and each poll takes the L1 write lock. A 5 ms poll
+			// under -race kept that lock so busy that renewals waited about
+			// 3 s for it and the 2 s lease expired (#1654). The poll speed
+			// only delays the first claim.
+			claimInterval := 250 * time.Millisecond
 			renewer := newRecordingDeadmanRenewer()
 			nodeAgent, err := New(Config{
 				Fabric: network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
@@ -226,7 +232,7 @@ func TestCancelSlowForcedStopKeepsLeaseAndResult(t *testing.T) {
 					return OCIIntentObservation{Enabled: true, Revision: 1}, nil
 				},
 				WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime}, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(),
-				HeartbeatInterval: heartbeatInterval, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 100 * time.Millisecond, Logf: t.Logf,
+				HeartbeatInterval: heartbeatInterval, ClaimInterval: claimInterval, RenewalInterval: 100 * time.Millisecond, Logf: t.Logf,
 			})
 			if err != nil {
 				t.Fatal(err)
