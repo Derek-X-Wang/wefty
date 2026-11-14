@@ -114,9 +114,10 @@ func queuedRunReasons(ctx context.Context, clients *apiClients, runIDs []string)
 	return reasons
 }
 
-// maxAnnotatedQueuedRuns bounds how many queued runs one listing asks about.
-// Each is one execution read; a listing is a screenful, and the head of the
-// queue is where a stuck run shows.
+// maxAnnotatedQueuedRuns bounds how many queued runs one listing asks about,
+// and separately how many live runs it reads for cancellation labels. Each is
+// one read; a listing is a screenful, and the head of the queue is where a
+// stuck run shows.
 const maxAnnotatedQueuedRuns = 20
 
 // runListingRow is one `runs list --json` row: the ledger's summary, plus L1's
