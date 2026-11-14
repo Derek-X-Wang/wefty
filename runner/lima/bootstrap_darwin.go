@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,15 +32,7 @@ func InspectGuestSystemdVersion(ctx context.Context, instance, limactl string) (
 	if err != nil {
 		return 0, errors.New("cannot inspect Lima guest systemd version")
 	}
-	fields := strings.Fields(string(output))
-	if len(fields) < 2 || fields[0] != "systemd" {
-		return 0, errors.New("cannot parse Lima guest systemd version")
-	}
-	version, err := strconv.Atoi(fields[1])
-	if err != nil || version <= 0 {
-		return 0, errors.New("cannot parse Lima guest systemd version")
-	}
-	return version, nil
+	return parseGuestSystemdVersion(output)
 }
 
 func InspectGuestHelperServiceUnit(ctx context.Context, instance, limactl string) (string, error) {
@@ -104,13 +95,8 @@ func (installer guestHelperInstaller) install(ctx context.Context, config GuestH
 		if versionErr != nil {
 			return errors.New("cannot inspect Lima guest systemd version")
 		}
-		fields := strings.Fields(string(versionOutput))
-		if len(fields) < 2 || fields[0] != "systemd" {
-			return errors.New("cannot parse Lima guest systemd version")
-		}
-		config.SystemdVersion, err = strconv.Atoi(fields[1])
-		if err != nil {
-			return errors.New("cannot parse Lima guest systemd version")
+		if config.SystemdVersion, err = parseGuestSystemdVersion(versionOutput); err != nil {
+			return err
 		}
 	}
 	staging, err := os.MkdirTemp("", "wefty-lima-helper-*")
