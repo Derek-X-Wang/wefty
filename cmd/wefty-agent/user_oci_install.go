@@ -26,7 +26,7 @@ type proofDialogReceipt struct {
 
 // The boolean grants OCI startup for this process. A recorded refusal keeps the
 // process-only node agent alive and cannot cause a launchd dialog restart loop.
-func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expectedVersion string, prepare func(context.Context, limarunner.UserInstallConfig, string, string) error, dialog agent.SeatApprovalDialog, stopProof func(context.Context, limarunner.UserInstallConfig) error) (bool, error) {
+func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expectedVersion string, prepare userOCIPrepare, dialog agent.SeatApprovalDialog, stopProof func(context.Context, limarunner.UserInstallConfig) error) (bool, error) {
 	var c limarunner.UserInstallConfig
 	if err := limarunner.ReadUserInstallJSON(path, &c); err != nil {
 		return false, err
@@ -71,10 +71,12 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 		}
 		skipPrepare = err == nil && info.Mode().IsRegular()
 	}
+	observedSystemd := 0
 	if !skipPrepare {
 		log.Printf("per-user host VM bootstrap begin pid=%d at=%s", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
-		if err := prepare(ctx, c, nodeID, bootID); err != nil {
-			return false, err
+		var prepareErr error
+		if observedSystemd, prepareErr = prepare(ctx, c, nodeID, bootID); prepareErr != nil {
+			return false, prepareErr
 		}
 	}
 	intent, err := (limarunner.FileIntentSource{Path: c.IntentFile}).ReadIntent(ctx)
@@ -109,8 +111,11 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 
 	// Setup-oci owns later configuration changes. Bootstrap only creates the
 	// initial state; a node-agent restart must not replace the owner's values.
+	// The guest systemd facts are observations, not owner values: each real
+	// preparation records the policy it rendered (#1670).
 	if _, err := ocicontrol.ReadSetupState(c.SetupState); errors.Is(err, os.ErrNotExist) {
 		state := ocicontrol.SetupState{VMMemory: c.Sizing.Memory, VMCPUs: c.Sizing.CPUs, VMDisk: c.Sizing.Disk, VMType: "vz", HostMountRoot: c.MountRoot, ProbeDigest: c.Assets.ProbeDigest, MemoryCapacityBytes: capacity, MemoryReserveBytes: reserve}
+		withObservedGuestSystemd(&state, observedSystemd)
 		if err := ocicontrol.WriteSetupState(c.SetupState, state); err != nil {
 			return false, err
 		}
@@ -118,6 +123,8 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 			return false, err
 		}
 	} else if err != nil {
+		return false, err
+	} else if err := recordObservedGuestSystemd(c.SetupState, observedSystemd); err != nil {
 		return false, err
 	}
 	if !c.ProofDialog {
@@ -164,6 +171,44 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 	return approved, nil
 }
 
+// userOCIPrepare prepares the per-user host VM and returns the guest systemd
+// version its helper unit was rendered for; zero means it observed none.
+type userOCIPrepare func(context.Context, limarunner.UserInstallConfig, string, string) (int, error)
+
+func withObservedGuestSystemd(state *ocicontrol.SetupState, systemdVersion int) {
+	if systemdVersion > 0 {
+		state.SystemdVersion = systemdVersion
+		state.HelperRestartPolicy = limarunner.GuestHelperRestartPolicyName(systemdVersion)
+	}
+}
+
+// recordObservedGuestSystemd updates only the observed guest systemd facts in
+// the current and desired setup states. Doctor compares the current record
+// with the installed unit, and setup-oci carries it into the desired state.
+func recordObservedGuestSystemd(setupState string, systemdVersion int) error {
+	if systemdVersion <= 0 {
+		return nil
+	}
+	for _, path := range []string{setupState, ocicontrol.DesiredSetupStatePath(setupState)} {
+		state, err := ocicontrol.ReadSetupState(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		observed := state
+		withObservedGuestSystemd(&observed, systemdVersion)
+		if observed == state {
+			continue
+		}
+		if err := ocicontrol.WriteSetupState(path, observed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func userOCIPreparedPath(c limarunner.UserInstallConfig) string {
 	return filepath.Join(filepath.Dir(c.SetupState), "host-vm-prepared.json")
 }
@@ -173,7 +218,7 @@ func userOCIPreparedPath(c limarunner.UserInstallConfig) string {
 // cycle stops after the delete, the next node-agent start prepares the new
 // guest instead of skipping it. The interim Mac bootstrap keeps no helper
 // assets in the running agent, so it cannot rebuild a guest and refuses.
-func userOCIRecreateReinstall(path, nodeID, bootID string, prepare func(context.Context, limarunner.UserInstallConfig, string, string) error) (func(context.Context) error, error) {
+func userOCIRecreateReinstall(path, nodeID, bootID string, prepare userOCIPrepare) (func(context.Context) error, error) {
 	if path == "" {
 		return nil, &ocicontrol.ControlError{Code: ocicontrol.ErrorSetupRequired, Status: http.StatusPreconditionFailed,
 			Message: "host VM recreate refused: this node runs the interim Mac bootstrap, which cannot reinstall the guest helper in a new host VM; move to the per-user installation (wefty setup --oci-config) before recreating"}
@@ -194,7 +239,15 @@ func userOCIRecreateReinstall(path, nodeID, bootID string, prepare func(context.
 	if err := errors.Join(syncErr, root.Close()); err != nil {
 		return nil, err
 	}
-	return func(ctx context.Context) error { return prepare(ctx, c, nodeID, bootID) }, nil
+	// A new guest may carry a different systemd: record what the reinstall
+	// rendered so the setup-oci write after the cycle keeps it (#1670).
+	return func(ctx context.Context) error {
+		systemdVersion, err := prepare(ctx, c, nodeID, bootID)
+		if err != nil {
+			return err
+		}
+		return recordObservedGuestSystemd(c.SetupState, systemdVersion)
+	}, nil
 }
 
 // Registered is only a startup signal. Keep a receipt only after the local

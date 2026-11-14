@@ -31,7 +31,10 @@ func TestPerUserBootstrapUsesSameProcessAndNativeDialogOnce(t *testing.T) {
 	}
 	t.Setenv("LIMA_HOME", c.LimaHome)
 	prepares, dialogs := 0, 0
-	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error { prepares++; return nil }
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
+		prepares++
+		return 0, nil
+	}
 	dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
 		dialogs++
 		return agent.SeatApprovalApprove, nil
@@ -93,7 +96,10 @@ func TestPerUserProofRefusalIsDurableWithoutRestartDialog(t *testing.T) {
 			t.Setenv("LIMA_HOME", c.LimaHome)
 			dialogs, prepares, stops := 0, 0, 0
 			stopProof := func(context.Context, limarunner.UserInstallConfig) error { stops++; return nil }
-			prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error { prepares++; return nil }
+			prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
+				prepares++
+				return 0, nil
+			}
 			dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
 				dialogs++
 				return choice, nil
@@ -126,9 +132,9 @@ func TestPerUserProofDialogGetsFreshDeadlineAfterSlowBootstrap(t *testing.T) {
 		path := perUserProofTestConfig(t)
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
 		defer cancel()
-		prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error {
+		prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
 			time.Sleep(14*time.Minute + 59*time.Second) // Virtual clock, no wall-clock wait.
-			return nil
+			return 0, nil
 		}
 		dialog := agent.SeatApprovalDialogFunc(func(ctx context.Context, prompt agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
 			deadline, bounded := ctx.Deadline()
@@ -163,7 +169,7 @@ func TestPerUserProofRefusalStopFailureKeepsNodeProcessUp(t *testing.T) {
 	path := perUserProofTestConfig(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error { return nil }
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) { return 0, nil }
 	dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
 		cancel() // The completed bootstrap's context cannot cancel cleanup.
 		return agent.SeatApprovalDeny, nil
@@ -205,13 +211,13 @@ func TestOnDemandNodeRestartDoesNotBootstrapHostVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepares := 0
-	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error {
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
 		prepares++
 		folder := filepath.Join(config.LimaHome, config.Instance)
 		if err := os.MkdirAll(folder, 0700); err != nil {
-			return err
+			return 0, err
 		}
-		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+		return 0, os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
 	}
 	for range 2 {
 		allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil)
@@ -236,13 +242,13 @@ func TestPreparedReceiptDoesNotHideRemovedLimaInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepares := 0
-	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error {
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
 		prepares++
 		folder := filepath.Join(config.LimaHome, config.Instance)
 		if err := os.MkdirAll(folder, 0700); err != nil {
-			return err
+			return 0, err
 		}
-		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+		return 0, os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
 	}
 	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
 		t.Fatal(err)
@@ -273,16 +279,17 @@ func TestRecreateReinstallForgetsPreparedReceiptAndPreparesNewGuest(t *testing.T
 		t.Fatal(err)
 	}
 	var prepared []limarunner.UserInstallConfig
-	prepare := func(_ context.Context, c limarunner.UserInstallConfig, nodeID, bootID string) error {
+	prepare := func(_ context.Context, c limarunner.UserInstallConfig, nodeID, bootID string) (int, error) {
 		if nodeID != "node" || bootID != "boot" {
 			t.Fatalf("prepare identity = %q/%q", nodeID, bootID)
 		}
 		prepared = append(prepared, c)
 		folder := filepath.Join(c.LimaHome, c.Instance)
 		if err := os.MkdirAll(folder, 0700); err != nil {
-			return err
+			return 0, err
 		}
-		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+		// The recreated guest carries a newer systemd than the first one.
+		return 255 + 4*min(len(prepared)-1, 1), os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
 	}
 	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
 		t.Fatal(err)
@@ -307,6 +314,7 @@ func TestRecreateReinstallForgetsPreparedReceiptAndPreparesNewGuest(t *testing.T
 	if len(prepared) != 2 || prepared[1] != config {
 		t.Fatalf("reinstall preparations = %+v", prepared)
 	}
+	assertRecordedGuestSystemd(t, config.SetupState, 259)
 	// The instance lima.yaml exists again, but without the receipt the next
 	// start still prepares, which repairs a cycle interrupted after delete.
 	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
@@ -319,12 +327,103 @@ func TestRecreateReinstallForgetsPreparedReceiptAndPreparesNewGuest(t *testing.T
 
 func TestRecreateReinstallRefusesInterimMacBootstrap(t *testing.T) {
 	called := false
-	reinstall, err := userOCIRecreateReinstall("", "node", "boot", func(context.Context, limarunner.UserInstallConfig, string, string) error {
+	reinstall, err := userOCIRecreateReinstall("", "node", "boot", func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
 		called = true
-		return nil
+		return 0, nil
 	})
 	var control *ocicontrol.ControlError
 	if reinstall != nil || !errors.As(err, &control) || control.Code != ocicontrol.ErrorSetupRequired || !strings.Contains(err.Error(), "cannot reinstall the guest helper") || called {
 		t.Fatalf("interim bootstrap recreate = %v, %v, called=%t", reinstall != nil, err, called)
+	}
+}
+
+func assertRecordedGuestSystemd(t *testing.T, setupState string, systemdVersion int) {
+	t.Helper()
+	for _, path := range []string{setupState, ocicontrol.DesiredSetupStatePath(setupState)} {
+		state, err := ocicontrol.ReadSetupState(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.SystemdVersion != systemdVersion || state.HelperRestartPolicy != limarunner.GuestHelperRestartPolicyName(systemdVersion) {
+			t.Fatalf("%s recorded systemd_version=%d helper_restart_policy=%q, want %d", filepath.Base(path), state.SystemdVersion, state.HelperRestartPolicy, systemdVersion)
+		}
+	}
+}
+
+func helperRestartPolicyFinding(t *testing.T, setupState string, installedSystemd int, unit []byte) ocicontrol.DiagnosticFinding {
+	t.Helper()
+	report := ocicontrol.BuildDoctor(t.Context(), ocicontrol.DoctorConfig{
+		SetupStatePath:             setupState,
+		InstalledSystemdVersion:    func(context.Context) (int, error) { return installedSystemd, nil },
+		InstalledHelperServiceUnit: func(context.Context) (string, error) { return string(unit), nil },
+	})
+	for _, item := range report.Findings {
+		if item.Check == "helper-restart-policy" {
+			return item
+		}
+	}
+	t.Fatalf("helper-restart-policy finding missing: %+v", report.Findings)
+	return ocicontrol.DiagnosticFinding{}
+}
+
+// A fresh per-user proof install records the helper restart policy that its
+// bootstrap rendered, so the first doctor finds no drift (#1670). Before the
+// fix the first state carried systemd_version=0 and an empty policy name.
+func TestFreshPerUserInstallRecordsRenderedHelperRestartPolicy(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	const guestSystemd = 259
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
+		return guestSystemd, nil
+	}
+	dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
+		return agent.SeatApprovalApprove, nil
+	})
+	if allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, dialog, nil); err != nil || !allowed {
+		t.Fatalf("allowed=%t err=%v", allowed, err)
+	}
+	assertRecordedGuestSystemd(t, config.SetupState, guestSystemd)
+	unit := limarunner.RenderGuestHelperServiceUnit(limarunner.GuestHelperInstallConfig{HostMountRoot: config.MountRoot, GuestUID: 501, SystemdVersion: guestSystemd})
+	if item := helperRestartPolicyFinding(t, config.SetupState, guestSystemd, unit); item.Outcome != ocicontrol.DiagnosticOK || item.Code != "oci_helper_restart_policy_current" {
+		t.Fatalf("fresh install doctor = %+v", item)
+	}
+	// Real drift still reports: the guest now runs a different systemd than
+	// the one the installed unit and the durable record were rendered for.
+	if item := helperRestartPolicyFinding(t, config.SetupState, guestSystemd+1, unit); item.Outcome != ocicontrol.DiagnosticFailed || item.Code != "oci_helper_restart_policy_drift" {
+		t.Fatalf("changed guest systemd doctor = %+v", item)
+	}
+}
+
+// An install whose state was written before #1670 heals on its next
+// preparation, which changes only the observed guest facts.
+func TestPerUserPrepareRecordsGuestSystemdWithoutReplacingOwnerValues(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	owner := ocicontrol.SetupState{VMMemory: "6GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: config.MountRoot, ProbeDigest: "sha256:test"}
+	for _, state := range []string{config.SetupState, ocicontrol.DesiredSetupStatePath(config.SetupState)} {
+		if err := ocicontrol.WriteSetupState(state, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) { return 259, nil }
+	dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
+		return agent.SeatApprovalApprove, nil
+	})
+	if allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, dialog, nil); err != nil || !allowed {
+		t.Fatalf("allowed=%t err=%v", allowed, err)
+	}
+	assertRecordedGuestSystemd(t, config.SetupState, 259)
+	saved, err := ocicontrol.ReadSetupState(config.SetupState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.VMMemory != "6GiB" {
+		t.Fatalf("node startup replaced the owner's saved setup-oci state: %+v", saved)
 	}
 }

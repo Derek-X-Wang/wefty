@@ -69,7 +69,10 @@ func TestFreshPerUserBootstrapRegistersSeatRequestsWithoutRestart(t *testing.T) 
 	go func() {
 		done <- runWithUserOCIPrepare(ctx, func(ctx context.Context, path, nodeID, bootID string) (bool, error) {
 			return prepareInstalledUserOCI(ctx, path, nodeID, bootID, "test",
-				func(context.Context, limarunner.UserInstallConfig, string, string) error { prepares++; return nil },
+				func(context.Context, limarunner.UserInstallConfig, string, string) (int, error) {
+					prepares++
+					return 0, nil
+				},
 				agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
 					return agent.SeatApprovalApprove, nil
 				}), nil)

@@ -101,7 +101,9 @@ type userInstallOps struct {
 
 // PrepareUserInstall runs in the installed node agent, before its normal OCI
 // boot barrier. setup itself only writes files and loads the login service.
-func PrepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID string) error {
+// It returns the guest systemd version the helper unit was rendered for, or
+// zero when disabled intent stopped it before the guest was observed.
+func PrepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID string) (int, error) {
 
 	var startedAt time.Time
 	run := func(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -118,45 +120,45 @@ func PrepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 		CheckFreeSpace: func() error { return CheckHostVMFreeSpace(c.LimaHome, c.HostVMMinimumFreeBytes) },
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return prepareUserInstall(ctx, c, nodeID, bootID, userInstallOps{run: run, ensure: supervisor.Ensure, install: InstallGuestHelper, hostStartEnd: func() time.Time { return startedAt }})
 }
 
-func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID string, ops userInstallOps) error {
+func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID string, ops userInstallOps) (int, error) {
 	if os.Getenv("LIMA_HOME") != c.LimaHome {
-		return errors.New("per-user host VM LIMA_HOME does not match configuration")
+		return 0, errors.New("per-user host VM LIMA_HOME does not match configuration")
 	}
 	if err := c.Validate(); err != nil {
-		return err
+		return 0, err
 	}
 	intent, err := (FileIntentSource{Path: c.IntentFile}).ReadIntent(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !intent.Enabled {
-		return nil
+		return 0, nil
 	}
 	if err := os.MkdirAll(c.LimaHome, 0700); err != nil {
-		return err
+		return 0, err
 	}
 	// LIMA_HOME is set by the rendered LaunchAgent, never by a host-wide change.
 	payload, err := ops.run(ctx, "limactl", "list", "--json")
 	if err != nil {
-		return fmt.Errorf("inspect per-user host VM: %w", err)
+		return 0, fmt.Errorf("inspect per-user host VM: %w", err)
 	}
 	_, err = decodeInstanceState(payload, c.Instance)
 	if err != nil {
 		var absent *instanceAbsentError
 		if !errors.As(err, &absent) {
-			return err
+			return 0, err
 		}
 		if _, err = ops.run(ctx, "limactl", "create", "--tty=false", "--name="+c.Instance, c.TemplatePath); err != nil {
-			return fmt.Errorf("create per-user host VM: %w", err)
+			return 0, fmt.Errorf("create per-user host VM: %w", err)
 		}
 	}
 	if err := ops.ensure(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	hostStarted := time.Now().UTC()
 	if ops.hostStartEnd != nil {
@@ -167,24 +169,34 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 	}
 	name, err := guest("id", "-un")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	uidBytes, err := guest("id", "-u")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	uid, err := strconv.ParseUint(strings.TrimSpace(string(uidBytes)), 10, 32)
 	if err != nil || uid == 0 {
-		return errors.New("guest login UID must be positive")
+		return 0, errors.New("guest login UID must be positive")
+	}
+	// Render the unit for the version this call observes and return it, so
+	// the durable setup state records the policy that was installed (#1670).
+	versionOutput, err := guest("systemctl", "--version")
+	if err != nil {
+		return 0, errors.New("cannot inspect Lima guest systemd version")
+	}
+	systemdVersion, err := parseGuestSystemdVersion(versionOutput)
+	if err != nil {
+		return 0, err
 	}
 	capacity, reserve, _ := DefaultMacComputerCapacity(c.Sizing)
 	socket, _ := HelperSocketPath(c.LimaHome, c.Instance)
 	helper := GuestHelperInstallConfig{MinimumFreeBytes: c.HostVMMinimumFreeBytes, Instance: c.Instance, GuestUser: strings.TrimSpace(string(name)), GuestUID: uint32(uid),
 		HelperBinary: c.Assets.LinuxHelper, ExpectedVersion: c.Assets.HelperVersion, ExpectedChecksum: c.Assets.HelperChecksum,
 		HostMountRoot: c.MountRoot, HelperSocket: socket, ProbeArchive: c.Assets.ProbeArchive, ProbeReference: c.Assets.ProbeReference, ProbeDigest: c.Assets.ProbeDigest,
-		NodeID: nodeID, BootSessionID: bootID, MemoryCapacityBytes: capacity, MemoryReserveBytes: reserve}
+		NodeID: nodeID, BootSessionID: bootID, MemoryCapacityBytes: capacity, MemoryReserveBytes: reserve, SystemdVersion: systemdVersion}
 	if err := ops.install(ctx, helper); err != nil {
-		return err
+		return 0, err
 	}
 	readBudget := ops.guestReadBudget
 	if readBudget == 0 {
@@ -197,7 +209,7 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 		}
 		return release, nil
 	}, c.LimaHome, c.Instance, time.Now()); err != nil {
-		return err
+		return 0, err
 	}
 	if c.Instance == "wefty-proof" {
 		var start *time.Time
@@ -210,18 +222,18 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 			HelperInstalled time.Time  `json:"helper_installed"`
 		}{os.Getpid(), start, time.Now().UTC()})
 		if err != nil {
-			return err
+			return 0, err
 		}
 		root, err := os.OpenRoot(filepath.Dir(c.SetupState))
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer root.Close()
 		if err := durable.WriteFile(root, "user-install-timing.json", append(receipt, '\n'), 0600); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return systemdVersion, nil
 }
 
 // Successful Lima warnings belong on stderr, never in the JSON inventory.
