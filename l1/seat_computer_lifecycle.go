@@ -3,7 +3,32 @@ package l1
 import (
 	"context"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
+
+// seatEndHostVMOff names the owner's off switch. The off switch suppresses the
+// Computer attempt's completion, so L1 learns of the end only at lease expiry.
+const seatEndHostVMOff = "the owner turned the host VM off"
+
+// endHostVMOffSeats ends a lost Computer attempt's Seats with the off-switch
+// reason when its Node reports durable OCI intent off. A host VM restart keeps
+// intent on and delivers its completion, so it keeps "the Computer restarted".
+func endHostVMOffSeats(ctx context.Context, q seatApprovalQuery, nodeID, jobID, attemptID string, now time.Time) error {
+	computer, err := computerForJob(ctx, q, jobID)
+	if err != nil || computer == "" {
+		return err
+	}
+	var off bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id=? AND capability_reason_code=?
+ AND json_extract(capabilities_json,'$."kind:oci"') IS NOT 1)`, nodeID, contract.CapabilityReasonOCIIntentDisabled).Scan(&off); err != nil {
+		return err
+	}
+	if !off {
+		return nil
+	}
+	return endComputerSeats(ctx, q, computer, attemptID, seatEndHostVMOff, now)
+}
 
 // Authority loss and Seat ending commit with the Computer intent. Attempt
 // completion is scoped to its old Seats, never to a replacement's new Seats.

@@ -5304,6 +5304,9 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 		return internalError(err, "read attempt expiry result")
 	}
 	if changed > 0 {
+		if err := endHostVMOffSeats(ctx, tx, attempt.nodeID, attempt.jobID, attempt.attemptID, now); err != nil {
+			return internalError(err, "end Seats of a host VM turned off")
+		}
 		var jobState contract.JobState
 		var desiredState sql.NullString
 		var leaseLossCount sql.NullInt64

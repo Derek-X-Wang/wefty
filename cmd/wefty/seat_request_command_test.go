@@ -38,6 +38,7 @@ func TestSeatRequestRefusalsAndCredentialFromRealBinary(t *testing.T) {
 		{"denied by the owner", "seat_denied"},
 		{"dedicated Computer cap reached", "seat_dedicated_cap"},
 		{"the host VM is off", "seat_host_off"},
+		{"the owner turned the host VM off", "seat_host_off"},
 		{"Computer failed to start", "seat_start_failed"},
 	}
 	for _, c := range cases {
