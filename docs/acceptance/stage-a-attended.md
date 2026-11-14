@@ -50,9 +50,11 @@ and clicks every dialog. ORCHESTRATOR runs every observer and capture.
   absolute paths to `sandbox.filesystem.allowWrite`. This uses Claude Code's
   sandbox network allowance for local connections while leaving internet domains
   unallowed; it does not select exact local ports. Keep permission prompts denied
-  for other domains and for unsandboxed execution. If the installed harness also
-  needs an explicit local-network permission, grant only that sandbox permission,
-  retain it, and run no unsandboxed fallback.
+  for other domains and for unsandboxed execution. `allowedDomains` covers only
+  proxied traffic: direct loopback connections to the proof L1/L3 also need
+  `sandbox.network.allowLocalBinding=true` (macOS). Without it the first Seat
+  request fails with exit 13 and no Seat is created. Grant only that sandbox
+  permission, retain it, and run no unsandboxed fallback.
 
   ORCHESTRATOR saves both harness versions and their actual effective policy,
   added/default write roots, loopback ports, internet allowance/deviation, and
@@ -116,7 +118,11 @@ Never reuse a Computer name: removed Computers retain their names.
 ## Fixed-clock timeline
 
 Offsets below are a nominal schedule; record actual anchors and shift later
-work after delays. A clock is never restarted to hide a failed case.
+work after delays. A clock is never restarted to hide a failed case. The
+schedule assumes OWNER stays present from W to W+60. If OWNER must pause,
+ORCHESTRATOR takes the W+59 capture first when it is near, and records that
+live Seats (such as D) can expire during the pause; a replacement Seat after
+the pause is a recorded deviation.
 
 | Attended minute | Action / fixed clock |
 |---|---|
@@ -214,7 +220,10 @@ OWNER types this exact installation command:
 ```
 
 Expected: only the three proof labels, private L1/L3 ports 48111/48112 and
-private paths. OWNER approves the initial **proof fixture** dialog. This is
+private paths. The **proof fixture** dialog does not appear during setup: the
+node agent shows it after it boots the host VM, typically about 5 minutes
+later. Wait for it; do not treat its absence during setup as a failure.
+OWNER approves the initial proof fixture dialog. This is
 not an L1 Seat approval and does not bootstrap an administrator. Do block 3
 next. Undo: block 11; denied/missing/failed proof dialog means stop, no retry.
 
@@ -464,8 +473,11 @@ commands. ORCHESTRATOR starts the SC-2 token interval immediately before step 1:
 "$HOME/.local/share/wefty-proof/tools/w" seat screenshot SEAT_D -o "$HOME/.local/share/wefty-proof/evidence/stage-a/sc2-start.png"
 ```
 
-If fullscreen Chromium hides the address bar, PRIMARY first sends `F11`, then
-`ctrl+l`; keep that call in the interval. Select actual pixel coordinates from
+The Seat browser starts with `--start-fullscreen`, so the address bar is
+hidden and keys reach the window only after it has focus. PRIMARY first clicks
+an empty area of the page, then sends `ctrl+t` (a new window tab with an
+address bar; `F11` did not reveal it in the 2026-11-14 run), then `ctrl+l`;
+keep these calls in the interval. Select actual pixel coordinates from
 the 1280×800 screenshots; do not assume browser-chrome offsets.
 
 | Step | PRIMARY's screen action | Expected state |
@@ -485,7 +497,10 @@ PRIMARY uses only the absolute wrapper with `seat click SEAT_D X Y`,
 `seat type SEAT_D TEXT`, `seat key SEAT_D COMBO`, and `seat screenshot`;
 ORCHESTRATOR retains the original AI agent tool transcript/results. Give every
 screenshot an explicit unique path under the Stage A evidence folder (`-o`
-for screenshot alone, or `--screenshot FILE` with input). No DOM or
+for screenshot alone, or `--screenshot FILE` with input). The wrapper refuses
+to overwrite an existing file, so a retried attempt uses new names. An input's
+`--screenshot` can show the screen before a navigation or new tab finishes;
+after navigation keys, confirm with a separate `seat screenshot -o`. No DOM or
 Mac browser tools. Include corrections and screenshots in time/tokens. End
 SC-2's interval when step 10 and its final screen observation finish; exclude
 initial kit copy and final copy-out equally for both methods.
