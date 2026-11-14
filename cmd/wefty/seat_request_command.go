@@ -293,7 +293,7 @@ func seatCallRefusal(id, reason string) *apiResponseError {
 		code = seatErrorNoAnswer
 	case reason == "denied by the owner":
 		code = seatErrorDenied
-	case reason == "the host VM is off":
+	case reason == "the host VM is off" || reason == "the owner turned the host VM off":
 		code = seatErrorHostOff
 	}
 	return &apiResponseError{APIError: contract.APIError{Code: code, Message: reason, Retryable: code == seatErrorRoomFull || code == seatErrorNoAnswer || code == seatErrorNodeUnavailable, Details: map[string]any{"seat_id": id}}}
