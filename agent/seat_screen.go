@@ -95,6 +95,34 @@ func (g *seatScreenGate) admit(ctx context.Context) (context.Context, func(), er
 		g.mu.Unlock()
 	}, nil
 }
+
+// open is an admitted input stream's last refusal point before the upgrade.
+// Under the gate lock a take has either not begun, and the stream opens, or
+// has closed the door, and the stream gets person_driving. An earlier
+// cancellation of another cause keeps its own error.
+func (g *seatScreenGate) open(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return seatInputFailure(ctx, err)
+	}
+	if g.driving {
+		return errSeatPersonDriving
+	}
+	return nil
+}
+
+// seatInputFailure reports person_driving only for a failure that a take
+// caused: ctx, the request's effective context, was first cancelled by the
+// take, and err is that cancellation. An outage, or a cancellation of
+// another cause such as the Seat's lifetime, keeps its own error (#1672).
+func seatInputFailure(ctx context.Context, err error) error {
+	if errors.Is(context.Cause(ctx), errSeatPersonDriving) && (errors.Is(err, context.Canceled) || errors.Is(err, errSeatPersonDriving)) {
+		return errSeatPersonDriving
+	}
+	return err
+}
+
 func (g *seatScreenGate) block(ctx context.Context) error {
 	g.mu.Lock()
 	g.driving = true
@@ -499,26 +527,17 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	finish := func() {}
-	fail := func(err error) { writeSeatScreenError(w, err) }
 	if input {
 		ctx, finish, err = seat.gate.admit(ctx)
 		if err != nil {
 			writeSeatScreenError(w, err)
 			return
 		}
-		admitted := ctx
-		fail = func(err error) {
-			// An input that lost the control door to a person's take
-			// fails because of that take, whatever the cancel broke.
-			if cause := context.Cause(admitted); errors.Is(cause, errSeatPersonDriving) {
-				err = cause
-			}
-			writeSeatScreenError(w, err)
-		}
 	}
 	defer finish()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	fail := func(err error) { writeSeatScreenError(w, seatInputFailure(ctx, err)) }
 	stopSeat := context.AfterFunc(seat.ctx, cancel)
 	defer stopSeat()
 	kind := workloadrunner.AttemptEndpointView
@@ -538,6 +557,10 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if input {
 		if _, err = h.record(ctx, id, l1.SeatLogEvent{EventID: rand.Text(), Kind: l1.SeatEventScreenInput, Reason: "ai_agent"}); err != nil {
 			fail(err)
+			return
+		}
+		if err = seat.gate.open(ctx); err != nil {
+			writeSeatScreenError(w, err)
 			return
 		}
 	}

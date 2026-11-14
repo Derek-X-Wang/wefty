@@ -268,8 +268,12 @@ later than the first AI agent input refused under this tenure; L1's write
 time is later and is not used. A take that overrides another person's tenure
 keeps the door closed and stamps its record time. The audit `occurred_at` is
 the same value. An AI agent input stream that was admitted before the switch,
-and that the take closes before its stream opens, fails with `person_driving`
-(not retryable), the same as a later refusal (#1672).
+and that the take closes before the node accepts its WebSocket upgrade, fails
+with `person_driving` (not retryable), the same as a later refusal. The node
+checks the door once more, just before that upgrade. Only the take's own
+cancellation becomes `person_driving`; an outage, or an earlier cancellation of
+another cause, keeps its own error. A stream already upgraded when the take
+lands ends as a transport failure (#1672).
 
 
 ### Working-copy sync
