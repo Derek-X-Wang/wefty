@@ -147,15 +147,16 @@ func annotateRunListing(ctx context.Context, clients *apiClients, page l3.RunLis
 	return annotated
 }
 
-// General summaries omit cancellation delivery. Read failed Runs only for the
-// human table, under one shared budget so a slow ledger cannot stall each row.
-// An unavailable record leaves the recorded status visible without guessing.
+// General summaries omit cancellation delivery. Read failed and live Runs
+// only for the human table, under one shared budget so a slow ledger cannot
+// stall each row. A succeeded Run has no cancellation to show. An unavailable
+// record leaves the recorded status visible without guessing.
 func annotateRunCancellations(ctx context.Context, clients *apiClients, page *runListingPage) {
 	probeCtx, cancel := context.WithTimeout(ctx, statusProbeBudget)
 	defer cancel()
 	for index := range page.Runs {
 		run := &page.Runs[index]
-		if run.Status != contract.RunFailed {
+		if run.Status == contract.RunSucceeded {
 			continue
 		}
 		record, err := clients.getRun(probeCtx, run.RunID)

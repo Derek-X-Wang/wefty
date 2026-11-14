@@ -428,10 +428,15 @@ func pointerOrNA(value *string, suffix string) string {
 }
 
 // humanRunStatus keeps cancellation visible without changing the ledger state.
-// Pending, refused and legacy delivery records do not prove settlement.
+// Pending, refused and legacy delivery records do not prove settlement. A
+// live Run with an unrefused cancellation is still stopping (#1678): the
+// plain state alone read as if the cancel had done nothing.
 func humanRunStatus(status contract.RunState, cancelStatus string) string {
-	if status == contract.RunFailed && cancelStatus == "settled" {
+	switch {
+	case status == contract.RunFailed && cancelStatus == "settled":
 		return "failed (cancelled)"
+	case status != contract.RunFailed && status != contract.RunSucceeded && cancelStatus != "" && cancelStatus != "refused":
+		return string(status) + " (cancelling)"
 	}
 	return string(status)
 }

@@ -24,7 +24,11 @@ func TestCancelledRunHumanViews(t *testing.T) {
 		{"pending delivery", contract.RunFailed, "pending", "failed"},
 		{"refused delivery", contract.RunFailed, "refused", "failed"},
 		{"legacy delivery", contract.RunFailed, "completed", "failed"},
-		{"still running", contract.RunRunning, "settled", "running"},
+		{"stopping after delivery", contract.RunRunning, "settled", "running (cancelling)"},
+		{"stopping before delivery", contract.RunRunning, "pending", "running (cancelling)"},
+		{"queued and stopping", contract.RunQueued, "pending", "queued (cancelling)"},
+		{"refused while running", contract.RunRunning, "refused", "running"},
+		{"running without cancellation", contract.RunRunning, "", "running"},
 		{"already succeeded", contract.RunSucceeded, "settled", "succeeded"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -105,5 +109,53 @@ func TestCancelledRunJSONKeepsFailedStatus(t *testing.T) {
 		if args[0] == "inspect" && (body.Run.Status != contract.RunFailed || body.Run.CancelStatus != "settled") {
 			t.Fatalf("inspect changed root JSON: %s", out.String())
 		}
+	}
+}
+
+// TestCancelRunTextSaysTheCancelIsUnderway is #1678: an accepted cancel of a
+// live Run printed its plain "running" state, which read as if the cancel had
+// done nothing. The text names the stopping state; JSON keeps the ledger state
+// and its cancel_status unchanged.
+func TestCancelRunTextSaysTheCancelIsUnderway(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name         string
+		status       contract.RunState
+		cancelStatus string
+		want         string
+	}{
+		{"delivered, still stopping", contract.RunRunning, "settled", "running (cancelling)"},
+		{"delivery pending", contract.RunRunning, "pending", "running (cancelling)"},
+		{"already settled", contract.RunFailed, "settled", "failed (cancelled)"},
+		{"finished before cancel", contract.RunSucceeded, "settled", "succeeded"},
+		{"refused", contract.RunRunning, "refused", "running"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			run := contract.RunRecord{RunID: "run_a", Status: test.status, CancelStatus: test.cancelStatus}
+			clients := ledgerStub(t, map[string]any{"/v1/runs/run_a/cancel": run})
+
+			var out bytes.Buffer
+			if err := execute(t.Context(), clients, false, []string{"cancel", run.RunID}, &out, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(out.String(), "\n")
+			if len(lines) < 2 || strings.Split(lines[1], "\t")[1] != test.want {
+				t.Fatalf("status must be %q in %q", test.want, out.String())
+			}
+
+			out.Reset()
+			if err := execute(t.Context(), clients, true, []string{"cancel", run.RunID}, &out, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			var body contract.RunRecord
+			if err := json.Unmarshal(out.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Status != test.status || body.CancelStatus != test.cancelStatus {
+				t.Fatalf("JSON changed the ledger state: %s", out.String())
+			}
+		})
 	}
 }
