@@ -547,9 +547,15 @@ func runOCIOutcomeStopFixture(t *testing.T, controlledRenewal bool) {
 func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	network := plain.NewNetwork()
 	clock := newManualClock(time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC))
+	// L1 runs on the manual clock, but the agent holds each lease on real
+	// time. A 500 ms lease left the first renewal about 225 ms to land; one
+	// slow L1 write on a busy runner ended the renewal loop before helper
+	// admission, so no deadman renewal ever came (#1659). The test expires
+	// the lease by advancing the manual clock, so its length costs no time.
+	const lease = 5 * time.Second
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"intent-marker-node": {Tags: []string{"intent-marker"}, MaxOneshotSlots: 1, MaxServiceSlots: 2},
-	}, 500*time.Millisecond)
+	}, lease)
 	defer stopServer()
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	jobSpec := contract.JobSpec{
@@ -672,7 +678,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(time.Second)
+	clock.Advance(lease + time.Second)
 	deadline = time.Now().Add(3 * time.Second)
 	for {
 		if _, err := store.Reconcile(t.Context()); err != nil {
