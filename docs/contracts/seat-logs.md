@@ -261,6 +261,16 @@ strict writer as `AppendSeatEvent`. Its tenure events change the Seat-life
 person hold in that same transaction. Immutable retries do not repeat hold
 transitions.
 
+The node closes the control door to AI agent input before it records the take.
+So a fresh take's `control_taken` carries a node-supplied `occurred_at`: the
+node's wall-clock time read just before the door switched. That time is never
+later than the first AI agent input refused under this tenure; L1's write
+time is later and is not used. A take that overrides another person's tenure
+keeps the door closed and stamps its record time. The audit `occurred_at` is
+the same value. An AI agent input stream that was admitted before the switch,
+and that the take closes before its stream opens, fails with `person_driving`
+(not retryable), the same as a later refusal (#1672).
+
 
 ### Working-copy sync
 

@@ -1329,7 +1329,10 @@ relay deliberately closes both legs when either copy reaches EOF instead of
 propagating TCP half-close through WebSocket framing.
 
 The exact helper-owned `driver.json` signal is set true before the first
-input-capable control dial. Explicit release, disconnect, revocation, cap
+input-capable control dial. A take from Free records `control_acquired` after
+that dial, but its `occurred_at` is the node wall-clock time read just before
+the signal switch, so the event is never later than the switch (#1672).
+Explicit release, disconnect, revocation, cap
 expiry, or authority loss closes and observes that leg, records
 `control_released`, clears the signal, and returns tenure to Free. A successful
 human-to-human override leaves the signal true throughout; replacement-backend
