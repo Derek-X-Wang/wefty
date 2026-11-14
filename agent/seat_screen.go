@@ -44,6 +44,9 @@ type seatScreenConfig struct {
 	authority         ocihelper.AttemptAuthority
 	fatal             func(error)
 	logFailure        func(error)
+	// beforeUpgrade is a test seam between the input stream's final door
+	// check and its WebSocket upgrade. It is nil in production.
+	beforeUpgrade func(context.Context)
 }
 type seatScreenHandler struct {
 	config seatScreenConfig
@@ -66,30 +69,63 @@ type seatScreenGate struct {
 	streams map[*seatScreenStream]struct{}
 }
 type seatScreenStream struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	done   chan struct{}
 }
+
+// errSeatPersonDriving is the cancel cause of an admitted AI agent input
+// stream that a person's take closed. Its request reports person_driving,
+// not a retryable outage (#1672).
+var errSeatPersonDriving = &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "person_driving", Message: "a person is driving"}}
 
 func (g *seatScreenGate) admit(ctx context.Context) (context.Context, func(), error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.driving {
-		return nil, nil, &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "person_driving", Message: "a person is driving"}}
+		return nil, nil, errSeatPersonDriving
 	}
 	if g.streams == nil {
 		g.streams = map[*seatScreenStream]struct{}{}
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	stream := &seatScreenStream{cancel: cancel, done: make(chan struct{})}
 	g.streams[stream] = struct{}{}
 	return ctx, func() {
-		cancel()
+		cancel(nil)
 		g.mu.Lock()
 		delete(g.streams, stream)
 		close(stream.done)
 		g.mu.Unlock()
 	}, nil
 }
+
+// open is an admitted input stream's last refusal point before the upgrade.
+// Under the gate lock a take has either not begun, and the stream opens, or
+// has closed the door, and the stream gets person_driving. An earlier
+// cancellation of another cause keeps its own error.
+func (g *seatScreenGate) open(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return seatInputFailure(ctx, err)
+	}
+	if g.driving {
+		return errSeatPersonDriving
+	}
+	return nil
+}
+
+// seatInputFailure reports person_driving only for a failure that a take
+// caused: ctx, the request's effective context, was first cancelled by the
+// take, and err is that cancellation. An outage, or a cancellation of
+// another cause such as the Seat's lifetime, keeps its own error (#1672).
+func seatInputFailure(ctx context.Context, err error) error {
+	if errors.Is(context.Cause(ctx), errSeatPersonDriving) && (errors.Is(err, context.Canceled) || errors.Is(err, errSeatPersonDriving)) {
+		return errSeatPersonDriving
+	}
+	return err
+}
+
 func (g *seatScreenGate) block(ctx context.Context) error {
 	g.mu.Lock()
 	g.driving = true
@@ -99,7 +135,7 @@ func (g *seatScreenGate) block(ctx context.Context) error {
 	}
 	g.mu.Unlock()
 	for _, s := range streams {
-		s.cancel()
+		s.cancel(errSeatPersonDriving)
 	}
 	for _, s := range streams {
 		select {
@@ -432,6 +468,11 @@ func (a seatScreenAuditor) AppendComputerTakeoverAudit(ctx context.Context, _, _
 		note = ""
 	}
 	e := l1.SeatLogEvent{EventID: r.Event.EventID, Kind: kind, Reason: string(r.Event.Reason), Note: note, Audit: &r.Event}
+	if kind == l1.SeatEventControlTaken {
+		// The node supplies the switch time: the control door refused AI
+		// agent input from then, before this write reached L1 (#1672).
+		e.OccurredAt = r.Event.OccurredAt
+	}
 	receipt, err := a.handler.record(ctx, a.id, e)
 	if err != nil {
 		return l1.ComputerTakeoverAuditReceipt{}, err
@@ -499,6 +540,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer finish()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	fail := func(err error) { writeSeatScreenError(w, seatInputFailure(ctx, err)) }
 	stopSeat := context.AfterFunc(seat.ctx, cancel)
 	defer stopSeat()
 	kind := workloadrunner.AttemptEndpointView
@@ -507,7 +549,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	backend, backendWS, banner, err := dialComputerBackend(ctx, func(ctx context.Context, _ string) (net.Conn, error) { return h.dial(ctx, binding, kind) }, kind)
 	if err != nil {
-		writeSeatScreenError(w, err)
+		fail(err)
 		return
 	}
 	timing("backend_banner_received")
@@ -517,8 +559,17 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer stopBackend()
 	if input {
 		if _, err = h.record(ctx, id, l1.SeatLogEvent{EventID: rand.Text(), Kind: l1.SeatEventScreenInput, Reason: "ai_agent"}); err != nil {
+			fail(err)
+			return
+		}
+		// The point of no return: a take after this check finds the
+		// stream open, and it ends as a transport failure.
+		if err = seat.gate.open(ctx); err != nil {
 			writeSeatScreenError(w, err)
 			return
+		}
+		if h.config.beforeUpgrade != nil {
+			h.config.beforeUpgrade(ctx)
 		}
 	}
 	if binding.ReleaseNote != "" {
