@@ -442,7 +442,7 @@ func newServiceCLIHarnessWithOptions(t *testing.T, options l1.StoreOptions) *ser
 }
 
 // awaitServiceDesiredState plays the node's side of a CLI wait: it returns
-// once L1 records the operator's intent, so the node's response cannot land
+// once L1 records the requested desired state, so the node's response cannot land
 // before the request it answers.
 func awaitServiceDesiredState(ctx context.Context, store *l1.Store, jobID string, want contract.ServiceDesiredState) error {
 	deadline := time.Now().Add(testwait.Bound)
