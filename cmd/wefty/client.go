@@ -72,6 +72,15 @@ func (e *networkSandboxError) Error() string {
 
 func (e *networkSandboxError) Unwrap() error { return e.cause }
 
+// bareStatusError is a server error answer without a decodable API error
+// body, such as one from a proxy or a server outside wefty's handlers.
+type bareStatusError struct {
+	status  int
+	message string
+}
+
+func (e *bareStatusError) Error() string { return e.message }
+
 type apiResponseError struct {
 	Service    string
 	StatusCode int
@@ -1121,7 +1130,7 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	failure := fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 	if response.StatusCode >= 500 && response.StatusCode < 600 {
-		var failure error = errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody))
+		var failure error = &bareStatusError{status: response.StatusCode, message: httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody)}
 		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable {
 			failure = &transientExchangeError{cause: failure}
 		}

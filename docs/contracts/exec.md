@@ -490,9 +490,13 @@ retries. An unreachable service is retried every second for up to forty
 seconds, counted from the first such failure in a row, which outlasts a
 service restart. While the run is not yet known to be terminal, a busy service
 is retried for up to five minutes per read: one that answers a server error
-whose error body is marked retryable, or that gives no answer within forty
-seconds. A failure below that, such as a refused or slow connection, counts as
-unreachable. The gap between
+whose error body is marked retryable, answers 503 without an API error body,
+gives no answer within forty seconds, or whose local client service refuses the
+connection because it is at capacity. A refused connection, a connection not
+made within its three-second budget, and any other server error without an API
+error body, such as a 502, count as unreachable, because a stopped service fails
+that way too. A proxy that answers 503 for a stopped service behind it gets the
+busy window. The gap between
 those reads doubles from one second to ten, so a loaded host is not asked
 every second. A run continues while its reads are busy, so exec keeps waiting
 for the command's own exit status. When the next try of a busy read starts
