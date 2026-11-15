@@ -1756,8 +1756,8 @@ The copy acknowledgement no longer accepts these outcomes (#1627); only a
 failure report carries them. The evidence grants no publication or cleanup
 authority. A deferral leaves the reserved directive retryable, and a
 `runtime_loss` interruption is retried until the budget ends the copy, because
-the next session's startup sweep rolls a lost copy back or completes it. Later
-success or supersession clears the evidence. An import or clone the budget ends
+the next session's startup sweep rolls a lost copy back or completes it. For a
+Custody import, later success or supersession clears the evidence. An import or clone the budget ends
 records `failed` with the last class's code, retires the never-published
 generation, latches the destination Job `computer_storage_operation_failed`
 with `next_restart_at` null, and leaves the destination latched failed. Ending
