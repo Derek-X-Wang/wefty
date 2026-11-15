@@ -20,6 +20,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -205,6 +206,43 @@ func TestComputerFrontDoorConcurrentPolicyInstall(t *testing.T) {
 			assertStaleRefusalAudit(t, auditor.snapshot(), permission, identity)
 		})
 	}
+}
+
+// A front door withdrawn between the WebSocket upgrade and session
+// registration closes the upgraded view before its admission banner. The
+// client sees a banner-phase transport failure, never an admission (#1661).
+func TestComputerFrontDoorWithdrawnMidAdmissionClosesBeforeBanner(t *testing.T) {
+	fixture, _, auditor, _, fixtureServer, _ := computerFrontDoorFixture(t, l1.ComputerGrantView)
+	fixtureServer.Close()
+	config := fixture.frontDoor.config
+	var frontDoor *computerFrontDoor
+	config.beforeControlSessionRegistration = func() { frontDoor.SetReady(false) }
+	frontDoor, err := newComputerFrontDoor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontDoor.SetReady(true)
+	server := httptest.NewServer(frontDoor)
+	defer server.Close()
+
+	session, err := takeover.OpenAtPolicyRevision(t.Context(), &countingTakeoverFabric{}, "ws"+server.URL[len("http"):]+computerWebSocketPath, 1)
+	if session != nil {
+		session.Close()
+		t.Fatal("a withdrawn front door admitted the view")
+	}
+	var failure *takeover.TransportError
+	if !errors.As(err, &failure) || failure.Phase != httpexchange.Banner {
+		t.Fatalf("withdrawn mid-admission = %v, want a banner-phase transport failure", err)
+	}
+	// The client sees the close before the front door finalizes its audit.
+	testwait.Until(t, "withdrawn admission audit closes the opened session", func() (bool, error) {
+		var opened, closed bool
+		for _, event := range auditor.snapshot() {
+			opened = opened || event.Kind == l1.ComputerTakeoverSessionOpen
+			closed = closed || event.Kind == l1.ComputerTakeoverSessionClose
+		}
+		return opened && closed, nil
+	})
 }
 
 func TestComputerFrontDoorControlGrantWaitsForRequestedPolicy(t *testing.T) {

@@ -100,6 +100,12 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 		return nil, fmt.Errorf("Computer view session omitted its session capability")
 	}
 	_, banner, err := connection.Read(ctx)
+	if errors.Is(err, websocket.ErrMessageTooBig) {
+		// An oversized first message is a malformed banner, not lost availability.
+		_ = connection.CloseNow()
+		transport.CloseIdleConnections()
+		return nil, fmt.Errorf("Computer view admission banner is invalid: %w", err)
+	}
 	if err != nil {
 		_ = connection.CloseNow()
 		transport.CloseIdleConnections()

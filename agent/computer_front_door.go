@@ -741,6 +741,9 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 	frontDoor.mu.Lock()
 	if !frontDoor.ready {
 		frontDoor.mu.Unlock()
+		// The client already holds an upgraded socket, so it sees this close
+		// before any admission banner (#1661).
+		log.Printf("agent: Computer front door for attempt %s closed an upgraded view before its banner: the front door was withdrawn", frontDoor.config.attemptID)
 		reason := l1.ComputerTakeoverAttemptAuthorityLost
 		cancelSession(&computerSessionEnd{reason: reason})
 		relay.Close()
@@ -775,6 +778,7 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		}
 	}
 	if _, err := client.Write(banner); err != nil {
+		log.Printf("agent: Computer front door for attempt %s could not send the view admission banner: %v", frontDoor.config.attemptID, err)
 		_ = backend.Close()
 		release()
 		frontDoor.finishSession(request.Context(), baseEvent, l1.ComputerTakeoverClientClosed)

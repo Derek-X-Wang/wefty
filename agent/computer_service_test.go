@@ -146,7 +146,7 @@ func TestComputerReadinessIsAtomicAcrossPartialLossAndRecovery(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+		done <- monitorComputerReadiness(ctx, clock, started, dial, "attempt-1", func(ready bool) { observations <- ready })
 	}()
 	wantComputerReadinessObservation(t, observations, true)
 
@@ -267,7 +267,7 @@ func TestComputerReadinessDeadlineIncludesPostStartRoundTrips(t *testing.T) {
 	observations := make(chan bool, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- monitorComputerReadiness(t.Context(), clock, started, dial, func(ready bool) { observations <- ready })
+		done <- monitorComputerReadiness(t.Context(), clock, started, dial, "attempt-1", func(ready bool) { observations <- ready })
 	}()
 	deadline := now.Add(DefaultComputerReadinessDeadline)
 	clock.waitForDeadline(t, deadline)
@@ -299,7 +299,7 @@ func TestComputerSteadyStateConnectTimeoutUsesInjectedClock(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+		done <- monitorComputerReadiness(ctx, clock, started, dial, "attempt-1", func(ready bool) { observations <- ready })
 	}()
 	wantComputerReadinessObservation(t, observations, true)
 
@@ -634,7 +634,7 @@ func TestComputerReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+		done <- monitorComputerReadiness(ctx, clock, started, dial, "attempt-1", func(ready bool) { observations <- ready })
 	}()
 	wantComputerReadinessObservation(t, observations, true)
 

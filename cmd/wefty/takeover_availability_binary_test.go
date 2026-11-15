@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/coder/websocket"
 )
 
 func TestTakeoverFrontDoorNonEnvelope5xxFromRealBinary(t *testing.T) {
@@ -230,5 +231,43 @@ func TestTakeoverCancellationDuringExchange(t *testing.T) {
 				t.Fatalf("cancellation exit=%d stderr=%s err=%v decode=%v", commandExitCode(err), stderr.String(), err, decode)
 			}
 		})
+	}
+}
+
+// A front door that withdraws the display after the upgrade closes the view
+// before its admission banner. The real binary reports it as retryable
+// unavailability, not an internal failure (#1661).
+func TestTakeoverViewClosedBeforeBannerFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	frontDoor := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.ComputerControlTokenHeader, "session-token")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+		if err != nil {
+			return
+		}
+		_ = conn.CloseNow()
+	})
+	endpoint := "ws://" + frontDoor + contract.ComputerDisplayWebSocketPath
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/computers/computer-1":
+			_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer-1", Name: "alice"})
+		case "/v1/computers/computer-1/takeover":
+			_ = json.NewEncoder(w).Encode(l1.ComputerTakeoverAvailability{
+				ComputerID: "computer-1", FriendlyName: "alice", DisplayEndpoint: &endpoint, PolicyRevision: 1,
+			})
+		default:
+			t.Errorf("unexpected L1 request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	code, stdout, stderr := runPolishBinary(t, binary, "--json", "--fabric=plain", "--plain-user-id=operator",
+		"--plain-device-id=test-device", "--l1", address, "services", "takeover", "view", "computer-1",
+		"--session-token-file", filepath.Join(t.TempDir(), "session.json"))
+	var envelope contract.ErrorResponse
+	if err := json.Unmarshal(stderr, &envelope); err != nil || code != exitUnavailable || len(stdout) != 0 ||
+		envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable ||
+		!strings.Contains(envelope.Error.Message, "read Computer view admission banner") {
+		t.Fatalf("exit=%d stdout=%s stderr=%s decode=%v, want unavailable/retryable/exit 13", code, stdout, stderr, err)
 	}
 }
