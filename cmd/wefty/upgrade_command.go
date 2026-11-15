@@ -476,18 +476,19 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, errors.New("upgrade requires setup's plain-process node and matching connection profile")
 	}
 	var recovered, drain *upgradeDrainReceipt
-	if forwardFrom == "" {
-		if recovered, err = recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
-			return result, err
-		}
-	}
-	// Registered first so it runs last, after drain cleanup and the run hint.
+	// Registered first so it runs last, after drain cleanup and the run hint,
+	// and before a recovery error returns.
 	defer func() {
 		result, resultErr = settleUpgradeRecovery(result, resultErr, recovered, drain != nil)
 	}()
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, operations, profile, resultErr)
 	}()
+	if forwardFrom == "" {
+		if recovered, err = recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
+			return result, err
+		}
+	}
 	nodePlist := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
 	if operations.requestRolling {
 		if _, statErr := os.Lstat(filepath.Join(paths.data, agentinstall.Directory)); statErr == nil {

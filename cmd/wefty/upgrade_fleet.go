@@ -300,18 +300,19 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	managerHost.unloadBound = time.Duration(setupNodeAgentExitTimeout+15) * time.Second
 	manager := fleetServiceManager{host: managerHost}
 	op := fleetUpgradeOperations(host, paths, profile, plan)
-	recovered, err := recoverUpgradeDrain(ctx, op, paths, profile, warnings)
-	if err != nil {
-		return report, err
-	}
-	var drain *upgradeDrainReceipt
-	// Registered first so it runs last, after drain cleanup and the run hint.
+	var recovered, drain *upgradeDrainReceipt
+	// Registered first so it runs last, after drain cleanup and the run hint,
+	// and before a recovery error returns.
 	defer func() {
 		report, resultErr = settleUpgradeRecovery(report, resultErr, recovered, drain != nil)
 	}()
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, op, profile, resultErr)
 	}()
+	recovered, err = recoverUpgradeDrain(ctx, op, paths, profile, warnings)
+	if err != nil {
+		return report, err
+	}
 	if err := manager.preflightUpgrade(ctx, paths, role); err != nil {
 		return report, err
 	}

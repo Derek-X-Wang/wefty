@@ -807,3 +807,17 @@ func TestLinuxFleetUpgradePreflightFailureReportsVersion(t *testing.T) {
 		t.Fatalf("preflight failure: version=%q err=%v", report.Version, err)
 	}
 }
+
+// Recovery reopens claims, the new drain closes them and cannot reopen them:
+// the fleet report says they stay disabled (#1655).
+func TestLinuxFleetUpgradeFailedReopenAfterRecoveryReportsDisabledClaims(t *testing.T) {
+	f, _ := newLinuxUpgradeFixture(t, serviceplan.Join)
+	paths, _ := resolvePlatformMaintenancePaths(f.home, "linux", "")
+	pendingClaimsOnlyDrain(t, f, paths.config)
+	failNewDrainRestoration(f)
+	report, err := runUpgrade(t.Context(), f.host, false, io.Discard, 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "restore upgrade intent failed") || f.node.ClaimsEnabled ||
+		!report.ClaimsDisabled || !report.InterruptedDrainRecovered {
+		t.Fatalf("report says claims are open: %v %+v", err, report)
+	}
+}

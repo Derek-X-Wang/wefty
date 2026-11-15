@@ -107,7 +107,10 @@ report, on success and on failure, has `interrupted_drain_recovered: true` and
 carries that recovery's `restarted_services` and `claims_remain_disabled`. A
 recovery that only reopened claims shows only `interrupted_drain_recovered`.
 When a new drain then runs, `restarted_services` lists the services of both,
-each once, and `claims_remain_disabled` is the state after the new drain.
+each once, and `claims_remain_disabled` is the state after the new drain. Once
+any drain cleanup has seen claims disabled, `claims_remain_disabled` stays true
+until a later read confirms them open, so a failed reopening is reported as
+disabled.
 Without a recovery the field is absent. This holds for the plain Mac upgrade
 and the fleet upgrade.
 

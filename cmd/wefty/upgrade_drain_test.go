@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -475,14 +476,62 @@ func TestUpgradeDrainInterruptedAfterShutdownBeforeNewBootRecoversNeverService(t
 
 // pendingClaimsOnlyDrain leaves an interrupted drain whose recovery only
 // reopens claims: no service was running.
-func pendingClaimsOnlyDrain(t *testing.T, f *upgradeFixture) {
+func pendingClaimsOnlyDrain(t *testing.T, f *upgradeFixture, config string) {
 	t.Helper()
 	f.node.ClaimsEnabled = false
 	f.node.IntentRevision = 1
 	f.node.IntentReason = "wefty upgrade claims-only"
-	paths, _ := resolveSetupPaths(f.home)
-	if err := writeUpgradeDrain(paths.config, &upgradeDrainReceipt{Home: f.home, Version: 1, NodeID: f.node.NodeID, Revision: 1, Reason: f.node.IntentReason, RestoreClaims: true}); err != nil {
+	if err := writeUpgradeDrain(config, &upgradeDrainReceipt{Home: f.home, Version: 1, NodeID: f.node.NodeID, Revision: 1, Reason: f.node.IntentReason, RestoreClaims: true}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// failNewDrainRestoration lets recovery reopen claims, then the new drain
+// close them and time out on a long one-shot, and its reopening fail.
+func failNewDrainRestoration(f *upgradeFixture) {
+	set := f.operations.setClaims
+	disabled := false
+	f.operations.setClaims = func(ctx context.Context, p connprofile.Profile, r l1.NodeIntentRequest) (l1.Node, error) {
+		if r.ClaimsEnabled && disabled {
+			return l1.Node{}, &unavailableError{cause: errors.New("restore transport unavailable")}
+		}
+		node, err := set(ctx, p, r)
+		if err == nil && !r.ClaimsEnabled {
+			disabled = true
+			f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
+		}
+		return node, err
+	}
+}
+
+// The JSON error after recovery carries the note even when its message comes
+// from a typed cause, and keeps that cause's code and retryability (#1655).
+func TestUpgradeRecoveryNoteReachesJSONError(t *testing.T) {
+	recovered := &upgradeDrainReceipt{restarted: []string{"a", "b", "a"}}
+	for name, test := range map[string]struct {
+		cause     error
+		code      contract.ErrorCode
+		retryable bool
+		message   string
+	}{
+		"client service unavailable": {&local.UnavailableError{Cause: errors.New("socket gone")}, contract.ErrorFabricUnreachable, false,
+			"; interrupted-upgrade recovery ran first and keeps its effects"},
+		"drain timeout": {upgradeDrainTimedOut(true, nil), contract.ErrorConflict, true,
+			"drain timed out; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged; try again"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			report, err := settleUpgradeRecovery(upgradeReport{RestartedServices: []string{"b", "c", "c"}}, test.cause, recovered, false)
+			if !slices.Equal(report.RestartedServices, []string{"a", "b", "c"}) {
+				t.Fatalf("services not listed once in first-seen order: %v", report.RestartedServices)
+			}
+			var out bytes.Buffer
+			writeCommandError(&out, err, true)
+			var document contract.ErrorResponse
+			if e := json.Unmarshal(out.Bytes(), &document); e != nil || document.Error.Code != test.code || document.Error.Retryable != test.retryable ||
+				!strings.Contains(document.Error.Message, test.message) || strings.Count(document.Error.Message, upgradeRecoveryRan) != 1 {
+				t.Fatalf("JSON error: %v %s", e, &out)
+			}
+		})
 	}
 }
 
@@ -491,7 +540,8 @@ func pendingClaimsOnlyDrain(t *testing.T, f *upgradeFixture) {
 func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
 	t.Run("claims-only recovery then success", func(t *testing.T) {
 		f := newUpgradeFixture(t)
-		pendingClaimsOnlyDrain(t, f)
+		paths, _ := resolveSetupPaths(f.home)
+		pendingClaimsOnlyDrain(t, f, paths.config)
 		var stdout bytes.Buffer
 		if err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, true, &stdout, io.Discard); err != nil {
 			t.Fatal(err)
@@ -514,15 +564,17 @@ func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
 	})
 	t.Run("drain timeout refusal", func(t *testing.T) {
 		f := newUpgradeFixture(t)
-		pendingClaimsOnlyDrain(t, f)
+		paths, _ := resolveSetupPaths(f.home)
+		pendingClaimsOnlyDrain(t, f, paths.config)
 		f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
 		var stdout bytes.Buffer
 		err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, false, &stdout, io.Discard, 12*time.Second)
 		const want = "drain timed out; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged; try again when the running one-shots finish"
-		var refusal *apiResponseError
+		var document bytes.Buffer
+		writeCommandError(&document, err, true)
 		if commandExitCode(err) != exitConflict || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "installed stack unchanged") ||
-			!errors.As(err, &refusal) || !strings.HasPrefix(refusal.APIError.Message, want) || !refusal.APIError.Retryable {
-			t.Fatalf("drain timeout hides recovery: %v", err)
+			!strings.Contains(document.String(), want) || !strings.Contains(document.String(), `"retryable": true`) {
+			t.Fatalf("drain timeout hides recovery: %v %s", err, &document)
 		}
 		var report upgradeReport
 		if e := json.Unmarshal(stdout.Bytes(), &report); e != nil || !report.InterruptedDrainRecovered {
@@ -531,8 +583,8 @@ func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
 	})
 	t.Run("untyped exit keeps restarted services", func(t *testing.T) {
 		f := newUpgradeFixture(t)
-		pendingClaimsOnlyDrain(t, f)
 		paths, _ := resolveSetupPaths(f.home)
+		pendingClaimsOnlyDrain(t, f, paths.config)
 		receipt, err := readUpgradeDrain(paths.config)
 		if err != nil {
 			t.Fatal(err)
@@ -562,7 +614,31 @@ func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
 			t.Fatalf("report hides recovery: %v %s", e, &stdout)
 		}
 	})
+	t.Run("recovery notice fails", func(t *testing.T) {
+		f := newUpgradeFixture(t)
+		paths, _ := resolveSetupPaths(f.home)
+		pendingClaimsOnlyDrain(t, f, paths.config)
+		report, err := runUpgrade(t.Context(), f.host, true, failingWriter{})
+		if err == nil || !strings.Contains(err.Error(), upgradeRecoveryRan) || !report.InterruptedDrainRecovered || !f.node.ClaimsEnabled {
+			t.Fatalf("completed recovery left the report: %v %+v", err, report)
+		}
+	})
+	t.Run("new drain fails to reopen claims", func(t *testing.T) {
+		f := newUpgradeFixture(t)
+		paths, _ := resolveSetupPaths(f.home)
+		pendingClaimsOnlyDrain(t, f, paths.config)
+		failNewDrainRestoration(f)
+		report, err := runUpgrade(t.Context(), f.host, false, io.Discard, 10*time.Second)
+		if err == nil || !strings.Contains(err.Error(), "restore upgrade intent failed") || f.node.ClaimsEnabled ||
+			!report.ClaimsDisabled || !report.InterruptedDrainRecovered {
+			t.Fatalf("report says claims are open: %v %+v", err, report)
+		}
+	})
 }
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("notice output closed") }
 
 func TestUpgradeDrainTimeoutFlagControlsBoundAndProgress(t *testing.T) {
 	f := newUpgradeFixture(t)

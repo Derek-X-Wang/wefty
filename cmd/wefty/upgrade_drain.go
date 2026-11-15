@@ -500,7 +500,8 @@ func upgradeDrainResult(primary, restore error, claimsOpen bool) error {
 }
 
 // recoverUpgradeDrain finishes an interrupted drain. It returns the settled
-// receipt when one was pending, so the caller can say what recovery changed.
+// receipt when one was pending and recovery completed, even with an error from
+// a later notice, so the caller can say what recovery changed.
 func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, out io.Writer) (*upgradeDrainReceipt, error) {
 	receipt, err := readUpgradeDrain(paths.config)
 	if errors.Is(err, os.ErrNotExist) {
@@ -513,6 +514,10 @@ func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, 
 		return nil, errors.New("upgrade drain receipt names a different node")
 	}
 	if err := finishUpgradeDrain(ctx, op, paths, profile, receipt, true, out); err != nil {
+		// Recovery completed when it removed its receipt; only a notice failed.
+		if _, readErr := readUpgradeDrain(paths.config); errors.Is(readErr, os.ErrNotExist) {
+			return receipt, err
+		}
 		return nil, err
 	}
 	_, err = fmt.Fprintln(out, "Restored intent from interrupted upgrade.")
@@ -536,8 +541,8 @@ func settleUpgradeRecovery(report upgradeReport, err error, recovered *upgradeDr
 		return report, err
 	}
 	report.InterruptedDrainRecovered = true
-	restarted := slices.Clone(recovered.restarted)
-	for _, jobID := range report.RestartedServices {
+	var restarted []string
+	for _, jobID := range slices.Concat(recovered.restarted, report.RestartedServices) {
 		if !slices.Contains(restarted, jobID) {
 			restarted = append(restarted, jobID)
 		}
@@ -548,11 +553,6 @@ func settleUpgradeRecovery(report upgradeReport, err error, recovered *upgradeDr
 	}
 	if err == nil {
 		return report, nil
-	}
-	// A typed refusal reports its API message in JSON, so it changes too.
-	var response *apiResponseError
-	if errors.As(err, &response) {
-		response.APIError.Message = noteUpgradeRecovery(response.APIError.Message)
 	}
 	return report, &recoveredUpgradeError{cause: err}
 }
@@ -567,7 +567,9 @@ func noteUpgradeRecovery(message string) string {
 	return message + "; " + upgradeRecoveryRan
 }
 
-// recoveredUpgradeError keeps the cause for exit codes and typed checks.
+// recoveredUpgradeError keeps the cause for exit codes and typed checks. The
+// command report adds the same note to the JSON error message, which a typed
+// cause supplies from its own text.
 type recoveredUpgradeError struct{ cause error }
 
 func (e *recoveredUpgradeError) Error() string { return noteUpgradeRecovery(e.cause.Error()) }
@@ -595,6 +597,9 @@ func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, p
 	for recovery.Err() == nil && op.now().Before(deadline) {
 		node, err := op.readNode(recovery, profile)
 		if err == nil {
+			// Claims seen disabled stay reported as disabled until a re-read
+			// confirms them open, so a failed restoration never reports open.
+			receipt.claimsDisabled = receipt.claimsDisabled || !node.ClaimsEnabled
 			pendingDisable := receipt.RestoreClaims && node.ClaimsEnabled && node.IntentRevision == receipt.Revision-1 && node.IntentReason == receipt.PreviousReason
 			// A new upgrade must not be held hostage by service-only failures.
 			// Once our intent is settled, retry each remaining service once and
