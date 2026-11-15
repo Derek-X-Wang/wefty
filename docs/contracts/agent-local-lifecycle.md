@@ -240,8 +240,11 @@ generation at a later intent revision clears it under the attachment flock
 (or by abort or removal), and publishes a reset only while the Computer still holds
 the reset's revision, so that later request proves the fenced reset can never
 publish. The fence's Node, and its managed root when the request names one,
-must match. A reset request older than the generation's last attachment is
-refused as stale, so a delayed reset cannot fence the generation again.
+must match. The same manifest write records that later revision as the
+generation's intent revision, and a reset request older than the generation's
+recorded revision is refused as stale. So a delayed copy of the superseded
+reset cannot fence the generation again, even when the clearing request then
+fails or the helper restarts.
 
 Cold Backup create and prune are also standing heartbeat work, separate from
 attempt leases. L1 releases a create directive only after disruptive intent

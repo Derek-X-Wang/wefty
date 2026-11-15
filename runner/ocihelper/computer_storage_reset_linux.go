@@ -51,8 +51,12 @@ func clearSupersededResetRetirement(diskRoot string, manifest *computerDiskManif
 		rootInstanceID != "" && retirement.RootInstanceID != rootInstanceID {
 		return nil
 	}
+	// The superseding revision is recorded in the same write, so a delayed
+	// copy of the superseded reset is refused as stale even when the caller
+	// fails, or records nothing, after this point.
 	cleared := *manifest
 	cleared.Retirement = nil
+	cleared.Storage.IntentRevision = max(cleared.Storage.IntentRevision, storage.IntentRevision)
 	if err := writeComputerDiskManifest(diskRoot, cleared); err != nil {
 		return err
 	}
@@ -165,8 +169,9 @@ func (engine *ContainerdEngine) fenceResetPredecessor(ctx context.Context, stora
 			manifest.MountDirectory != name || manifest.Attached != nil || manifest.Pending != nil {
 			return errors.New("Computer Storage reset lacks exact detached generation authority")
 		}
-		// A reset older than the generation's last attachment was superseded;
-		// it must not fence a generation that a later revision made current.
+		// A reset older than the generation's recorded revision (its last
+		// attachment, or a request that cleared a superseded fence) was
+		// superseded; it must not fence a generation a later revision made current.
 		if authority.IntentRevision < manifest.Storage.IntentRevision {
 			return errors.New("Computer Storage reset intent revision is stale")
 		}

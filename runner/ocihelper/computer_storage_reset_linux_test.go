@@ -540,6 +540,16 @@ func requireNoRetirement(t *testing.T, diskRoot string) {
 	}
 }
 
+// requireLateResetRefused replays the aborted reset after the fence cleared:
+// it must be refused as stale and must not fence the generation again.
+func requireLateResetRefused(t *testing.T, engine *ContainerdEngine, reset ResetComputerStorageRequest, diskRoot string) {
+	t.Helper()
+	if _, err := engine.ResetComputerStorage(t.Context(), reset); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("late aborted reset = %v, want a stale refusal", err)
+	}
+	requireNoRetirement(t, diskRoot)
+}
+
 // An aborted reset's fence clears when the same generation is named at a
 // later revision, so start, Backup and a new reset work again (#1609).
 func TestAbortedResetFenceClearsForALaterRevision(t *testing.T) {
@@ -570,11 +580,26 @@ func TestAbortedResetFenceClearsForALaterRevision(t *testing.T) {
 			t.Fatal(err)
 		}
 		requireNoRetirement(t, diskRoot)
-		// The aborted reset, delivered late, must not fence the generation again.
-		if _, err := engine.ResetComputerStorage(t.Context(), reset); err == nil || !strings.Contains(err.Error(), "stale") {
-			t.Fatalf("late aborted reset = %v, want a stale refusal", err)
+		requireLateResetRefused(t, engine, reset, diskRoot)
+	})
+	t.Run("failed start", func(t *testing.T) {
+		engine, storage, reset, diskRoot := abortedResetFence(t)
+		// The start clears the fence, then fails before it records its own
+		// revision: the image is no longer a regular file.
+		imagePath := filepath.Join(diskRoot, "disk.ext4")
+		if err := os.Remove(imagePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(imagePath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		later := storage
+		later.IntentRevision = startRevision
+		if _, err := engine.attachComputerDisk(t.Context(), later, testComputerAuthority("attempt-b", "fence-b", "boot-a")); err == nil {
+			t.Fatal("attach over a directory image succeeded")
 		}
 		requireNoRetirement(t, diskRoot)
+		requireLateResetRefused(t, engine, reset, diskRoot)
 	})
 	t.Run("Backup", func(t *testing.T) {
 		engine, storage, reset, diskRoot := abortedResetFence(t)
@@ -593,6 +618,10 @@ func TestAbortedResetFenceClearsForALaterRevision(t *testing.T) {
 		}
 		release()
 		requireNoRetirement(t, diskRoot)
+		requireLateResetRefused(t, engine, reset, diskRoot)
+		// A recreated helper reads the same durable record.
+		restarted := &ContainerdEngine{config: engine.config, diskSystem: newFakeComputerDiskSystem()}
+		requireLateResetRefused(t, restarted, reset, diskRoot)
 	})
 	t.Run("reset", func(t *testing.T) {
 		engine, _, reset, diskRoot := abortedResetFence(t)
