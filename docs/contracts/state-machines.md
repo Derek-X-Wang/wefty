@@ -699,17 +699,24 @@ residue for removal, which inventories every recorded generation:
 |---|---|---|
 | restore, prepare | `failed`, code = last class | `stable` on the old generation, stopped (as a failed predecessor copy aborts it) |
 | restore, retire | `cleanup_owed` | `stable` on the new generation, held stopped, failure latched |
-| reset, prepare | counted and shown; not ended yet (#1609) | stays `resetting` |
+| reset, prepare | `failed`, code = last class | `stable` on the old generation, held stopped, failure latched (as a dead-Node abort) |
 | reset, retire | `cleanup_owed` | `stable` on the new generation, held stopped, failure latched; not resumed |
 | Backup | `failed`, code = last class | `stable`; resumes when the Backup stopped a running Computer, as after a failure receipt |
 | grow | `failed`, code = last class | `stable`, same size, failure latched with no pending restart |
 | clone, import | `failed`, code = last class | destination latched failed through the shared terminal tail |
 
 The latched failure is `computer_storage_operation_failed`, and its message
-names the stage, the attempt count, and the last class and code. A reset is
-not ended before publication until a fenced reset can heal (#1609): the helper
-fences the old generation before it prepares the successor, so ending it early
-would strand the Computer. `cleanup_owed` is not `failed`: the data switch
+names the stage, the attempt count, and the last class and code. A reset
+fences the old generation on the Node before it prepares the successor, and
+ending the reset sends nothing to the Node. The next start, Backup or reset
+names that generation at a later intent revision, and the helper clears the
+fence then ([agent-local lifecycle](agent-local-lifecycle.md), #1609). A
+Computer that was running keeps `desired_state=running` while held stopped,
+so its way back is a restart; a reimage preflight refuses the fenced
+generation until one of these has run. This
+replaced owner decision D1, which kept a failing reset `resetting` until every
+Node ran a helper that clears the fence (#1703).
+`cleanup_owed` is not `failed`: the data switch
 happened and the old generation is no longer current. The Computer is usable
 after an explicit start, and the old generation's bytes stay on the Node until
 removal deletes them. A Backup the budget ended has no copy receipt, so its
