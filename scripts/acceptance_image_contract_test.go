@@ -297,7 +297,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if prBuild.Uses != "./.github/workflows/acceptance-image-build.yml" || prBuild.With["package_releases"] != true {
 		t.Fatalf("PR realtiming artifact build = uses %q with %#v", prBuild.Uses, prBuild.With)
 	}
-	if prBuild.If != "github.event_name == 'pull_request'" || prBuild.With["candidate_sha"] != "${{ github.event.pull_request.head.sha }}" || prBuild.With["source_repository"] != "${{ github.event.pull_request.head.repo.full_name }}" {
+	if prBuild.If != "github.event_name == 'pull_request' && startsWith(github.head_ref, 'batch/')" || prBuild.With["candidate_sha"] != "${{ github.event.pull_request.head.sha }}" || prBuild.With["source_repository"] != "${{ github.event.pull_request.head.repo.full_name }}" {
 		t.Fatalf("PR realtiming artifact source guard = if %q with %#v", prBuild.If, prBuild.With)
 	}
 	for name, workflow := range map[string]workflowContract{"workflow-run": realtiming, "scheduled": scheduled} {
