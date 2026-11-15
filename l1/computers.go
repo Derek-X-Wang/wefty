@@ -167,6 +167,9 @@ type ComputerMutationPrecondition struct {
 type ComputerDesiredStateRequest struct {
 	ComputerMutationPrecondition
 	DesiredState contract.ServiceDesiredState `json:"desired_state"`
+	// The idle timer's stop only; never accepted from JSON. It rechecks
+	// idleness inside the same write fence as the stop.
+	idleOnly bool
 }
 
 type ComputerBackupCapRequest struct {
@@ -632,11 +635,11 @@ func (s *Store) insertComputerIntent(
 		return internalError(err, "append immutable Computer intent")
 	}
 	if revision > initialComputerRevision {
-		var made bool
-		if err := tx.QueryRowContext(ctx, `SELECT seat_request_made FROM computers WHERE computer_id=?`, computerID).Scan(&made); err != nil {
+		var timed bool
+		if err := tx.QueryRowContext(ctx, `SELECT idle_action IN ('delete','stop') FROM computers WHERE computer_id=?`, computerID).Scan(&timed); err != nil {
 			return internalError(err, "read Computer idle timer ownership")
 		}
-		if !made {
+		if !timed {
 			return nil
 		}
 		boot, ns, err := seatTime(s.clock, now)
@@ -645,7 +648,7 @@ func (s *Store) insertComputerIntent(
 			boot = ""
 			ns = 0
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE computers SET wait_boot_id=?,wait_started_ns=? WHERE computer_id=? AND seat_request_made=1`, boot, ns, computerID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE computers SET wait_boot_id=?,wait_started_ns=? WHERE computer_id=?`, boot, ns, computerID); err != nil {
 			return internalError(err, "restart Computer idle wait")
 		}
 	}
@@ -1190,6 +1193,15 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	}
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
+	}
+	if request.idleOnly {
+		due, err := s.computerIdleDue(ctx, tx, computerID, false)
+		if err != nil {
+			return Computer{}, err
+		}
+		if !due {
+			return computer, protocolError(contract.ErrorConflict, "Computer is no longer idle")
+		}
 	}
 	backupStopWins, err := computerDesiredDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
