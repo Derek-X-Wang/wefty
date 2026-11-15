@@ -170,8 +170,10 @@ control socket — use one
 failed-exchange classification, with the Unix-socket request exception below.
 Connection failures on TCP adapters (including dial timeouts,
 request deadlines,
-and a deadline or timeout waiting for the display banner after a take-over
-WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
+and a failure reading the display banner after a take-over WebSocket upgrade:
+a deadline, a timeout, or a close before the banner, because the front door
+refuses only before the upgrade) and non-envelope HTTP 5xx responses use
+`code=unavailable`,
 `retryable=true`,
 exit 13. Response-body I/O failures, including a stalled or truncated body,
 follow the same rule on every adapter, including registry token reads and

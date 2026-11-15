@@ -98,7 +98,7 @@ func TestComputerReadinessSleepRearmsDeadline(t *testing.T) {
 			observations := make(chan bool, 2)
 			done := make(chan error, 1)
 			go func() {
-				done <- monitorComputerReadiness(ctx, clock, started, dial, func(ready bool) { observations <- ready })
+				done <- monitorComputerReadiness(ctx, clock, started, dial, "attempt-1", func(ready bool) { observations <- ready })
 			}()
 			clock.waitForDeadline(t, originalDeadline)
 			intervalDeadline := clock.Now().Add(DefaultComputerReadinessProbeInterval)

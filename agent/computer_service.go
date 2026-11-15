@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -351,7 +352,7 @@ func runComputerService(
 	}()
 	readinessErrors := make(chan error, 1)
 	go func() {
-		readinessErrors <- monitorComputerReadiness(runContext, clock, started, config.dial, publication.Observe)
+		readinessErrors <- monitorComputerReadiness(runContext, clock, started, config.dial, config.attemptID, publication.Observe)
 	}()
 
 	stop := func(publicationFinished bool, publicationErr error) error {
@@ -537,7 +538,7 @@ func syncComputerTokenFile(
 	}
 }
 
-func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan computerReadinessClock, dial computerEndpointDial, observe func(bool)) error {
+func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan computerReadinessClock, dial computerEndpointDial, attemptID string, observe func(bool)) error {
 	if clock == nil {
 		clock = systemClock{}
 	}
@@ -577,6 +578,13 @@ func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan c
 		}
 		if nextReady != ready {
 			ready = nextReady
+			// A lost probe withdraws the front door and ends its sessions,
+			// including an admission not yet past its banner (#1661).
+			if ready {
+				log.Printf("agent: Computer attempt %s display readiness probe succeeded again", attemptID)
+			} else {
+				log.Printf("agent: Computer attempt %s display readiness probe failed; the front door is withdrawn: %v", attemptID, probeErr)
+			}
 			observe(ready)
 		}
 	}
