@@ -150,6 +150,12 @@ type Store struct {
 	// so a test can run the statements L1 had before #942 through an
 	// otherwise identical pass.
 	reconcileLivenessForTest func(context.Context, *sql.Tx, time.Time) (int64, error)
+
+	// emptyClaimPollMu runs one empty-claim check at a time. The SQLite
+	// library serializes memory allocation process-wide, so parallel parses
+	// of the large claim query slowed every other statement, lease renewals
+	// included (#1686).
+	emptyClaimPollMu sync.Mutex
 }
 
 // defaultStoreClock is replaced only by TestMain in this package's tests.
@@ -3432,6 +3438,16 @@ func (s *Store) claimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	if err != nil {
 		return nil, err
 	}
+	empty, waiting, err := s.emptyClaimPoll(ctx, identityNodeID, nodeID, bootSessionID, class, queued != nil, exclusionClause, exclusionArguments)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		if queued != nil {
+			*queued = waiting
+		}
+		return nil, nil
+	}
 	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return nil, internalError(err, "begin job claim")
@@ -3498,9 +3514,7 @@ func (s *Store) claimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs
 			SET state=?, current_attempt_id=NULL, prestart_next_retry_at_ns=NULL,
 				prestart_terminal_reason=?, updated_ns=?
-			WHERE state=? AND prestart_budget_deadline_ns IS NOT NULL
-				AND prestart_budget_deadline_ns<=?
-				AND NOT EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)`,
+			WHERE `+expiredPrestartJobs,
 			contract.JobFailed, "pre-start infrastructure budget expired while awaiting scheduling",
 			now.UnixNano(), contract.JobQueued, now.UnixNano()); err != nil {
 			return nil, internalError(err, "terminalize expired pre-start scheduling gap")
@@ -3530,137 +3544,13 @@ SET state=@job_claimed, current_attempt_id=@attempt_id, completion_replay_attemp
     restart_count=restart_count+CASE WHEN next_restart_at_ns IS NOT NULL THEN 1 ELSE 0 END,
     next_restart_at_ns=NULL
 WHERE job_id=(
-  SELECT j.job_id
-	  FROM jobs j
-	  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
-	  LEFT JOIN computer_job_projections candidate_projection ON candidate_projection.job_id=j.job_id
-	  LEFT JOIN computers candidate_computer ON candidate_computer.computer_id=candidate_projection.computer_id
-		  WHERE j.state=@job_queued AND j.outcome=''
-		    AND (candidate_projection.job_id IS NULL OR (
-		      candidate_projection.current=1
-		      AND candidate_computer.current_job_id=j.job_id
-		      AND candidate_computer.desired_state=@desired_running
-		      AND candidate_computer.reconfiguration_phase='stable'
-		      AND candidate_computer.placement_node_id=@node_id
-		      -- A Computer may be claimed only while it names Storage that
-		      -- was actually published. A generation retired by an
-		      -- unsuccessful copy must never reach a helper, which would
-		      -- format a fresh empty disk under that Computer identity.
-		      AND EXISTS (
-		        SELECT 1 FROM computer_storage_generations published_storage
-		        WHERE published_storage.computer_id=candidate_computer.computer_id
-		          AND published_storage.storage_generation=candidate_computer.storage_generation
-		          AND published_storage.phase='current'
-		      )
-		    ))
-	    AND (
-	      (
-	        @class='one-shot'
-	        AND candidate_service.job_id IS NULL
-	        AND (j.next_restart_at_ns IS NULL OR j.next_restart_at_ns<=@now_ns)
-	        AND (j.prestart_next_retry_at_ns IS NULL OR j.prestart_next_retry_at_ns<=@now_ns)
-	        AND (j.prestart_budget_deadline_ns IS NULL OR j.prestart_budget_deadline_ns>@now_ns)
-	        AND (
-	          SELECT COUNT(*)
-	          FROM attempts active_oneshot
-	          WHERE active_oneshot.node_id=@node_id
-	            AND active_oneshot.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
-	            AND NOT EXISTS (
-	              SELECT 1 FROM service_jobs active_service
-	              WHERE active_service.job_id=active_oneshot.job_id
-	            )
-	        ) < (
-	          SELECT max_oneshot_slots FROM nodes WHERE node_id=@node_id
-	        )
-	      )
-	      OR
-	      (
-	        @class='service'
-	        AND candidate_service.job_id IS NOT NULL
-	        AND candidate_service.desired_state=@desired_running
-	        AND (candidate_service.bound_node_id IS NULL OR candidate_service.bound_node_id=@node_id)
-	        AND candidate_service.policy_stop_json IS NULL
-	        AND (candidate_service.next_restart_at IS NULL OR candidate_service.next_restart_at<=@now_ns)
-	        AND (
-	          candidate_service.bound_node_id=@node_id
-	          OR (
-	            SELECT COUNT(*)
-	            FROM service_jobs occupied_service
-	            JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
-	            WHERE occupied_service.bound_node_id=@node_id
-	              AND (
-	                (occupied_job.state=@job_queued AND occupied_service.desired_state=@desired_running)
-	                OR occupied_job.state IN (@job_claimed, @job_running, @job_stopping, @job_removal_pending, @job_agent_cleaned)
-	              )
-	          ) < (
-	            SELECT max_service_slots FROM nodes WHERE node_id=@node_id
-	          )
-	        )
-	      )
-	    )
-	    AND NOT EXISTS (
-	      SELECT 1 FROM attempts prior
-	      WHERE prior.node_id=@node_id
-	        AND (prior.boot_session_id<>@boot_session_id OR (
-	          prior.authority_generation<>@authority_generation
-	          AND EXISTS (SELECT 1 FROM node_generation_catalog enrolled WHERE enrolled.node_id=@node_id)
-	        ))
-	        AND NOT EXISTS (SELECT 1 FROM node_generation_residents resident
-	          JOIN node_generations session ON session.node_id=resident.node_id AND session.generation_id=resident.generation_id
-	          WHERE resident.attempt_id=prior.attempt_id AND resident.node_id=prior.node_id
-	            AND resident.job_id=prior.job_id AND resident.boot_session_id=prior.boot_session_id
-	            AND resident.authority_generation=prior.authority_generation AND resident.fencing_token=prior.fencing_token
-	            AND session.role='retiring' AND session.boot_session_id=prior.boot_session_id
-	            AND session.authority_generation=prior.authority_generation
- AND COALESCE(json_extract(session.registration_json,'$.system_boot_id'),'')=COALESCE((SELECT json_extract(p.registration_json,'$.system_boot_id') FROM node_generations p WHERE p.node_id=session.node_id AND p.role='primary'),'') )
-	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
-	    )
-	    %s
-	    AND NOT EXISTS (
-      SELECT 1 FROM job_tags jt
-      WHERE jt.job_id=j.job_id
-	        AND NOT EXISTS (
-	          SELECT 1 FROM node_tags nt WHERE nt.node_id=@node_id AND nt.tag=jt.tag
-	        )
-    )
-	    AND NOT EXISTS (
-	      SELECT 1 FROM job_required_capabilities required
-	      WHERE required.job_id=j.job_id
-	        AND NOT EXISTS (
-	          SELECT 1
-	          FROM json_each(CAST((SELECT capabilities_json FROM nodes WHERE node_id=@node_id) AS TEXT)) advertised
-	          WHERE advertised.key=required.capability AND advertised.value=1
-	        )
-	    )
-  ORDER BY CASE
-	WHEN @class='service' AND candidate_service.bound_node_id=@node_id THEN 0
-	ELSE 1
-  END, j.created_ns, j.job_id
-  LIMIT 1
-)
+` + claimCandidateQuery + `)
 AND state=@job_queued
 	RETURNING job_id, spec_json, fence_counter, created_ns,
 	          image_resolution_json, prestart_budget_deadline_ns,
 	          parent_job_id, parent_attempt_id, originating_submitter, submitted_by_run_ledger, spawn_depth`
-	claimArguments := []any{
-		sql.Named("job_claimed", contract.JobClaimed),
-		sql.Named("attempt_id", attemptID),
-		sql.Named("now_ns", now.UnixNano()),
-		sql.Named("job_queued", contract.JobQueued),
-		sql.Named("class", class),
-		sql.Named("node_id", nodeID),
-		sql.Named("boot_session_id", bootSessionID),
-		sql.Named("authority_generation", authorityGeneration),
-		sql.Named("desired_running", contract.ServiceDesiredRunning),
-		sql.Named("attempt_claimed", contract.AttemptClaimed),
-		sql.Named("attempt_running", contract.AttemptRunning),
-		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
-		sql.Named("job_running", contract.JobRunning),
-		sql.Named("job_stopping", contract.JobStopping),
-		sql.Named("job_removal_pending", contract.JobRemovalPending),
-		sql.Named("job_agent_cleaned", contract.JobAgentCleaned),
-	}
-	claimArguments = append(claimArguments, exclusionArguments...)
+	claimArguments := append(claimCandidateArguments(nodeID, bootSessionID, class, now, authorityGeneration, exclusionArguments),
+		sql.Named("attempt_id", attemptID))
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(claimQuery, exclusionClause), claimArguments...).
 		Scan(&jobID, &specJSON, &fence, &createdNS, &imageResolutionJSON, &prestartDeadlineNS,
 			&claimedParentJobID, &claimedParentAttemptID, &originatingSubmitter, &submittedByRunLedger, &spawnDepth)
@@ -3836,6 +3726,147 @@ func requireClaimBindingUpdate(result sql.Result, resource, resourceID, nodeID s
 			resource, resourceID, nodeID), "bind claimed service")
 	}
 	return nil
+}
+
+// expiredPrestartJobs selects the queued one-shot jobs whose pre-start
+// infrastructure budget has run out, with the arguments (queued state, now).
+// A one-shot claim fails them before it looks for work.
+const expiredPrestartJobs = `state=? AND prestart_budget_deadline_ns IS NOT NULL
+				AND prestart_budget_deadline_ns<=?
+				AND NOT EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=jobs.job_id)`
+
+// claimCandidateQuery selects the one job a claim would win, with
+// claimCandidateArguments and the exclusion clause in place of %s. The claim
+// UPDATE and the read-only empty-poll check share it, so they cannot disagree
+// about what is claimable.
+const claimCandidateQuery = `  SELECT j.job_id
+	  FROM jobs j
+	  LEFT JOIN service_jobs candidate_service ON candidate_service.job_id=j.job_id
+	  LEFT JOIN computer_job_projections candidate_projection ON candidate_projection.job_id=j.job_id
+	  LEFT JOIN computers candidate_computer ON candidate_computer.computer_id=candidate_projection.computer_id
+		  WHERE j.state=@job_queued AND j.outcome=''
+		    AND (candidate_projection.job_id IS NULL OR (
+		      candidate_projection.current=1
+		      AND candidate_computer.current_job_id=j.job_id
+		      AND candidate_computer.desired_state=@desired_running
+		      AND candidate_computer.reconfiguration_phase='stable'
+		      AND candidate_computer.placement_node_id=@node_id
+		      -- A Computer may be claimed only while it names Storage that
+		      -- was actually published. A generation retired by an
+		      -- unsuccessful copy must never reach a helper, which would
+		      -- format a fresh empty disk under that Computer identity.
+		      AND EXISTS (
+		        SELECT 1 FROM computer_storage_generations published_storage
+		        WHERE published_storage.computer_id=candidate_computer.computer_id
+		          AND published_storage.storage_generation=candidate_computer.storage_generation
+		          AND published_storage.phase='current'
+		      )
+		    ))
+	    AND (
+	      (
+	        @class='one-shot'
+	        AND candidate_service.job_id IS NULL
+	        AND (j.next_restart_at_ns IS NULL OR j.next_restart_at_ns<=@now_ns)
+	        AND (j.prestart_next_retry_at_ns IS NULL OR j.prestart_next_retry_at_ns<=@now_ns)
+	        AND (j.prestart_budget_deadline_ns IS NULL OR j.prestart_budget_deadline_ns>@now_ns)
+	        AND (
+	          SELECT COUNT(*)
+	          FROM attempts active_oneshot
+	          WHERE active_oneshot.node_id=@node_id
+	            AND active_oneshot.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+	            AND NOT EXISTS (
+	              SELECT 1 FROM service_jobs active_service
+	              WHERE active_service.job_id=active_oneshot.job_id
+	            )
+	        ) < (
+	          SELECT max_oneshot_slots FROM nodes WHERE node_id=@node_id
+	        )
+	      )
+	      OR
+	      (
+	        @class='service'
+	        AND candidate_service.job_id IS NOT NULL
+	        AND candidate_service.desired_state=@desired_running
+	        AND (candidate_service.bound_node_id IS NULL OR candidate_service.bound_node_id=@node_id)
+	        AND candidate_service.policy_stop_json IS NULL
+	        AND (candidate_service.next_restart_at IS NULL OR candidate_service.next_restart_at<=@now_ns)
+	        AND (
+	          candidate_service.bound_node_id=@node_id
+	          OR (
+	            SELECT COUNT(*)
+	            FROM service_jobs occupied_service
+	            JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
+	            WHERE occupied_service.bound_node_id=@node_id
+	              AND (
+	                (occupied_job.state=@job_queued AND occupied_service.desired_state=@desired_running)
+	                OR occupied_job.state IN (@job_claimed, @job_running, @job_stopping, @job_removal_pending, @job_agent_cleaned)
+	              )
+	          ) < (
+	            SELECT max_service_slots FROM nodes WHERE node_id=@node_id
+	          )
+	        )
+	      )
+	    )
+	    AND NOT EXISTS (
+	      SELECT 1 FROM attempts prior
+	      WHERE prior.node_id=@node_id
+	        AND (prior.boot_session_id<>@boot_session_id OR (
+	          prior.authority_generation<>@authority_generation
+	          AND EXISTS (SELECT 1 FROM node_generation_catalog enrolled WHERE enrolled.node_id=@node_id)
+	        ))
+	        AND NOT EXISTS (SELECT 1 FROM node_generation_residents resident
+	          JOIN node_generations session ON session.node_id=resident.node_id AND session.generation_id=resident.generation_id
+	          WHERE resident.attempt_id=prior.attempt_id AND resident.node_id=prior.node_id
+	            AND resident.job_id=prior.job_id AND resident.boot_session_id=prior.boot_session_id
+	            AND resident.authority_generation=prior.authority_generation AND resident.fencing_token=prior.fencing_token
+	            AND session.role='retiring' AND session.boot_session_id=prior.boot_session_id
+	            AND session.authority_generation=prior.authority_generation
+ AND COALESCE(json_extract(session.registration_json,'$.system_boot_id'),'')=COALESCE((SELECT json_extract(p.registration_json,'$.system_boot_id') FROM node_generations p WHERE p.node_id=session.node_id AND p.role='primary'),'') )
+	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+	    )
+	    %s
+	    AND NOT EXISTS (
+      SELECT 1 FROM job_tags jt
+      WHERE jt.job_id=j.job_id
+	        AND NOT EXISTS (
+	          SELECT 1 FROM node_tags nt WHERE nt.node_id=@node_id AND nt.tag=jt.tag
+	        )
+    )
+	    AND NOT EXISTS (
+	      SELECT 1 FROM job_required_capabilities required
+	      WHERE required.job_id=j.job_id
+	        AND NOT EXISTS (
+	          SELECT 1
+	          FROM json_each(CAST((SELECT capabilities_json FROM nodes WHERE node_id=@node_id) AS TEXT)) advertised
+	          WHERE advertised.key=required.capability AND advertised.value=1
+	        )
+	    )
+  ORDER BY CASE
+	WHEN @class='service' AND candidate_service.bound_node_id=@node_id THEN 0
+	ELSE 1
+  END, j.created_ns, j.job_id
+  LIMIT 1
+`
+
+func claimCandidateArguments(nodeID, bootSessionID, class string, now time.Time, authorityGeneration int64, exclusionArguments []any) []any {
+	arguments := []any{
+		sql.Named("job_claimed", contract.JobClaimed),
+		sql.Named("now_ns", now.UnixNano()),
+		sql.Named("job_queued", contract.JobQueued),
+		sql.Named("class", class),
+		sql.Named("node_id", nodeID),
+		sql.Named("boot_session_id", bootSessionID),
+		sql.Named("authority_generation", authorityGeneration),
+		sql.Named("desired_running", contract.ServiceDesiredRunning),
+		sql.Named("attempt_claimed", contract.AttemptClaimed),
+		sql.Named("attempt_running", contract.AttemptRunning),
+		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
+		sql.Named("job_running", contract.JobRunning),
+		sql.Named("job_stopping", contract.JobStopping),
+		sql.Named("job_removal_pending", contract.JobRemovalPending),
+		sql.Named("job_agent_cleaned", contract.JobAgentCleaned),
+	}
+	return append(arguments, exclusionArguments...)
 }
 
 func claimExclusion(jobIDs []string) (string, []any, error) {

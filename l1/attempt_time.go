@@ -20,6 +20,9 @@ type attemptClock struct {
 	sleepOffset      *sleepClockOffset
 	sleepGap         time.Duration
 	sleepUncertainty time.Duration
+	// sleepAnchorPending reports that a write door would update the durable
+	// sleep anchor (credit a gap, tighten it, or create or replace it).
+	sleepAnchorPending bool
 }
 type attemptClockKey struct{}
 
