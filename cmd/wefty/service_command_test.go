@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -233,7 +234,12 @@ func assertServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 
 	completionResult := make(chan error, 1)
 	go func() {
-		time.Sleep(25 * time.Millisecond)
+		// Complete only after L1 records the stop. A completion that lands
+		// first ends a running attempt, not the stop the CLI waits for.
+		if err := awaitServiceDesiredState(ctx, harness.store, createdID.JobID, contract.ServiceDesiredStopped); err != nil {
+			completionResult <- err
+			return
+		}
 		_, completeErr := harness.store.CompleteAttempt(ctx, nodeIdentity.NodeID, createdID.JobID, firstClaim.Lease.AttemptID, l1.CompletionRequest{
 			FencingToken: firstClaim.Lease.FencingToken, IdempotencyKey: "cli-stop-first",
 			Result:                    l1.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent},
@@ -256,8 +262,14 @@ func assertServiceCLIContractOverJobKeyedL1Routes(t *testing.T) {
 		err   error
 	}, 1)
 	go func() {
-		time.Sleep(25 * time.Millisecond)
-		claim, claimErr := harness.store.ClaimJob(ctx, nodeIdentity.NodeID, node.NodeID, node.BootSessionID, contract.JobClassService)
+		// Claim only after L1 records the start (#1651). A claim that runs
+		// first finds nothing queued, and the CLI waits for a claim that
+		// never comes.
+		var claim *l1.Claim
+		claimErr := awaitServiceDesiredState(ctx, harness.store, createdID.JobID, contract.ServiceDesiredRunning)
+		if claimErr == nil {
+			claim, claimErr = harness.store.ClaimJob(ctx, nodeIdentity.NodeID, node.NodeID, node.BootSessionID, contract.JobClassService)
+		}
 		if claimErr == nil && claim != nil {
 			appendRequest := l1.AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: []contract.LogEvent{{
 				AttemptID: claim.Lease.AttemptID, Stream: contract.LogStdout, Sequence: 0,
@@ -427,6 +439,26 @@ func newServiceCLIHarnessWithOptions(t *testing.T, options l1.StoreOptions) *ser
 		}
 	})
 	return &serviceCLIHarness{store: store, clients: clients}
+}
+
+// awaitServiceDesiredState plays the node's side of a CLI wait: it returns
+// once L1 records the requested desired state, so the node's response cannot land
+// before the request it answers.
+func awaitServiceDesiredState(ctx context.Context, store *l1.Store, jobID string, want contract.ServiceDesiredState) error {
+	deadline := time.Now().Add(testwait.Bound)
+	for {
+		job, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if job.ServiceJob != nil && job.DesiredState == want {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("service " + jobID + " never reached desired state " + string(want))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func runServiceCLI(t *testing.T, ctx context.Context, clients *apiClients, jsonOutput bool, args ...string) []byte {
