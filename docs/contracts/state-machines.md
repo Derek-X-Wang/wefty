@@ -3302,7 +3302,8 @@ can select a different Seat's helper endpoint. The view endpoint ignores input
 and remains available during a person's tenure, so an AI agent can still take
 screenshots. The input endpoint returns HTTP 409, code `person_driving`, message
 `a person is driving`, while the person holds that Seat's tenure. Taking control
-also closes existing AI agent input streams before the human control dial.
+also closes existing AI agent input streams before the human control dial; an
+open stream gets WebSocket close code 4409, reason `person_driving`.
 Other Seats and commands keep running.
 
 The person path is `/v1/seats/{seat_id}/person/websockify`, with sideband

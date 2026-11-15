@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -119,6 +120,33 @@ func (g *seatScreenGate) open(ctx context.Context) error {
 // caused: ctx, the request's effective context, was first cancelled by the
 // take, and err is that cancellation. An outage, or a cancellation of
 // another cause such as the Seat's lifetime, keeps its own error (#1672).
+// seatTakeCloseLimit bounds the typed close of an open AI agent input stream.
+// The take waits for the stream to end, so a slow agent connection can delay
+// the person's control by at most this much (#1680).
+const seatTakeCloseLimit = 500 * time.Millisecond
+
+// seatHijackWriter keeps the upgraded connection, so a take can bound the
+// close handshake with a deadline. websocket.Conn.Close alone may wait up to
+// ten seconds on the peer.
+type seatHijackWriter struct {
+	http.ResponseWriter
+	conn net.Conn
+}
+
+func (w *seatHijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(w.ResponseWriter).Hijack()
+	w.conn = conn
+	return conn, rw, err
+}
+
+// closeSeatInputForTake sends the typed person_driving close within
+// seatTakeCloseLimit. If the agent's connection is backed up past the limit,
+// the stream ends as before, as a transport failure.
+func closeSeatInputForTake(ws *websocket.Conn, raw net.Conn) {
+	_ = raw.SetDeadline(time.Now().Add(seatTakeCloseLimit))
+	_ = ws.Close(websocket.StatusCode(contract.SeatInputPersonDrivingClose), string(errSeatPersonDriving.APIError.Code))
+}
+
 func seatInputFailure(ctx context.Context, err error) error {
 	if errors.Is(context.Cause(ctx), errSeatPersonDriving) && (errors.Is(err, context.Canceled) || errors.Is(err, errSeatPersonDriving)) {
 		return errSeatPersonDriving
@@ -563,7 +591,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The point of no return: a take after this check finds the
-		// stream open, and it ends as a transport failure.
+		// stream open, and ends it with the typed person_driving close.
 		if err = seat.gate.open(ctx); err != nil {
 			writeSeatScreenError(w, err)
 			return
@@ -576,15 +604,26 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Wefty-Seat-Release-Note", base64.RawURLEncoding.EncodeToString([]byte(binding.ReleaseNote)))
 	}
 	w.Header().Set("Wefty-Seat-Unread-Events", fmt.Sprint(binding.UnreadEvents))
-	clientWS, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{computerWebSocketSubprotocol}})
+	hijacked := &seatHijackWriter{ResponseWriter: w}
+	clientWS, err := websocket.Accept(hijacked, r, &websocket.AcceptOptions{Subprotocols: []string{computerWebSocketSubprotocol}})
 	if err != nil {
 		return
 	}
-	defer clientWS.CloseNow()
-	stopClient := context.AfterFunc(ctx, func() { _ = clientWS.CloseNow() })
+	// Every end of the stream closes the client here, once. A take's own
+	// cancellation first sends the typed close (#1680).
+	closeClient := sync.OnceFunc(func() {
+		if errors.Is(context.Cause(ctx), errSeatPersonDriving) && hijacked.conn != nil {
+			closeSeatInputForTake(clientWS, hijacked.conn)
+		}
+		_ = clientWS.CloseNow()
+	})
+	defer closeClient()
+	stopClient := context.AfterFunc(ctx, closeClient)
 	defer stopClient()
 	timing("websocket_accepted")
-	client := websocket.NetConn(ctx, clientWS, websocket.MessageBinary)
+	// closeClient, not the I/O context, ends client I/O: a cancelled I/O
+	// context would drop the connection before the typed close is sent.
+	client := websocket.NetConn(r.Context(), clientWS, websocket.MessageBinary)
 	if _, err = client.Write(banner); err != nil {
 		return
 	}
@@ -596,7 +635,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	_, _ = io.Copy(client, backend)
 	cancel()
-	_ = clientWS.CloseNow()
+	closeClient()
 	_ = backendWS.CloseNow()
 	<-done
 }

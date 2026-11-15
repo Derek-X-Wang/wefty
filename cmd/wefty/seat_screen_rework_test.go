@@ -27,6 +27,8 @@ import (
 
 type seatScreenReworkStats struct {
 	input, events, baseline, syncs, incremental, capture, discovery atomic.Int32
+	// taken closes after a "take-mid-input" fixture sent the typed close.
+	taken chan struct{}
 }
 
 func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string, *atomic.Int32) {
@@ -43,7 +45,7 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 	if _, err := storeSeatCredential(id, secret); err != nil {
 		t.Fatal(err)
 	}
-	stats := new(seatScreenReworkStats)
+	stats := &seatScreenReworkStats{taken: make(chan struct{})}
 	address := ""
 	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/seats/"+id+"/") || r.Header.Get(l1.SeatCredentialHeader) != secret {
@@ -75,12 +77,23 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 			return
 		}
 		defer ws.CloseNow()
+		if failure == "take-open" && isInput {
+			_ = ws.Close(contract.SeatInputPersonDrivingClose, "person_driving")
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		events := 0
 		requests := 0
 		conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
-		_ = screenFakeRFBRespond(conn, func([]byte) { events++; stats.events.Add(1) }, func(payload []byte) error {
+		_ = screenFakeRFBRespond(conn, func([]byte) {
+			events++
+			stats.events.Add(1)
+			if failure == "take-mid-input" && isInput && events == 1 {
+				_ = ws.Close(contract.SeatInputPersonDrivingClose, "person_driving")
+				close(stats.taken)
+			}
+		}, func(payload []byte) error {
 			width, height := int(binary.BigEndian.Uint16(payload[5:])), int(binary.BigEndian.Uint16(payload[7:]))
 			incremental := payload[0] == 1
 			if events == 0 {
@@ -102,11 +115,15 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 			if !isInput && (width != 1280 || height != 800) {
 				t.Errorf("screenshot requested %dx%d instead of full screen", width, height)
 			}
-			if isInput && events > 0 && (failure == "sync" || failure == "wait" && incremental || failure == "frame" && !incremental && (width != 1 || height != 1)) {
+			if isInput && events > 0 && (failure == "sync" || failure == "take" || failure == "wait" && incremental || failure == "frame" && !incremental && (width != 1 || height != 1)) {
 				if events != 2 {
 					t.Errorf("sync failure before click press and release: events=%d", events)
 				}
-				_ = ws.CloseNow()
+				if failure == "take" {
+					_ = ws.Close(contract.SeatInputPersonDrivingClose, "person_driving")
+				} else {
+					_ = ws.CloseNow()
+				}
 				return io.EOF
 			}
 			return settleUpdate(conn, width, height, false)
@@ -216,6 +233,75 @@ func TestSeatScreenSyncFailureReportsActionDone(t *testing.T) {
 				t.Fatalf("JSON lost completed action: %s", rendered.String())
 			}
 		})
+	}
+}
+
+// TestSeatScreenTakeOnOpenStreamIsPersonDriving is #1680: a take that lands
+// on an open input stream closes it with the typed close, and the CLI reports
+// person_driving (exit 5, not retryable), not a transport failure. After the
+// input was written, the error still says the action was done.
+func TestSeatScreenTakeOnOpenStreamIsPersonDriving(t *testing.T) {
+	for _, test := range []struct {
+		failure    string
+		actionDone bool
+	}{
+		{"take-open", false},
+		{"take", true},
+	} {
+		t.Run(test.failure, func(t *testing.T) {
+			clients, id, input := seatScreenReworkFixture(t, test.failure)
+			err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2"}, io.Discard, io.Discard)
+			var api *apiResponseError
+			if !errors.As(err, &api) || api.StatusCode != http.StatusConflict || api.APIError.Code != seatErrorPersonDriving || api.APIError.Retryable || !strings.HasSuffix(api.APIError.Message, "a person is driving") {
+				t.Fatalf("take on an open stream = %v, want person_driving", err)
+			}
+			if done := api.APIError.Details["action_done"] == true; done != test.actionDone {
+				t.Fatalf("action_done=%t, want %t: %v", done, test.actionDone, err)
+			}
+			if code := commandExitCode(err); code != exitConflict {
+				t.Fatalf("exit=%d, want %d", code, exitConflict)
+			}
+			if input.Load() != 1 {
+				t.Fatalf("input calls=%d", input.Load())
+			}
+		})
+	}
+}
+
+// TestSeatScreenTakeDuringInputWritesIsPersonDriving is the #1680 R2 case: a
+// take lands while a multi-event input is still writing. The CLI writes
+// after the node dropped the stream, so the write fails first; the typed
+// close it received meanwhile still makes the result person_driving.
+func TestSeatScreenTakeDuringInputWritesIsPersonDriving(t *testing.T) {
+	clients, id, stats := seatScreenReworkFixtureWithStats(t, "take-mid-input")
+	keys := 0
+	ctx := context.WithValue(t.Context(), seatScreenWriteHookKey{}, func(p []byte) {
+		// Pause before the second key event until the node has closed. The
+		// write after that draws the peer's reset, so the third write fails
+		// before any read could see the close frame.
+		if len(p) > 0 && p[0] == 4 {
+			switch keys++; keys {
+			case 2:
+				select {
+				case <-stats.taken:
+				case <-time.After(10 * time.Second):
+					t.Error("fixture never sent the typed close")
+				}
+			case 3:
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	})
+	err := execute(ctx, clients, true, []string{"seat", "type", id, "abc"}, io.Discard, io.Discard)
+	var api *apiResponseError
+	if !errors.As(err, &api) || api.StatusCode != http.StatusConflict || api.APIError.Code != seatErrorPersonDriving || api.APIError.Retryable {
+		t.Fatalf("take during input writes = %v, want person_driving", err)
+	}
+	if code := commandExitCode(err); code != exitConflict {
+		t.Fatalf("exit=%d, want %d", code, exitConflict)
+	}
+	if stats.input.Load() != 1 {
+		t.Fatalf("input calls=%d", stats.input.Load())
 	}
 }
 
