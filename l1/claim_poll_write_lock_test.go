@@ -17,20 +17,27 @@ import (
 
 // claimPollFixture is one L1 with one claimed one-shot Attempt and pollers
 // extra registered Nodes, so every further claim poll finds nothing (#1686).
+// A fake clock never measures sleep; the store's real clock does, so its
+// polls also show how often a sleep-anchor update sends one to the write path.
 type claimPollFixture struct {
 	store *Store
-	clock *seatBootTestClock
 	log   *writeLockLog
 	nodes []Node
 	job   Job
 	claim *Claim
 }
 
-func newClaimPollFixture(tb testing.TB, pollers int) *claimPollFixture {
+func newClaimPollFixture(tb testing.TB, pollers int, fake bool) *claimPollFixture {
 	tb.Helper()
-	wall := &fakeClock{now: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
-	f := &claimPollFixture{clock: &seatBootTestClock{fakeClock: wall, boot: "l1-boot", elapsed: time.Hour}, log: &writeLockLog{}}
-	store, err := openTestStore(tb, filepath.Join(tb.TempDir(), "l1.sqlite"), StoreOptions{Clock: f.clock, LeaseDuration: time.Minute, NodeStaleAfter: 12 * time.Hour, NodeDeadAfter: 24 * time.Hour})
+	f := &claimPollFixture{log: &writeLockLog{}}
+	options := StoreOptions{LeaseDuration: time.Minute, NodeStaleAfter: 12 * time.Hour, NodeDeadAfter: 24 * time.Hour}
+	observed := time.Now()
+	if fake {
+		wall := &fakeClock{now: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
+		options.Clock = &seatBootTestClock{fakeClock: wall, boot: "l1-boot", elapsed: time.Hour}
+		observed = wall.Now()
+	}
+	store, err := openTestStore(tb, filepath.Join(tb.TempDir(), "l1.sqlite"), options)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -45,7 +52,7 @@ func newClaimPollFixture(tb testing.TB, pollers int) *claimPollFixture {
 		node, err := store.RegisterNode(context.Background(), fabric.Identity{NodeID: "agent-" + id}, contract.NodeRegistration{
 			NodeID: id, BootSessionID: "boot-" + id, RootInstanceID: "root-" + id,
 			OS: "linux", Architecture: "arm64", AgentVersion: "test",
-			Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1, CapabilityObservedAt: wall.Now(), MissingCapabilities: []string{},
+			Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1, CapabilityObservedAt: observed, MissingCapabilities: []string{},
 		}, DefaultNodePolicy(), true)
 		if err != nil {
 			tb.Fatal(err)
@@ -78,7 +85,7 @@ func (f *claimPollFixture) renew() error {
 // #1686: a claim poll that finds nothing to claim must not take SQLite's
 // write lock, so it cannot delay a lease renewal.
 func TestEmptyClaimPollTakesNoWriteLock(t *testing.T) {
-	f := newClaimPollFixture(t, 2)
+	f := newClaimPollFixture(t, 2, true)
 	for _, node := range f.nodes {
 		reply, err := f.poll(node)
 		if err != nil || reply.Claim != nil {
@@ -100,14 +107,18 @@ func TestEmptyClaimPollTakesNoWriteLock(t *testing.T) {
 //
 //	go test ./l1 -run '^$' -bench EmptyClaimPollRenewal -benchtime 300x
 func BenchmarkEmptyClaimPollRenewal(b *testing.B) {
-	for _, pollers := range []int{0, 16} {
-		b.Run(fmt.Sprintf("pollers=%d", pollers), func(b *testing.B) { benchmarkEmptyClaimPollRenewal(b, pollers) })
+	for _, clock := range []string{"fake", "real"} {
+		for _, pollers := range []int{0, 16} {
+			b.Run(fmt.Sprintf("clock=%s/pollers=%d", clock, pollers), func(b *testing.B) {
+				benchmarkEmptyClaimPollRenewal(b, pollers, clock == "fake")
+			})
+		}
 	}
 }
 
-func benchmarkEmptyClaimPollRenewal(b *testing.B, pollers int) {
+func benchmarkEmptyClaimPollRenewal(b *testing.B, pollers int, fake bool) {
 	const interval = 5 * time.Millisecond
-	f := newClaimPollFixture(b, pollers)
+	f := newClaimPollFixture(b, pollers, fake)
 	stop := make(chan struct{})
 	var polls atomic.Int64
 	var wg sync.WaitGroup

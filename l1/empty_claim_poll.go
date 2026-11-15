@@ -15,11 +15,11 @@ import (
 // not queue for SQLite's write lock ahead of lease renewals (#1686). It
 // reports empty only for a registered, alive Node of this identity and boot
 // session whose heartbeat needs no liveness transition, and only when no
-// proved sleep gap waits to be persisted, no queued pre-start budget has
-// expired (one-shot) and no job is claimable. In every other case, refusals included, the write transaction decides and
-// re-checks everything, so it stays the one authority for claims and their
-// errors. waiting is the queued OCI work hint, read when hint is set; it
-// means nothing unless empty is true.
+// durable sleep-anchor update is pending, no queued pre-start budget has
+// expired (one-shot) and no job is claimable. In every other case, refusals
+// included, the write transaction decides and re-checks everything, so it
+// stays the one authority for claims and their errors. waiting is the queued
+// OCI work hint, read when hint is set; it means nothing unless empty is true.
 //
 // A busy read pool falls back to the write transaction, which is what every
 // claim did before this check existed. Checks run one at a time (see
@@ -30,11 +30,11 @@ func (s *Store) emptyClaimPoll(ctx context.Context, identityNodeID, nodeID, boot
 	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		q := reads.(*databaseReads).q
 		now := reads.now()
-		// Only a write transaction persists a proved sleep gap. Without it, a
-		// later clock failure or host boot judges Nodes and leases by wall
-		// time alone, so a poll that sees a gap leaves it to the claim
-		// transaction, as every poll did before.
-		if clock := currentAttemptClock(ctx); clock.err != nil || clock.sleepGap > 0 {
+		// Only a write transaction updates the durable sleep anchor. Without
+		// that update, later decisions after a clock failure, more sleep or a
+		// host boot would use a stale anchor, so a poll that would update it
+		// leaves that to the claim transaction, as every poll did before.
+		if clock := currentAttemptClock(ctx); clock.err != nil || clock.sleepAnchorPending {
 			return nil
 		}
 		var storedIdentity, storedBoot string

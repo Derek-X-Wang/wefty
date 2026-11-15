@@ -73,6 +73,11 @@ func withLeaseSleepGap(ctx context.Context, tx *sql.Tx, write bool) (context.Con
 	// Persist only gap. The remainder can delay an expiry decision, but can
 	// neither renew authority nor advance the durable anchor.
 	sample.sleepUncertainty = time.Duration(possible - gap)
+	// The anchor bounds the offset already accounted for in deadlines. A
+	// positive credit translates both bounds; tightening can only lower hi,
+	// since uncredited sleep may have happened after the baseline sample.
+	tighten := err == nil && boot == sample.boot && gap == 0 && sample.sleepOffset.upper < anchorHi
+	sample.sleepAnchorPending = gap > 0 || tighten || err == sql.ErrNoRows || boot != sample.boot
 	if !write {
 		sample.ns -= gap
 		sample.sleepGap = time.Duration(gap)
@@ -92,11 +97,7 @@ func withLeaseSleepGap(ctx context.Context, tx *sql.Tx, write bool) (context.Con
 			return ctx, err
 		}
 	}
-	// The anchor bounds the offset already accounted for in deadlines. A
-	// positive credit translates both bounds; tightening can only lower hi,
-	// since uncredited sleep may have happened after the baseline sample.
-	tighten := err == nil && boot == sample.boot && gap == 0 && sample.sleepOffset.upper < anchorHi
-	if gap > 0 || tighten || err == sql.ErrNoRows || boot != sample.boot {
+	if sample.sleepAnchorPending {
 		nextLo, nextHi := sample.sleepOffset.lower, sample.sleepOffset.upper
 		if err == nil && boot == sample.boot {
 			nextLo = anchorLo + gap

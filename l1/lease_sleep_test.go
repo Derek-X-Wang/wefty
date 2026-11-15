@@ -990,3 +990,39 @@ func TestLeaseSleepEmptyClaimPollPersistsCredit(t *testing.T) {
 		alive(t, f, result, err)
 	})
 }
+
+// #1686 review: an empty poll whose sample would only tighten the sleep
+// anchor must still persist it, as the claim transaction did. A loose anchor
+// left in place hides later proved sleep, so a reboot expires a lease that
+// the tightened anchor and its credit keep alive.
+func TestLeaseSleepEmptyClaimPollPersistsTightening(t *testing.T) {
+	f, c := existingAttemptWithLooseSleepInit(t, 10*time.Second)
+	poll := func() {
+		t.Helper()
+		reply, err := f.store.ClaimJobPoll(t.Context(), "agent-lease-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassOneShot)
+		if err != nil || reply.Claim != nil {
+			t.Fatalf("poll claim=%+v err=%v", reply.Claim, err)
+		}
+	}
+	poll()
+	if lo, hi := readSleepAnchor(t, f.store); lo != 0 || hi != 0 {
+		t.Errorf("empty poll left the loose anchor [%v,%v]", lo, hi)
+	}
+	c.advance(0, 20*time.Second)
+	poll()
+	if err := f.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c.Advance(5 * time.Second)
+	c.boot = "next-boot"
+	c.elapsed = time.Minute
+	c.awake = time.Minute
+	var err error
+	f.store, err = openTestStore(t, f.path, f.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := f.store.Reconcile(t.Context()); err != nil || result.ExpiredAttempts != 0 {
+		t.Fatalf("reboot expired a lease that proved sleep kept alive: %+v err=%v", result, err)
+	}
+}
