@@ -40,13 +40,10 @@ func classifyFailedExchange(ctx context.Context, phase httpexchange.Phase, err e
 			return err
 		}
 		return &unavailableError{cause: err}
-	case httpexchange.BareStatus, httpexchange.Body:
+	case httpexchange.BareStatus, httpexchange.Body, httpexchange.Banner:
+		// The front door refuses before the upgrade. A close before the
+		// admission banner means it withdrew the display mid-admission (#1661).
 		return &unavailableError{cause: err}
-	case httpexchange.Banner:
-		var timeout net.Error
-		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
-			return &unavailableError{cause: err}
-		}
 	}
 	return err
 }

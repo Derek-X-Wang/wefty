@@ -15,7 +15,7 @@ const (
 	BareStatus              // A non-envelope HTTP 5xx response.
 	Body
 	Decode // Decoding a completely read body is a local failure.
-	Banner // The upgraded take-over admission banner has its own timeout rule.
+	Banner // Reading the upgraded take-over admission banner.
 )
 
 type Failure struct {

@@ -317,21 +317,30 @@ func TestHTTPFailedExchangeCanceledAfterBareStatus(t *testing.T) {
 	}
 }
 
+// The front door refuses before the upgrade, so a close after the upgrade and
+// before the admission banner is the display going away mid-admission (#1661).
 func TestHTTPFailedExchangeViewClosedBeforeBanner(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(contract.ComputerControlTokenHeader, "session-token")
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
-		if err != nil {
-			return
-		}
-		_ = conn.CloseNow()
-	}))
-	defer server.Close()
-	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
-	_, err := openTakeoverViewWithPolicyRetry(t.Context(), directDialFabric{}, endpoint, 1)
-	var failure *takeover.TransportError
-	if !errors.As(err, &failure) || failure.Phase != httpexchange.Banner {
-		t.Fatalf("expected a banner read failure: %v", err)
+	for name, closeConnection := range map[string]func(*websocket.Conn){
+		"bare EOF":    func(conn *websocket.Conn) { _ = conn.CloseNow() },
+		"close frame": func(conn *websocket.Conn) { _ = conn.Close(websocket.StatusGoingAway, "display withdrawn") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(contract.ComputerControlTokenHeader, "session-token")
+				conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+				if err != nil {
+					return
+				}
+				closeConnection(conn)
+			}))
+			defer server.Close()
+			endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+			_, err := openTakeoverViewWithPolicyRetry(t.Context(), directDialFabric{}, endpoint, 1)
+			var failure *takeover.TransportError
+			if !errors.As(err, &failure) || failure.Phase != httpexchange.Banner {
+				t.Fatalf("expected a banner read failure: %v", err)
+			}
+			assertExchangeReport(t, err, exitUnavailable, contract.ErrorUnavailable, true)
+		})
 	}
-	assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
 }
