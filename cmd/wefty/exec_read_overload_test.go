@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 )
 
@@ -201,5 +203,76 @@ func TestExecOutlastsBusyLogReadsFromRealBinary(t *testing.T) {
 	if code != 10 || strings.Count(out, "tail-output\n") != 1 || strings.Contains(out, "lost observation") ||
 		strings.Count(out, "wefty: control plane busy; still following run ") != 1 || time.Since(started) < busyFor || refused < 2 {
 		t.Fatalf("busy log reads: code=%d refused=%d after %v output=%s", code, refused, time.Since(started), out)
+	}
+}
+
+type dialFailFabric struct {
+	fabric.Fabric
+	err error
+}
+
+func (f dialFailFabric) Dial(context.Context, string, string) (net.Conn, error) { return nil, f.err }
+
+// Busy signals that reach exec through the real client get the overload
+// window while a run is followed (#1652). A 502 and a dial past its budget
+// keep the restart window, so a stopped service is still reported in time.
+func TestExecReadCountsConnectionBusySignals(t *testing.T) {
+	answer := func(status int, body string) *apiClient {
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			fmt.Fprint(w, body)
+		}))
+		network := plain.NewNetwork()
+		listener, err := network.NewFabric(fabric.Identity{NodeID: "bare-status"}).Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = server.Listener.Close()
+		server.Listener = listener
+		server.Start()
+		t.Cleanup(server.Close)
+		return newAPIClient("L3", "l3", network.NewFabric(fabric.Identity{NodeID: "caller"}), listener.Addr().String())
+	}
+	dialing := func(err error) *apiClient {
+		return newAPIClient("L3", "l3", dialFailFabric{err: err}, "127.0.0.1:1")
+	}
+	for name, test := range map[string]struct {
+		client *apiClient
+		busy   bool
+	}{
+		"client service at capacity": {dialing(&local.BusyError{}), true},
+		"503 without a body":         {answer(http.StatusServiceUnavailable, ""), true},
+		"503 with a text body":       {answer(http.StatusServiceUnavailable, "upstream overloaded"), true},
+		"502 without a body":         {answer(http.StatusBadGateway, ""), false},
+		"500 without a body":         {answer(http.StatusInternalServerError, ""), false},
+		"dial past its budget":       {dialing(&fabric.ParticipantUnreachableError{Cause: context.DeadlineExceeded}), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Each try's deadline is the restart window, so the window stays
+			// long enough that a real round trip on a loaded host does not
+			// time out and count as busy. An unreachable read never succeeds:
+			// it must end on its own, long before the overload window.
+			const restart, overload = time.Second, time.Minute
+			setExecReadWindows(t, restart, overload, 10*time.Millisecond)
+			started := time.Now()
+			var failure error
+			value, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func() {}, func(ctx context.Context) (int, error) {
+				if !test.busy || time.Since(started) < restart+restart/2 {
+					_, failure = test.client.doWithResponse(ctx, http.MethodGet, "/v1/runs/run-1/logs", nil, nil, nil, http.StatusOK)
+					return 0, failure
+				}
+				return 7, nil
+			})
+			var transport *unavailableError
+			if !errors.As(failure, &transport) {
+				t.Fatalf("client failure %T %v is not a transient read error", failure, failure)
+			}
+			if test.busy && (err != nil || value != 7) {
+				t.Fatalf("busy signal ended the follow at the restart window: value=%d err=%v", value, err)
+			}
+			if !test.busy && (err == nil || time.Since(started) >= overload/2) {
+				t.Fatalf("unreachable signal held the follow for %v: err=%v", time.Since(started), err)
+			}
+		})
 	}
 }
