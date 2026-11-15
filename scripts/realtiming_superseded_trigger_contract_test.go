@@ -9,6 +9,8 @@ import (
 // (cancel-in-progress). The workflow_run it still fires must skip every
 // realtiming job, so the run concludes skipped: not success (#241), and not a
 // red failure. Every other trigger conclusion keeps the fail-closed result gate.
+// #1692: a member pull request (head not batch/*) skips every job too; a
+// batch/* pull request keeps the fail-closed gate.
 func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 	workflow, _ := readWorkflow(t, "../.github/workflows/service-acceptance-realtiming.yml")
 	names := make([]string, 0, len(workflow.Jobs))
@@ -24,8 +26,9 @@ func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 
 	// values describes the trigger; a pull_request event has no
 	// github.event.workflow_run, so its conclusion is '' or nil.
-	values := func(event string, conclusion any, resolveResult string) map[string]any {
+	values := func(event string, conclusion any, resolveResult string, batchHead bool) map[string]any {
 		return map[string]any{
+			"startsWith(github.head_ref, 'batch/')":              batchHead,
 			"always()":                                           true,
 			"cancelled()":                                        false,
 			"github.event_name":                                  event,
@@ -57,10 +60,21 @@ func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 	t.Run("cancelled trigger skips every job", func(t *testing.T) {
 		// resolve-published-artifact is skipped first; its dependents then see
 		// result skipped. Checking every job catches a future unguarded job too.
-		fixture := values("workflow_run", "cancelled", "skipped")
+		fixture := values("workflow_run", "cancelled", "skipped", false)
 		for _, name := range names {
 			if runs(name, fixture) {
 				t.Errorf("job %s runs for a cancelled acceptance-image trigger; the run would not conclude skipped", name)
+			}
+		}
+	})
+
+	t.Run("member pull request skips every job", func(t *testing.T) {
+		for _, conclusion := range []any{"", nil} {
+			fixture := values("pull_request", conclusion, "skipped", false)
+			for _, name := range names {
+				if runs(name, fixture) {
+					t.Errorf("job %s runs for a member pull request (head not batch/*); only batch heads and main carry this lane", name)
+				}
 			}
 		}
 	})
@@ -83,7 +97,7 @@ func TestRealtimingSupersededTriggerSkipsEveryJob(t *testing.T) {
 			{"pull_request", nil},
 		} {
 			for _, name := range []string{"resolve-published-artifact", "realtiming-result"} {
-				if !runs(name, values(tc.event, tc.conclusion, "success")) {
+				if !runs(name, values(tc.event, tc.conclusion, "success", tc.event == "pull_request")) {
 					t.Errorf("%s does not run for %s trigger conclusion %v; a failed or missing artifact must still fail closed", name, tc.event, tc.conclusion)
 				}
 			}

@@ -1,6 +1,7 @@
 name: computer-seats
 
 # Independent image evidence. This is not an all-tests-pass dependency.
+# Pull requests run it only from batch/* heads (#1692); push to main always runs.
 on:
   pull_request:
     branches: [main]
@@ -47,6 +48,7 @@ env:
 jobs:
   default-computer-seats:
     name: default-computer-seats / linux/${{ matrix.arch }}
+    if: (github.event_name != 'pull_request' || startsWith(github.head_ref, 'batch/'))
     strategy:
       fail-fast: false
       matrix:

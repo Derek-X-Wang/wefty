@@ -2,6 +2,8 @@ name: service-acceptance-realtiming
 
 # Evidence lane only: this stays outside contract-gate's all-tests-pass
 # aggregation even when it runs for a pull request.
+# Pull requests run it only from batch/* heads (#1692): member PRs skip it,
+# and the lead's batch PR (a batch of one for a solo PR) carries the evidence.
 on:
   workflow_run:
     workflows: [acceptance-image]
@@ -37,7 +39,7 @@ concurrency:
 jobs:
   build-pr-artifacts:
     name: build-pr-artifacts
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'batch/')
     uses: ./.github/workflows/acceptance-image-build.yml
     with:
       candidate_sha: ${{ github.event.pull_request.head.sha }}
@@ -53,7 +55,7 @@ jobs:
   resolve-published-artifact:
     name: resolve-artifact
     needs: [build-pr-artifacts]
-    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'batch/')) }}
     runs-on: ubuntu-latest
     outputs:
       available: ${{ steps.resolve.outputs.available }}
@@ -632,7 +634,7 @@ jobs:
   realtiming-result:
     name: realtiming-result
     needs: [resolve-published-artifact, fabric-machine-identity, fabric-person-identity, service-acceptance-realtiming]
-    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'batch/')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out the receipt gate from the artifact-producing commit
