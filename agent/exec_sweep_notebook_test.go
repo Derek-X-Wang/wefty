@@ -580,3 +580,37 @@ func TestExecSweepNotebookStartupDoesNotBlock(t *testing.T) {
 	testwait.Receive(t, "startup sweep reached its diagnostic sink", entered)
 	testwait.Receive(t, "collector start returns while startup sweep is blocked", returned)
 }
+
+// #1700: the first notebook sweep takes the node collection lease, so it
+// must wait for Run's startup accounting pass. Stopping a collector whose
+// gate never opened ends it before the sweep and before the hourly timer it
+// creates right after the sweep: no timer may exist, armed or stopped.
+func TestExecSweepNotebookStartupWaitsForStartupMeasurement(t *testing.T) {
+	f := newExecNotebookFixture(t, false)
+	notebookScannerShim(t, "exit 2")
+	a := &Agent{clock: f.clock, handoffs: f.manager}
+	a.startResultCollector(t.Context(), make(chan struct{}))
+	a.stopResultCollector()
+	f.clock.mu.Lock()
+	timers := len(f.clock.timers)
+	f.clock.mu.Unlock()
+	if timers != 0 || f.messages() != "" {
+		t.Fatalf("collector swept before the startup measurement: timers=%d logs=%q", timers, f.messages())
+	}
+	notebookExists(t, f.entryDir, true)
+}
+
+// Once Run's startup pass has finished, the collector runs its first sweep.
+func TestExecSweepNotebookStartupSweepsAfterStartupMeasurement(t *testing.T) {
+	f := newExecNotebookFixture(t, false)
+	notebookScannerShim(t, "exit 2")
+	entered := make(chan struct{})
+	var once sync.Once
+	f.manager.logf = func(string, ...any) { once.Do(func() { close(entered) }) }
+	measured := make(chan struct{})
+	a := &Agent{clock: f.clock, handoffs: f.manager}
+	a.startResultCollector(t.Context(), measured)
+	t.Cleanup(a.stopResultCollector)
+	close(measured)
+	testwait.Receive(t, "startup sweep reached its diagnostic sink after the startup measurement", entered)
+}
