@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -17,9 +19,13 @@ import (
 //
 // An unreachable service gets the restart window, counted from the first of
 // its failures in a row. With stillFollowing, the read follows a live run, and
-// a service that is there but busy (it answers a retryable server error, or
-// nothing before the attempt's deadline) gets the longer overload window and a
-// growing gap, so a loaded host is not asked again every second (#1629).
+// a service that is there but busy gets the longer overload window and a
+// growing gap, so a loaded host is not asked again every second (#1629). Busy
+// means it answers a retryable server error or a 503 without an API error
+// body, the local client service refuses for capacity, or nothing answers
+// before the attempt's deadline (#1652). A 502 and a dial past its budget stay
+// unreachable: a stopped service fails that way, and it must still be reported
+// within the restart window.
 // stillFollowing runs once per read, when the next try starts past the restart
 // window, so a silent follow does not look hung. Without it every failure shares the
 // restart window and the fixed gap: a known verdict is not held back for a
@@ -48,8 +54,13 @@ func readExec[T any](caller context.Context, clients *apiClients, stillFollowing
 		}
 		var transport *unavailableError
 		var response *apiResponseError
+		var bare *bareStatusError
+		var capacity *local.BusyError
+		busy := timedOut || errors.As(err, &capacity) ||
+			(errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable) ||
+			(errors.As(err, &bare) && bare.status == http.StatusServiceUnavailable)
 		gap := execPollInterval
-		if timedOut || (errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable) {
+		if busy {
 			unreachableSince = time.Time{}
 			if following {
 				gap, busyGap = busyGap, min(2*busyGap, execReadOverloadGapLimit*execPollInterval)
