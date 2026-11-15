@@ -139,7 +139,7 @@ jobs:
           if-no-files-found: warn
 
   service-acceptance:
-    name: service-acceptance / ${{ matrix.os }}${{ matrix.shard && format(' / {0}', matrix.shard) || '' }}
+    name: service-acceptance / ${{ matrix.os }} / ${{ matrix.shard }}
     strategy:
       fail-fast: false
       matrix:

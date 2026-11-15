@@ -22,7 +22,7 @@ const serviceAcceptanceModule = "github.com/Derek-X-Wang/wefty"
 // have their own leg on that OS, so a new package lands in "rest" by default.
 // The test runs each leg's real step script with a stub go command against the
 // real package list, and requires that each OS runs every package exactly once.
-func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
+func TestContractGateServiceAcceptanceLegsRunEveryPackageOnce(t *testing.T) {
 	_, payload := readWorkflow(t, "../.github/workflows/contract-gate.yml")
 	list := exec.Command("go", "list", "-tags=service_acceptance", "./...")
 	list.Dir = ".."
@@ -90,9 +90,6 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 		if job.Strategy.FailFast == nil || *job.Strategy.FailFast {
 			return errors.New("service-acceptance must set fail-fast: false so one red leg does not cancel the others")
 		}
-		if !strings.Contains(job.Name, "matrix.shard") {
-			return errors.New("the service-acceptance legs need distinct job names")
-		}
 		var run *workflowStep
 		for i := range job.Steps {
 			if job.Steps[i].Name == "Run service acceptance suite" {
@@ -104,8 +101,10 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 		}
 		shards := map[string][]string{}
 		runs := map[string]map[string]int{}
+		var names []string
 		for _, leg := range job.Strategy.Matrix.Include {
 			goos := leg["os"]
+			names = append(names, strings.NewReplacer("${{ matrix.os }}", goos, "${{ matrix.shard }}", leg["shard"]).Replace(job.Name))
 			shards[goos] = append(shards[goos], leg["shard"])
 			args, err := runLeg(run.Run, leg["shard"], leg["skip"], false)
 			if err != nil {
@@ -132,6 +131,18 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 		slices.Sort(shards["ubuntu-latest"])
 		if !slices.Equal(shards["macos-latest"], []string{"cmd", "rest"}) || !slices.Equal(shards["ubuntu-latest"], []string{"cmd", "l1", "rest"}) || len(shards) != 2 {
 			return fmt.Errorf("service-acceptance legs = %q, want macOS cmd and rest, and ubuntu-latest cmd, l1 and rest", shards)
+		}
+		// Check names are what branch rules and people see; the macOS names
+		// predate the Ubuntu split and stay as they were.
+		slices.Sort(names)
+		if want := []string{
+			"service-acceptance / macos-latest / cmd",
+			"service-acceptance / macos-latest / rest",
+			"service-acceptance / ubuntu-latest / cmd",
+			"service-acceptance / ubuntu-latest / l1",
+			"service-acceptance / ubuntu-latest / rest",
+		}; !slices.Equal(names, want) {
+			return fmt.Errorf("service-acceptance check names = %q, want %q", names, want)
 		}
 		for goos, counts := range runs {
 			for _, pkg := range packages {
@@ -174,6 +185,7 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 		"list failure hidden":          bytes.Replace(payload, []byte("set -o pipefail\n          case \"$SHARD\""), []byte(`case "$SHARD"`), 1),
 		"unknown shard passes":         bytes.Replace(payload, []byte(`>&2; exit 1 ;;`), []byte(`>&2; exit 0 ;;`), 1),
 		"one red leg cancels the rest": bytes.Replace(payload, []byte("fail-fast: false\n      matrix:\n        # This suite"), []byte("fail-fast: true\n      matrix:\n        # This suite"), 1),
+		"legs share one check name":    bytes.Replace(payload, []byte("name: service-acceptance / ${{ matrix.os }} / ${{ matrix.shard }}"), []byte("name: service-acceptance / ${{ matrix.os }}"), 1),
 		"aggregate ignores result":     bytes.Replace(payload, []byte(`test "$SERVICE_ACCEPTANCE_RESULT" = success`), []byte(`true`), 1),
 	} {
 		if bytes.Equal(mutation, payload) {
