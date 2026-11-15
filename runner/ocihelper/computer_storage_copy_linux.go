@@ -562,14 +562,22 @@ func (engine *ContainerdEngine) reconcileDeferredComputerStorageCopy(ctx context
 //
 // The caller holds the generation flock. The copy record must name this exact
 // Storage, Node and managed root, and the Job the removal names or its prior
-// Job. A record the sweep already deferred, a published record, and a
-// destination still mounted or loop-attached are left to the paths that own
-// them. It reports whether recovery ran; a recovery error is returned and the
-// residue waits for the startup sweep.
+// Job. A published record and a destination still mounted or loop-attached
+// are left to the paths that own them.
+//
+// A record a startup sweep already deferred takes the counted recovery step an
+// ordinary copy call takes (#1597): after L1 ends the copy no copy call
+// follows, so only the next helper restart would otherwise retry it, and the
+// removal would stay pending until then. The attempt is counted, and the
+// sweep's give-up bound answers quarantined, exactly as on the copy path. That
+// step runs under storageCopyMu, as it does on the copy path.
+//
+// It reports whether recovery ran; a recovery error is returned and the
+// residue waits for a later removal or the startup sweep.
 func (engine *ContainerdEngine) recoverUnpublishedComputerStorageCopyForRemoval(ctx context.Context, root, name string,
 	request InventoryRemovalRequest) (bool, error) {
 	manifest, present, err := readComputerStorageCopyManifest(filepath.Join(root, "storage-copy.json"))
-	if err != nil || !present || manifest.Phase == computerStorageCopyPublished || manifest.Recovery.Attempts > 0 {
+	if err != nil || !present || manifest.Phase == computerStorageCopyPublished {
 		return false, err
 	}
 	authority := manifest.Request.Authority
@@ -603,6 +611,22 @@ func (engine *ContainerdEngine) recoverUnpublishedComputerStorageCopyForRemoval(
 		return false, err
 	} else if len(loops) != 0 {
 		return false, errors.New("unpublished Computer Storage copy remains loop-attached")
+	}
+	if manifest.Recovery.Attempts > 0 {
+		// The counted step can quarantine, which renames the root away. A copy
+		// checks for quarantine and then takes the generation lock by path,
+		// both under storageCopyMu; holding that mutex here keeps a copy from
+		// passing the check before the rename and recreating the root after
+		// it. The generation flock is never waited on, so this order cannot
+		// deadlock, and a long copy elsewhere answers contended.
+		if err := admitComputerStorage(ctx, &engine.storageCopyMu, "removal deferred copy recovery"); err != nil {
+			return false, err
+		}
+		defer engine.storageCopyMu.Unlock()
+		if err := engine.reconcileDeferredComputerStorageCopy(ctx, root, name, manifest.Request.Destination); err != nil {
+			return false, fmt.Errorf("recover deferred Computer Storage copy for removal: %w", err)
+		}
+		return true, nil
 	}
 	if _, err := engine.resumeComputerStorageCopy(ctx, root, name); err != nil {
 		return false, fmt.Errorf("recover unpublished Computer Storage copy for removal: %w", err)
