@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -561,6 +562,119 @@ func TestRemovalRecoversACopyTheLiveSessionRefused(t *testing.T) {
 			}
 			if _, statErr := os.Lstat(diskRoot); !errors.Is(statErr, os.ErrNotExist) {
 				t.Fatalf("refused-copy generation root survived removal: %v", statErr)
+			}
+		})
+	}
+}
+
+// A refused copy that a startup sweep already deferred (#1597). After L1 ends
+// the copy no copy call follows, so removal is the only call left to retry it
+// before the next helper restart. It takes the counted step an ordinary copy
+// call takes: success clears the residue and removal proceeds, a fault counts
+// one attempt, the abandonment bound quarantines, and a removal under another
+// authority changes nothing.
+func TestRemovalRecoversACopyAStartupSweepDeferred(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		checkpoint computerStorageCopyPhase
+		attempts   int
+		deferredAt time.Duration
+		fault      bool
+		foreign    bool
+	}{
+		{name: "rolls_back_before_manifest", checkpoint: computerStorageCopyCopied, attempts: 1},
+		{name: "publishes_after_manifest", checkpoint: computerStorageCopyManifestWritten, attempts: 3},
+		{name: "fault_counts_one_attempt", checkpoint: computerStorageCopyManifestWritten, attempts: 1, fault: true},
+		{name: "fault_at_the_bound_quarantines", checkpoint: computerStorageCopyManifestWritten,
+			attempts: defaultComputerStorageRecoveryAttempts - 1, deferredAt: 48 * time.Hour, fault: true},
+		{name: "foreign_authority", checkpoint: computerStorageCopyCopied, attempts: 1, foreign: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, system, source := publishedStorageCopySource(t)
+			request := storageCopyTestRequest(source, "clone", source.Receipt.AllocatedSize)
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: system,
+				storageCopyFinalize: fakeCloneFinalize(t), capacityReservations: make(map[string]*capacityReservation),
+				attempts: make(map[string]*containerdAttempt)}
+			refused := errors.New("injected engine failure the live session answers")
+			engine.storageCopyHook = func(phase computerStorageCopyPhase) error {
+				if phase == test.checkpoint {
+					return refused
+				}
+				return nil
+			}
+			if _, err := engine.CopyComputerStorage(t.Context(), request); !errors.Is(err, refused) {
+				t.Fatalf("refused clone error = %v", err)
+			}
+			engine.storageCopyHook = nil
+			storage := request.Destination
+			name, _ := deterministicComputerDiskName(storage)
+			diskRoot := filepath.Join(root, "computer-disks", name)
+			recordPath := filepath.Join(diskRoot, "storage-copy.json")
+			deferComputerStorageCopyForTest(t, diskRoot, time.Now().Add(-test.deferredAt), test.attempts)
+			if test.fault {
+				engine.computerRecoveryDigest = func(context.Context, string) (string, error) {
+					return "", errors.New("injected recovery digest failure")
+				}
+			}
+			removal := ManagedVolumeRemovalAuthority{NodeID: request.Authority.NodeID, BootSessionID: "removal-boot",
+				JobID: request.Authority.JobID, PriorJobID: request.Authority.JobID, RemovalGeneration: 2,
+				CleanupFence: "remove-deferred-copy"}
+			inventoryRequest := InventoryRemovalRequest{Removal: removal,
+				RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}
+			if test.foreign {
+				inventoryRequest.Removal.JobID, inventoryRequest.Removal.PriorJobID = "other-job", "other-job"
+			}
+			inventory, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
+			switch {
+			case test.foreign:
+				if err == nil {
+					t.Fatalf("removal under foreign authority recovered the deferred copy: %+v", inventory)
+				}
+				manifest, present, readErr := readComputerStorageCopyManifest(recordPath)
+				if readErr != nil || !present || manifest.Recovery.Attempts != test.attempts {
+					t.Fatalf("foreign removal changed the deferred record: %+v present=%t err=%v", manifest.Recovery, present, readErr)
+				}
+				return
+			case test.fault && test.attempts+1 >= defaultComputerStorageRecoveryAttempts:
+				var quarantined *ComputerStorageQuarantinedError
+				if !errors.As(err, &quarantined) || quarantined.Storage != storage {
+					t.Fatalf("removal at the abandonment bound = %+v %T %v", inventory, err, err)
+				}
+				if _, statErr := os.Lstat(diskRoot); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("quarantined generation root remained in the active namespace: %v", statErr)
+				}
+				return
+			case test.fault:
+				var deferred *ComputerStorageResumeDeferredError
+				if !errors.As(err, &deferred) || deferred.Storage != storage {
+					t.Fatalf("faulted deferred recovery = %+v %T %v", inventory, err, err)
+				}
+				manifest, present, readErr := readComputerStorageCopyManifest(recordPath)
+				if readErr != nil || !present || manifest.Recovery.Attempts != test.attempts+1 {
+					t.Fatalf("faulted removal recovery counted %+v present=%t err=%v, want %d attempts",
+						manifest.Recovery, present, readErr, test.attempts+1)
+				}
+				return
+			}
+			absent := test.checkpoint == computerStorageCopyCopied
+			if err != nil || len(inventory.Attempts) != 1 || !inventory.Attempts[0].StorageOnly ||
+				inventory.Attempts[0].StorageAbsent != absent {
+				t.Fatalf("deferred-copy removal inventory = %+v err=%v", inventory, err)
+			}
+			if !absent {
+				if inventory.Attempts[0].StoragePreparation == nil {
+					t.Fatalf("published-recovery inventory has no preparation witness: %+v", inventory)
+				}
+				return
+			}
+			deleted, err := engine.DeleteManagedVolume(t.Context(), DeleteManagedVolumeRequest{
+				Kind: ManagedVolumeComputerDisk, ComputerStorage: &storage, Removal: &removal,
+				StorageAbsent: true, QuarantineOnFailure: true, FailureAttempts: 3})
+			if err != nil || !deleted.Deleted || deleted.Quarantine != nil {
+				t.Fatalf("deferred-copy removal = %+v err=%v", deleted, err)
+			}
+			if _, statErr := os.Lstat(diskRoot); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("deferred-copy generation root survived removal: %v", statErr)
 			}
 		})
 	}
