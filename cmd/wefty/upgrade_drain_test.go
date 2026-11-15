@@ -636,6 +636,32 @@ func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
 	})
 }
 
+// Drain cleanup reopens claims but a service restart keeps failing: the
+// report says claims are open, with and without a prior recovery (#1655).
+func TestUpgradeDrainReportsReopenedClaimsWhileServiceRestartFails(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no recovery", true: "after recovery"}[recovery], func(t *testing.T) {
+			f := newUpgradeFixture(t)
+			if recovery {
+				paths, _ := resolveSetupPaths(f.home)
+				pendingClaimsOnlyDrain(t, f, paths.config)
+			}
+			f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "hosted-app", AttemptID: "service-attempt", Class: contract.JobClassService, State: contract.AttemptRunning, LeaseExpiresAt: f.now.Add(l1.DefaultLeaseDuration)}}
+			f.operations.readJob = func(_ context.Context, _ connprofile.Profile, id string) (l1.Job, error) {
+				return l1.Job{JobID: id, State: contract.JobFailed, CurrentAttemptID: "service-attempt", ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredRunning, BoundNodeID: f.node.NodeID}}, nil
+			}
+			f.operations.restartService = func(context.Context, connprofile.Profile, string, string) (l1.Job, error) {
+				return l1.Job{}, &apiResponseError{StatusCode: 503, APIError: contract.APIError{Code: contract.ErrorUnavailable, Retryable: true}}
+			}
+			report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "restore upgrade intent failed") || !f.node.ClaimsEnabled ||
+				report.ClaimsDisabled || report.InterruptedDrainRecovered != recovery {
+				t.Fatalf("report says open claims are disabled: claims=%v err=%v %+v", f.node.ClaimsEnabled, err, report)
+			}
+		})
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("notice output closed") }

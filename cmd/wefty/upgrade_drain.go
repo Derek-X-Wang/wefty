@@ -597,9 +597,10 @@ func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, p
 	for recovery.Err() == nil && op.now().Before(deadline) {
 		node, err := op.readNode(recovery, profile)
 		if err == nil {
-			// Claims seen disabled stay reported as disabled until a re-read
-			// confirms them open, so a failed restoration never reports open.
-			receipt.claimsDisabled = receipt.claimsDisabled || !node.ClaimsEnabled
+			// Report the claims state last read: a failed restoration then
+			// reports disabled claims, and reopened claims with a failing
+			// service report open. A failed read keeps the last state.
+			receipt.claimsDisabled = !node.ClaimsEnabled
 			pendingDisable := receipt.RestoreClaims && node.ClaimsEnabled && node.IntentRevision == receipt.Revision-1 && node.IntentReason == receipt.PreviousReason
 			// A new upgrade must not be held hostage by service-only failures.
 			// Once our intent is settled, retry each remaining service once and
