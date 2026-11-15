@@ -143,16 +143,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # On hosted macOS this suite runs 42-50 min and decides when the whole
-        # gate ends (#1035). -p 1 runs packages one after another, so two
-        # runners divide it cleanly: cmd/wefty alone (960-1245 s) and every
-        # other package (1395-1455 s).
+        # This suite decides when the whole gate ends (#1035). -p 1 runs
+        # packages one after another, so runners divide it by package. On
+        # hosted macOS: cmd/wefty alone (960-1245 s) and every other package
+        # (1395-1455 s). On ubuntu-latest the whole suite took 37-42 min, so it
+        # splits three ways: cmd/wefty (~890 s), l1 (~800 s) and every other
+        # package. A "rest" leg skips each package that has its own leg on the
+        # same OS; scripts/contract_gate_service_acceptance_split_test.go
+        # checks that each OS runs every package exactly once.
         include:
           - os: ubuntu-latest
+            shard: cmd
+          - os: ubuntu-latest
+            shard: l1
+          - os: ubuntu-latest
+            shard: rest
+            skip: cmd/wefty l1
           - os: macos-latest
             shard: cmd
           - os: macos-latest
             shard: rest
+            skip: cmd/wefty
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -168,16 +179,20 @@ jobs:
         # timing out on macos-latest while passing in every other job.
         # -timeout=45m matches mac-linux-runner: cmd/wefty takes 1107-1243 s
         # here on hosted macOS and hit 30m on PR #1319 (#163, #1035, #1326).
-        # The two macOS halves list packages with the same tags, so a package
-        # with only tagged files still lands in "rest".
+        # "rest" lists packages with the same tags, so a package with only
+        # tagged files still runs there.
         env:
           SHARD: ${{ matrix.shard }}
+          SKIP: ${{ matrix.skip }}
         run: |
           set -o pipefail
           case "$SHARD" in
-            '') packages=./... ;;
             cmd) packages=./cmd/wefty ;;
-            rest) packages=$(go list -tags=service_acceptance ./... | grep -vxF github.com/Derek-X-Wang/wefty/cmd/wefty) ;;
+            l1) packages=./l1 ;;
+            rest)
+              skip=()
+              for dir in $SKIP; do skip+=(-e "github.com/Derek-X-Wang/wefty/$dir"); done
+              packages=$(go list -tags=service_acceptance ./... | grep -vxF "${skip[@]}") ;;
             *) echo "unknown shard: $SHARD" >&2; exit 1 ;;
           esac
           # shellcheck disable=SC2086 # one import path per word
