@@ -690,7 +690,7 @@ func TestLinuxFleetUpgradeInterruptedDrainRecovery(t *testing.T) {
 			}
 			// Recovery restarted a service, so the stack did change (#1622).
 			if strings.Contains(err.Error(), "installed stack unchanged") || !strings.Contains(err.Error(), "upgrade fetch failed; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged") ||
-				!slices.Equal(report.RestartedServices, []string{"service"}) || report.ClaimsDisabled != operatorDisabled {
+				!slices.Equal(report.RestartedServices, []string{"service"}) || report.ClaimsDisabled != operatorDisabled || !report.InterruptedDrainRecovered {
 				t.Fatalf("preparation failure hides recovery: err=%v report=%+v", err, report)
 			}
 			if restarted != 1 || f.node.ClaimsEnabled == operatorDisabled || len(s.mutations()) != 0 {
@@ -805,5 +805,19 @@ func TestLinuxFleetUpgradePreflightFailureReportsVersion(t *testing.T) {
 	report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "upgrade state preflight failed; installed stack unchanged: injected preflight refusal") || report.Version == "" {
 		t.Fatalf("preflight failure: version=%q err=%v", report.Version, err)
+	}
+}
+
+// Recovery reopens claims, the new drain closes them and cannot reopen them:
+// the fleet report says they stay disabled (#1655).
+func TestLinuxFleetUpgradeFailedReopenAfterRecoveryReportsDisabledClaims(t *testing.T) {
+	f, _ := newLinuxUpgradeFixture(t, serviceplan.Join)
+	paths, _ := resolvePlatformMaintenancePaths(f.home, "linux", "")
+	pendingClaimsOnlyDrain(t, f, paths.config)
+	failNewDrainRestoration(f)
+	report, err := runUpgrade(t.Context(), f.host, false, io.Discard, 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "restore upgrade intent failed") || f.node.ClaimsEnabled ||
+		!report.ClaimsDisabled || !report.InterruptedDrainRecovered {
+		t.Fatalf("report says claims are open: %v %+v", err, report)
 	}
 }

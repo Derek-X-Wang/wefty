@@ -104,6 +104,9 @@ type upgradeReport struct {
 	AlreadyAt         bool                   `json:"already_at"`
 	RestartedServices []string               `json:"restarted_services,omitempty"`
 	ClaimsDisabled    bool                   `json:"claims_remain_disabled,omitempty"`
+	// InterruptedDrainRecovered says this command first finished an earlier
+	// upgrade's interrupted drain (#1655).
+	InterruptedDrainRecovered bool `json:"interrupted_drain_recovered,omitempty"`
 }
 
 func executeUpgrade(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
@@ -472,16 +475,20 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if profile.Fabric != "plain" || config.ControlSocket != "" || config.NodeID != profile.Identities.Node {
 		return upgradeReport{}, errors.New("upgrade requires setup's plain-process node and matching connection profile")
 	}
+	var recovered, drain *upgradeDrainReceipt
+	// Registered first so it runs last, after drain cleanup and the run hint,
+	// and before a recovery error returns.
+	defer func() {
+		result, resultErr = settleUpgradeRecovery(result, resultErr, recovered, drain != nil)
+	}()
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, operations, profile, resultErr)
 	}()
-	var recovered *upgradeDrainReceipt
 	if forwardFrom == "" {
 		if recovered, err = recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
 			return result, err
 		}
 	}
-	unchanged, failed := upgradePreparationLeft(recovered), recoveredUpgradeReport(upgradeReport{}, recovered)
 	nodePlist := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
 	if operations.requestRolling {
 		if _, statErr := os.Lstat(filepath.Join(paths.data, agentinstall.Directory)); statErr == nil {
@@ -502,7 +509,6 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if err != nil {
 		return upgradeReport{}, err
 	}
-	var drain *upgradeDrainReceipt
 	var rolling *rollingUpgrade
 	var enrollGeneration bool
 	defer func() {
@@ -567,10 +573,10 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	defer cancelPreparation()
 	commit, err := fetchUpgradeSource(preparation, operations, paths, source, loginPATH, warnings)
 	if err != nil {
-		return failed, fmt.Errorf("upgrade fetch failed; %s: %w", unchanged, err)
+		return upgradeReport{}, fmt.Errorf("upgrade fetch failed; %s: %w", upgradeStackUnchanged, err)
 	}
 	if err := operations.build(preparation, source, destination, commit, loginPATH); err != nil {
-		return failed, fmt.Errorf("upgrade build failed; %s: %w", unchanged, err)
+		return upgradeReport{}, fmt.Errorf("upgrade build failed; %s: %w", upgradeStackUnchanged, err)
 	}
 	for _, name := range setupBinaries {
 		if _, err := executableDigest(filepath.Join(destination, name)); err != nil {
@@ -578,22 +584,22 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		}
 		output, err := operations.command(preparation, stage, upgradeEnvironment(loginPATH), filepath.Join(destination, name), "--version")
 		if err != nil || strings.TrimSpace(string(output)) != commit {
-			return failed, fmt.Errorf("upgrade version check failed for %s: expected %s, got %q (%v); %s", name, commit, strings.TrimSpace(string(output)), err, unchanged)
+			return upgradeReport{}, fmt.Errorf("upgrade version check failed for %s: expected %s, got %q (%v); %s", name, commit, strings.TrimSpace(string(output)), err, upgradeStackUnchanged)
 		}
 	}
 	if upgradeAlreadyInstalled(paths, destination, commit) {
 		_, err := fmt.Fprintln(warnings, "already at "+commit)
-		return recoveredUpgradeReport(upgradeReport{Version: commit, AlreadyAt: true}, recovered), err
+		return upgradeReport{Version: commit, AlreadyAt: true}, err
 	}
 	live := []string{filepath.Join(paths.data, "l1.sqlite"), filepath.Join(paths.data, "l3.sqlite")}
 	for index, path := range live {
 		temporary := filepath.Join(stage, fmt.Sprintf("preflight-%d.sqlite", index))
 		if err := upgradestate.Snapshot(preparation, path, temporary); err != nil {
-			return failed, fmt.Errorf("upgrade state snapshot failed; %s: %w", unchanged, err)
+			return upgradeReport{}, fmt.Errorf("upgrade state snapshot failed; %s: %w", upgradeStackUnchanged, err)
 		}
 		name := []string{"wefty-l1", "wefty-l3"}[index]
 		if _, err := operations.command(preparation, stage, upgradeEnvironment(loginPATH), filepath.Join(destination, name), "--state-preflight", "--db="+temporary); err != nil {
-			return failed, fmt.Errorf("upgrade state preflight failed for %s; %s: %w", name, unchanged, err)
+			return upgradeReport{}, fmt.Errorf("upgrade state preflight failed for %s; %s: %w", name, upgradeStackUnchanged, err)
 		}
 	}
 	skillRoot, err := os.OpenRoot(filepath.Join(source, "skills"))
