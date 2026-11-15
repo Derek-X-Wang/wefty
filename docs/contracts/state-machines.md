@@ -405,12 +405,21 @@ successive `job_id` are distinct identities.
 The Computer also stores `seat_limit`, `idle_action` (`delete`, `stop`, or
 `nothing`), `network` (`internet` or `none`), and `seat_request_made`. Network
 is fixed at creation; replacing a Job projection never changes these fields.
-Stage A owner-made Computers, including pre-Seat database rows, have Seat
-limit 0 (no Seats), idle action `nothing`, network `internet`, and
+Each Job projection also stores `image_seat_places`, its image's Seat support
+reading (0–4, `docs/contracts/computer-image.md`); the Computer and its start
+claim expose the current projection's value. A reimage records the new image's
+reading; a generic projection keeps the current value only when the image
+digest does not change. Pre-Seat database rows read 0.
+Owner-made Computers created before stage B, including pre-Seat database rows,
+have Seat limit 0 (no Seats), idle action `nothing`, network `internet`, and
 `seat_request_made=false`. Their existing memory limit, image, Storage and
 desired state are preserved. Clones and imports of on-demand Computers become
-owner-made Computers with idle action `nothing` and no Seats in stage A.
-The owner's create API cannot supply
+owner-made Computers with idle action `nothing` and no Seats.
+In stage B the owner's create API takes `seat_limit` (0–4, default 2),
+`idle_action` (default `nothing`) and `image_seat_places` (spec P17); network
+stays `internet`. A creation replay that omits `seat_limit` or `idle_action`
+matches any stored value, and replay ignores `image_seat_places`, so a creation
+made before stage B still replays. The owner's create API cannot supply
 Seat-request settings. The trusted Seat-request flow creates Computers with
 a positive Seat limit, idle action `delete`, the explicitly requested
 network, and `seat_request_made=true`. Creation replay compares these

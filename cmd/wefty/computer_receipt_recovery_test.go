@@ -73,6 +73,7 @@ func TestComputerCommandsResendKeepingReceipt(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer-1", IntentRevision: 3})
 				})
 				withRetryWait(t, func(context.Context, time.Duration) error { return nil })
+				clients.images = &fakeImageResolver{seatPlaces: 4} // no registry in this test
 				var stdout, stderr bytes.Buffer
 				err := execute(t.Context(), clients, true, test.args, &stdout, &stderr)
 				mu.Lock()

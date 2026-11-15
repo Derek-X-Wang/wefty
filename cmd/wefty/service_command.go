@@ -90,6 +90,8 @@ func executeServiceCreate(
 	var computerName string
 	var computerBackupCap int64
 	var computerDiskBytes optionalInt64Flag
+	var computerSeatLimit seatLimitFlag
+	var computerIdleAction string
 	var mode scriptMode
 	var tags, interpreters stringListFlag
 	var publishedPort optionalPortFlag
@@ -100,6 +102,8 @@ func executeServiceCreate(
 	flags.StringVar(&computerName, "name", "", "durable Computer name (requires --computer)")
 	flags.Int64Var(&computerBackupCap, "backup-cap", 0, "maximum retained Computer Backups (requires --computer)")
 	flags.Var(&computerDiskBytes, "disk-bytes", "fully allocated Computer disk budget (requires --computer)")
+	flags.Var(&computerSeatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (requires --computer; default 2)")
+	flags.StringVar(&computerIdleAction, "idle-action", "", "nothing, stop or delete after the last Seat leaves (requires --computer; default nothing)")
 	imageFlags.bind(flags)
 	flags.Var(&interpreters, "interpreter", "inline script interpreter argv entry (repeatable)")
 	flags.Var(&mode, "mode", "inline script mode, such as 0755")
@@ -150,8 +154,8 @@ func executeServiceCreate(
 		}
 		return executeComputerCreate(ctx, clients, jsonOutput, computerArgs, stdout, stderr)
 	}
-	if computerName != "" || computerBackupCap != 0 || computerDiskBytes.set {
-		return usageError("--name, --backup-cap, and --disk-bytes require --computer")
+	if computerName != "" || computerBackupCap != 0 || computerDiskBytes.set || computerSeatLimit.set || computerIdleAction != "" {
+		return usageError("--name, --backup-cap, --disk-bytes, --seat-limit and --idle-action require --computer")
 	}
 	if (strings.TrimSpace(scriptPath) == "") == (strings.TrimSpace(imageFlags.reference) == "") {
 		return usageError("services create requires exactly one of --script or --image")

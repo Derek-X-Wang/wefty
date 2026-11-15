@@ -143,6 +143,7 @@ COPY --chmod=0755 examples/computer/rfb-websocket.py /usr/local/libexec/wefty-rf
 COPY --chmod=0755 examples/computer/watch-driver.py /usr/local/libexec/wefty-watch-driver
 COPY --chmod=0644 examples/computer/seat.html /opt/wefty-computer/seat.html
 LABEL org.opencontainers.image.source="https://github.com/Derek-X-Wang/wefty" \
-      org.opencontainers.image.description="Default Wefty Computer desktop with four Seat users"
+      org.opencontainers.image.description="Default Wefty Computer desktop with four Seat users" \
+      dev.wefty.computer.seat-places="4"
 WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/wefty-seat-supervisor"]
