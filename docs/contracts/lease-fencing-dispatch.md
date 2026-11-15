@@ -135,6 +135,14 @@ registration, and whose workload class has capacity; it then creates an attempt,
 fence, establishes a lease, and moves the job to `claimed`. Exactly one
 concurrent claimant commits.
 
+A claim poll that would change nothing does not take the write lock, so empty
+polls cannot queue ahead of lease renewals. L1 first reads a snapshot. When
+the snapshot shows an alive, matching node that needs no liveness transition,
+no expired pre-start budget, and no claimable job, L1 answers the empty claim
+from that snapshot. In every other case, refusals included, the claim
+transaction above decides and re-checks everything. If the snapshot is not
+available in time, L1 uses the claim transaction.
+
 The same transaction mints one attempt credential and returns its opaque bearer
 in the claim response, so a claim either yields a credential or does not happen.
 L1 persists only the SHA-256 digest, bound to the attempt, its job, the holding

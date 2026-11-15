@@ -294,17 +294,24 @@ func expiredAttemptsArguments(now time.Time, contexts ...context.Context) []any 
 	}...)
 }
 
-func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID string, state contract.NodeState, heartbeat, now time.Time) (contract.NodeState, error) {
-	next := state
+// claimingNodeLiveness is the liveness a claiming Node's heartbeat allows at
+// now: an alive or stale Node past its dead deadline is dead, and an alive
+// Node past its stale deadline is stale.
+func (s *Store) claimingNodeLiveness(ctx context.Context, state contract.NodeState, heartbeat, now time.Time) contract.NodeState {
 	comparison := leaseExpiryWallTime(ctx, now)
 	if state == contract.NodeAlive || state == contract.NodeStale {
 		switch {
 		case !heartbeat.Add(s.nodeDeadAfter).After(comparison):
-			next = contract.NodeDead
+			return contract.NodeDead
 		case state == contract.NodeAlive && !heartbeat.Add(s.nodeStaleAfter).After(comparison):
-			next = contract.NodeStale
+			return contract.NodeStale
 		}
 	}
+	return state
+}
+
+func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID string, state contract.NodeState, heartbeat, now time.Time) (contract.NodeState, error) {
+	next := s.claimingNodeLiveness(ctx, state, heartbeat, now)
 	if next == state {
 		return state, nil
 	}
