@@ -317,6 +317,27 @@ func TestHTTPFailedExchangeCanceledAfterBareStatus(t *testing.T) {
 	}
 }
 
+// An oversized first message is a malformed banner from a broken peer, like
+// a short invalid banner, so it stays a local failure rather than an outage.
+func TestHTTPFailedExchangeViewOversizedBannerIsLocal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.ComputerControlTokenHeader, "session-token")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		_ = conn.Write(r.Context(), websocket.MessageBinary, make([]byte, 64<<10))
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := openTakeoverViewWithPolicyRetry(t.Context(), directDialFabric{}, endpoint, 1)
+	if !errors.Is(err, websocket.ErrMessageTooBig) {
+		t.Fatalf("expected an oversized banner: %v", err)
+	}
+	assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
+}
+
 // The front door refuses before the upgrade, so a close after the upgrade and
 // before the admission banner is the display going away mid-admission (#1661).
 func TestHTTPFailedExchangeViewClosedBeforeBanner(t *testing.T) {
