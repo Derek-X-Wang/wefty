@@ -542,7 +542,7 @@ func TestTheResultCollectorStopsWhenTheAgentDoes(t *testing.T) {
 		clock:    systemClock{},
 		handoffs: newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil),
 	}
-	a.startResultCollector(t.Context())
+	a.startResultCollector(t.Context(), nil)
 	if a.collectorDone == nil {
 		t.Fatal("the collector did not start")
 	}
@@ -980,7 +980,7 @@ func TestCancellingTheAgentInterruptsAStartupAccountingPass(t *testing.T) {
 		handoffs: newHandoffManager(root, t.TempDir(), "node-1", time.Hour, nil),
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	a.startResultCollector(ctx)
+	a.startResultCollector(ctx, nil)
 	t.Cleanup(a.stopResultCollector)
 	if a.collectorContext == nil {
 		t.Fatal("the collector published no context for the startup pass")

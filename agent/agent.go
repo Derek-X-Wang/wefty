@@ -734,7 +734,13 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		// is the agent's, not this call's: Close cancels and joins it before
 		// the node lock is released, so nothing is sweeping a node another
 		// agent may already have taken.
-		a.startResultCollector(ctx)
+		//
+		// Its first exec notebook sweep waits for the startup accounting pass
+		// below. Both take the node's collection lease, and a pass that finds
+		// the lease busy is skipped, so a sweep that won the race left the
+		// node unmeasured until a later pass (#1700).
+		startupMeasured := make(chan struct{})
+		a.startResultCollector(ctx, startupMeasured)
 		// The first accounting pass runs here, after reconciliation and the
 		// first sweep, so the node has a figure to report from the moment it
 		// is up. It never runs on an attempt's finalization path, where one
@@ -751,7 +757,9 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		// over an adversarial tree at startup is as much of a stall as one on
 		// the timer, and cancelling Run has to reach it before Close waits on
 		// anything.
-		if err := a.handoffs.measureNodeOnly(a.collectorContext); err != nil {
+		err := a.handoffs.measureNodeOnly(a.collectorContext)
+		close(startupMeasured)
+		if err != nil {
 			a.log("measure this node's retained results: %v", err)
 		}
 	}
@@ -867,7 +875,10 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 // comes from stopResultCollector, which runs before the node lock is released:
 // a sweep that outlived its agent would be deleting under a node another agent
 // has already claimed, and that is true whether or not Run was cancelled.
-func (a *Agent) startResultCollector(parent context.Context) {
+// A non-nil startupMeasured holds the first exec notebook sweep until it is
+// closed, so the sweep cannot take the collection lease from Run's startup
+// accounting pass.
+func (a *Agent) startResultCollector(parent context.Context, startupMeasured <-chan struct{}) {
 	ctx, cancel := context.WithCancel(parent)
 	a.collectorCancel = cancel
 	a.collectorContext = ctx
@@ -878,6 +889,13 @@ func (a *Agent) startResultCollector(parent context.Context) {
 	}
 	go func() {
 		defer close(a.collectorDone)
+		if startupMeasured != nil {
+			select {
+			case <-startupMeasured:
+			case <-ctx.Done():
+				return
+			}
+		}
 		a.sweepExecNotebook(ctx)
 		timer := a.clock.NewTimer(resultCollectionInterval)
 		defer stopTimer(timer)
