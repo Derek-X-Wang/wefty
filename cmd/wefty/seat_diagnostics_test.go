@@ -37,10 +37,9 @@ func TestSeatDiagnosticsReturnedCLIRequestID(t *testing.T) {
 			if _, err := seatcopy.Pack(&archive, source); err != nil {
 				t.Fatal(err)
 			}
-			var address string
-			address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "-target") {
-					_ = json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + address})
+					_ = json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + stubLedgerAddress(r)})
 					return
 				}
 				if strings.HasPrefix(mode, "screen-") {
