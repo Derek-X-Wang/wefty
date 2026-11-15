@@ -23,9 +23,10 @@ import (
 // growing gap, so a loaded host is not asked again every second (#1629). Busy
 // means it answers a retryable server error or a 503 without an API error
 // body, the local client service refuses for capacity, or nothing answers
-// before the attempt's deadline (#1652). A 502 and a dial past its budget stay
-// unreachable: a stopped service fails that way, and it must still be reported
-// within the restart window.
+// before the attempt's deadline (#1652). No wefty service sends a bodiless 503;
+// one from a proxy in front of a stopped service also gets the longer window.
+// A 502 and a dial past its budget stay unreachable: a stopped service fails
+// that way, and it must still be reported within the restart window.
 // stillFollowing runs once per read, when the next try starts past the restart
 // window, so a silent follow does not look hung. Without it every failure shares the
 // restart window and the fixed gap: a known verdict is not held back for a

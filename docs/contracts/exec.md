@@ -492,9 +492,11 @@ service restart. While the run is not yet known to be terminal, a busy service
 is retried for up to five minutes per read: one that answers a server error
 whose error body is marked retryable, answers 503 without an API error body,
 gives no answer within forty seconds, or whose local client service refuses the
-connection because it is at capacity. A failure below that, such as a refused
-connection, a connection not made within its three-second budget, or a 502,
-counts as unreachable, because a stopped service fails that way too. The gap between
+connection because it is at capacity. A refused connection, a connection not
+made within its three-second budget, and any other server error without an API
+error body, such as a 502, count as unreachable, because a stopped service fails
+that way too. A proxy that answers 503 for a stopped service behind it gets the
+busy window. The gap between
 those reads doubles from one second to ten, so a loaded host is not asked
 every second. A run continues while its reads are busy, so exec keeps waiting
 for the command's own exit status. When the next try of a busy read starts

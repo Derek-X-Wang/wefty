@@ -248,11 +248,16 @@ func TestExecReadCountsConnectionBusySignals(t *testing.T) {
 		"dial past its budget":       {dialing(&fabric.ParticipantUnreachableError{Cause: context.DeadlineExceeded}), false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			setExecReadWindows(t, 50*time.Millisecond, time.Minute, 5*time.Millisecond)
+			// Each try's deadline is the restart window, so the window stays
+			// long enough that a real round trip on a loaded host does not
+			// time out and count as busy. An unreachable read never succeeds:
+			// it must end on its own, long before the overload window.
+			const restart, overload = time.Second, time.Minute
+			setExecReadWindows(t, restart, overload, 10*time.Millisecond)
 			started := time.Now()
 			var failure error
 			value, err := readExec(t.Context(), &apiClients{wait: waitForContext}, func() {}, func(ctx context.Context) (int, error) {
-				if time.Since(started) < 250*time.Millisecond {
+				if !test.busy || time.Since(started) < restart+restart/2 {
 					_, failure = test.client.doWithResponse(ctx, http.MethodGet, "/v1/runs/run-1/logs", nil, nil, nil, http.StatusOK)
 					return 0, failure
 				}
@@ -265,8 +270,8 @@ func TestExecReadCountsConnectionBusySignals(t *testing.T) {
 			if test.busy && (err != nil || value != 7) {
 				t.Fatalf("busy signal ended the follow at the restart window: value=%d err=%v", value, err)
 			}
-			if !test.busy && err == nil {
-				t.Fatalf("unreachable signal outlasted the restart window: %v", failure)
+			if !test.busy && (err == nil || time.Since(started) >= overload/2) {
+				t.Fatalf("unreachable signal held the follow for %v: err=%v", time.Since(started), err)
 			}
 		})
 	}
