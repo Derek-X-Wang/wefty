@@ -41,8 +41,7 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 	var events []byte
 	person := false
 	var refusedCredential atomic.Int32
-	address := ""
-	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/")
 		if len(parts) < 5 || parts[1] != "v1" || parts[2] != "seats" || credentials[parts[3]] == "" {
 			t.Error("unexpected Seat path")
@@ -57,7 +56,7 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/screen-target") {
-			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address, "unread_events": 2})
+			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r), "unread_events": 2})
 			return
 		}
 

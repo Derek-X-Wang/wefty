@@ -30,8 +30,7 @@ func TestCPRealBinaryCopyAndTypedFailures(t *testing.T) {
 	var outcomes []l1.SeatCopyOutcomeReceipt
 	var outcomeAttempts []string
 	copyNumber := 0
-	var address string
-	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get(l1.SeatCredentialHeader) != "secret" {
 			t.Errorf("copy lost credential")
 			w.WriteHeader(403)
@@ -53,7 +52,7 @@ func TestCPRealBinaryCopyAndTypedFailures(t *testing.T) {
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/copy-target") {
-			_ = json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + address + "/rfb"})
+			_ = json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + stubLedgerAddress(r) + "/rfb"})
 			return
 		}
 		if r.Header.Get("X-Wefty-Copy-Id") != "" {

@@ -45,11 +45,10 @@ func TestExecSeatSyncBeforeRunAndRefusal(t *testing.T) {
 				t.Fatal(err)
 			}
 			syncs, posts := 0, 0
-			var address string
-			address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/copy-target"):
-					json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + address + "/rfb"})
+					json.NewEncoder(w).Encode(l1.SeatCopyTarget{Endpoint: "ws://" + stubLedgerAddress(r) + "/rfb"})
 				case strings.HasSuffix(r.URL.Path, "/copy"):
 					syncs++
 					if r.URL.Query().Get("direction") != "sync" || r.URL.Query().Get("path") != "work" || r.Header.Get(contract.SeatCredentialHeader) != "secret" {

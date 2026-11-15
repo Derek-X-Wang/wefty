@@ -46,8 +46,7 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 		t.Fatal(err)
 	}
 	stats := &seatScreenReworkStats{taken: make(chan struct{})}
-	address := ""
-	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/seats/"+id+"/") || r.Header.Get(l1.SeatCredentialHeader) != secret {
 			t.Error("path and credential changed Seat")
 			w.WriteHeader(403)
@@ -58,7 +57,7 @@ func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients
 				writeRetryableUnavailable(w, "read_snapshot_expired")
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address, "unread_events": 0})
+			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r), "unread_events": 0})
 			return
 		}
 		if failure == "view" && strings.HasSuffix(r.URL.Path, "/view") {
@@ -331,7 +330,16 @@ func TestSeatScreenTimingBreakdown(t *testing.T) {
 			t.Errorf("missing or negative phase %s: %v", name, reply.Debug.Phases)
 		}
 	}
-	if reply.Debug.Phases["rfb_banner"] > reply.Debug.Phases["input_written"] || reply.Debug.Phases["input_written"] > reply.Debug.Phases["sync_done"] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases["frame_update_seen"] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases["frame_read"] || reply.Debug.Phases["frame_read"] > reply.Debug.Phases["png_written"] {
+	// The fixture's frame reply is the full screen. Under -race, reading it can
+	// outlast the 250ms settle window, so the call records the window's end
+	// instead (#1688). The plain build must see the update; a missing mark
+	// reads as 0 and fails the order check.
+	wait := "frame_update_seen"
+	if _, seen := reply.Debug.Phases[wait]; !seen && raceEnabled {
+		wait = "frame_update_timeout"
+		t.Logf("race build: settle window ended before the update: %v", reply.Debug.Phases)
+	}
+	if reply.Debug.Phases["rfb_banner"] > reply.Debug.Phases["input_written"] || reply.Debug.Phases["input_written"] > reply.Debug.Phases["sync_done"] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases[wait] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases["frame_read"] || reply.Debug.Phases["frame_read"] > reply.Debug.Phases["png_written"] {
 		t.Fatalf("timing phases out of order: %v", reply.Debug.Phases)
 	}
 }
