@@ -304,8 +304,9 @@ func exerciseLiveGrowBudget(t *testing.T, harness *acceptanceHarness, reference,
 
 // exerciseLiveResetBudget freezes the stopped generation's root, so the
 // helper cannot write the retirement fence: the reset fails before the fence.
-// Owner decision D1 (#1608): the failures are counted and shown, and the reset
-// is not ended. When the fault clears, the same reset completes.
+// The budget ends the reset `failed` on the old generation (#1703; the owner's
+// rollout decision replaced decision D1). When the fault clears, a new reset
+// completes.
 func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference, digest string) liveStorageBudgetEvidence {
 	t.Helper()
 	target := stopLiveStorageComputer(t, harness, createLiveStorageComputer(t, harness, reference, digest, "linux-native-reset-budget"))
@@ -313,27 +314,23 @@ func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference
 	thaw := liveStorageFault(t, harness, "freeze-computer-disk:"+diskName, "thaw-computer-disk:"+diskName)
 	resetting := runComputerCLI[l1.Computer](t, harness, false, "services", "reset", target.ComputerID,
 		"--expect-current", "--idempotency-key", "linux-native-reset-budget", "--terminate-sessions")
-	counted := waitForComputerCLI(t, harness, target.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
+	ended := waitForComputerCLI(t, harness, target.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
 		return current.IntentRevision >= resetting.IntentRevision && current.LastResetOperation != nil &&
-			storageBudgetSpent(current.LastResetOperation.Failure, l1.ComputerStorageOperationPrepare)
+			strings.EqualFold(current.LastResetOperation.Status, "failed") &&
+			current.ReconfigurationPhase == l1.ComputerReconfigurationStable
 	})
-	// The budget is spent. One more counted failure must leave the reset
-	// running on the old generation.
-	held := waitForComputerCLI(t, harness, target.ComputerID, 3*time.Minute, func(current l1.Computer) bool {
-		return current.LastResetOperation == nil || current.LastResetOperation.Failure == nil ||
-			current.LastResetOperation.Failure.FailedAttempts > counted.LastResetOperation.Failure.FailedAttempts
-	})
-	notEnded := held.ReconfigurationPhase == l1.ComputerReconfigurationResetting && held.LastResetOperation != nil &&
-		held.LastResetOperation.Failure != nil && held.LastResetOperation.CompletedAt == nil &&
-		held.StorageGeneration == target.StorageGeneration
 	thaw()
+	failedOnOld := storageBudgetSpent(ended.LastResetOperation.Failure, l1.ComputerStorageOperationPrepare) &&
+		ended.LastResetOperation.CompletedAt != nil && ended.StorageGeneration == target.StorageGeneration
+	retried := runComputerCLI[l1.Computer](t, harness, false, "services", "reset", ended.ComputerID,
+		"--expect-current", "--idempotency-key", "linux-native-reset-budget-retry", "--terminate-sessions")
 	healed := waitForComputerCLI(t, harness, target.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
-		return current.ReconfigurationPhase == l1.ComputerReconfigurationStable && current.AppliedRevision == current.IntentRevision &&
-			current.StorageGeneration > target.StorageGeneration
+		return current.IntentRevision >= retried.IntentRevision && current.ReconfigurationPhase == l1.ComputerReconfigurationStable &&
+			current.AppliedRevision == current.IntentRevision && current.StorageGeneration > target.StorageGeneration
 	})
-	evidence := liveStorageBudgetEvidence{Passed: notEnded,
-		Detail: fmt.Sprintf("%s held_phase=%s held_status=%s healed_generation=%d", storageBudgetDetail(counted.LastResetOperation.Failure),
-			held.ReconfigurationPhase, held.LastResetOperation.Status, healed.StorageGeneration)}
+	evidence := liveStorageBudgetEvidence{Passed: failedOnOld,
+		Detail: fmt.Sprintf("%s ended_status=%s ended_generation=%d healed_generation=%d", storageBudgetDetail(ended.LastResetOperation.Failure),
+			ended.LastResetOperation.Status, ended.StorageGeneration, healed.StorageGeneration)}
 	_ = removeAndWaitComputer(t, harness, healed, 5*time.Minute)
 	return evidence
 }
