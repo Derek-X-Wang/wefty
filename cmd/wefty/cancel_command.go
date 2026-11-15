@@ -45,7 +45,11 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		if jsonOutput {
 			return writeJSON(stdout, newRunRecordJSON(run, includeScript))
 		}
-		_, err := fmt.Fprintf(stdout, "RUN ID\tSTATUS\tREASON\n%s\t%s\t%s\n", run.RunID, run.Status, run.FailureReason)
+		reason := run.FailureReason
+		if reason == "" && run.CancelStatus == "refused" {
+			reason = run.CancelReason
+		}
+		_, err := fmt.Fprintf(stdout, "RUN ID\tSTATUS\tREASON\n%s\t%s\t%s\n", run.RunID, humanRunStatus(run.Status, run.CancelStatus), reason)
 		return err
 	}
 	var job l1.Job

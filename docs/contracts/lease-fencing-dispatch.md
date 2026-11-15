@@ -1269,7 +1269,13 @@ state (including an already-terminal target), 2 for usage/invalid requests,
 
 `wefty cancel RUN_ID` recognizes the `run_` prefix (and legacy `run-`) and calls
 L3's `POST /v1/runs/{run_id}/cancel`, returning the current Run record in
-`--json` mode or its ID, status and failure reason as text. It uses the same
+`--json` mode or its ID, status and failure reason as text. The text status
+of a live Run whose cancellation is recorded and not refused is
+`<status> (cancelling)`, for example `running (cancelling)`: the cancel is
+accepted and the Run is still stopping. A live Run whose cancellation L1
+refused shows `<status> (cancel refused)`, with `cancel_reason` as the text
+reason. JSON keeps the ledger `status` and names the cancellation in
+`cancel_status` and `cancel_reason`. It uses the same
 typed exit codes as job cancel; HTTP 200 is success even while cancellation
 awaits settlement or when the job already finished. An L1-only installation
 receives a usage error explaining that `--l3` is required for Run cancellation.
