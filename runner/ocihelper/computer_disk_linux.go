@@ -259,6 +259,9 @@ func (engine *ContainerdEngine) attachComputerDisk(ctx context.Context, storage 
 		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" || manifest.MountDirectory != name {
 			return nil, errors.New("Computer disk manifest does not match its durable Storage identity")
 		}
+		if err = clearSupersededResetRetirement(diskRoot, &manifest, storage, authority.NodeID, ""); err != nil {
+			return nil, err
+		}
 		if manifest.Retirement != nil {
 			return nil, &computerStorageRetiredError{}
 		}

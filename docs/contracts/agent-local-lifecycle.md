@@ -232,6 +232,17 @@ row, validates that every row actually ran and passed, then sends the shared
 cleanup acknowledgement to L1. Crashes retry these idempotent phases; no phase
 starts the Computer.
 
+A reset that L1 ends before publication (a dead-Node abort, or its failure
+budget) leaves the predecessor fence on the Node, and L1 sends nothing to
+clear it. The next attachment, cold Backup, or reset that names that same
+generation at a later intent revision clears it under the attachment flock
+(#1609). L1 advances a Computer's intent revision only while it is `stable`
+(or by abort or removal), and publishes a reset only while the Computer still holds
+the reset's revision, so that later request proves the fenced reset can never
+publish. The fence's Node, and its managed root when the request names one,
+must match. A reset request older than the generation's last attachment is
+refused as stale, so a delayed reset cannot fence the generation again.
+
 Cold Backup create and prune are also standing heartbeat work, separate from
 attempt leases. L1 releases a create directive only after disruptive intent
 has stopped the current Job. The agent passes the exact Computer revision and

@@ -439,6 +439,13 @@ func TestComputerStorageResetRefusesAttachedGenerationAndAuthorityReuse(t *testi
 	if _, err := engine.ResetComputerStorage(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
+	reused := request
+	reused.Authority.CleanupFence = "different-fence"
+	if _, err := engine.ResetComputerStorage(t.Context(), reused); err == nil || !strings.Contains(err.Error(), "different retirement authority") {
+		t.Fatalf("same-revision reset with a different fence = %v, want a retirement authority refusal", err)
+	}
+	// A later revision supersedes the fence (#1609), but the prepared
+	// successor still refuses an authority that did not prepare it.
 	request.Authority.IntentRevision++
 	request.Storage.IntentRevision++
 	request.Authority.CleanupFence = "different-fence"
@@ -485,4 +492,124 @@ func TestComputerStorageResetENOSPCLeavesPredecessorCurrentAndSuccessorTracked(t
 	if staging, err := filepath.Glob(filepath.Join(successorRoot, ".disk.ext4.tmp-*")); err != nil || len(staging) != 0 {
 		t.Fatalf("ENOSPC left allocation staging: %v err=%v", staging, err)
 	}
+}
+
+// abortedResetFence leaves generation 1 fenced by a reset at revision 2 that
+// stopped right after the fence, as when the Node dies and the owner aborts
+// the reset before its successor is prepared (#1609).
+func abortedResetFence(t *testing.T) (*ContainerdEngine, ComputerStorageReference, ResetComputerStorageRequest, string) {
+	t.Helper()
+	root := t.TempDir()
+	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}, diskSystem: newFakeComputerDiskSystem()}
+	storage := testComputerStorage()
+	prior := testComputerAuthority("attempt-a", "fence-a", "boot-a")
+	attachment, err := engine.attachComputerDisk(t.Context(), storage, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := resetTestRequest(storage, prior)
+	request.Storage.IntentRevision = request.Authority.IntentRevision
+	nodeDied := errors.New("Node died after the fence")
+	engine.storageResetHook = func(phase computerStorageResetPhase) error {
+		if phase == computerStorageResetRetirementFenced {
+			return nodeDied
+		}
+		return nil
+	}
+	if _, err := engine.ResetComputerStorage(t.Context(), request); !errors.Is(err, nodeDied) {
+		t.Fatalf("interrupted reset = %v, want the injected Node death", err)
+	}
+	engine.storageResetHook = nil
+	name, _ := deterministicComputerDiskName(storage)
+	diskRoot := filepath.Join(root, "computer-disks", name)
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || manifest.Retirement == nil {
+		t.Fatalf("fenced manifest = %+v present=%t err=%v", manifest, present, err)
+	}
+	return engine, storage, request, diskRoot
+}
+
+func requireNoRetirement(t *testing.T, diskRoot string) {
+	t.Helper()
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || manifest.Retirement != nil {
+		t.Fatalf("manifest after a later revision = %+v present=%t err=%v, want no retirement fence", manifest, present, err)
+	}
+}
+
+// An aborted reset's fence clears when the same generation is named at a
+// later revision, so start, Backup and a new reset work again (#1609).
+func TestAbortedResetFenceClearsForALaterRevision(t *testing.T) {
+	// Abort moved the Computer from revision 2 to 3; start then takes 4.
+	const abortRevision, startRevision = 3, 4
+	t.Run("start", func(t *testing.T) {
+		engine, storage, reset, diskRoot := abortedResetFence(t)
+		var retired *computerStorageRetiredError
+		if _, err := engine.attachComputerDisk(t.Context(), reset.Storage,
+			testComputerAuthority("attempt-same-revision", "fence-s", "boot-a")); !errors.As(err, &retired) {
+			t.Fatalf("attach at the reset's own revision = %v, want retirement", err)
+		}
+		later := storage
+		later.IntentRevision = startRevision
+		foreign := testComputerAuthority("attempt-foreign", "fence-f", "boot-a")
+		foreign.NodeID = "node-other"
+		if _, err := engine.attachComputerDisk(t.Context(), later, foreign); !errors.As(err, &retired) {
+			t.Fatalf("attach from another Node = %v, want retirement", err)
+		}
+		attachment, err := engine.attachComputerDisk(t.Context(), later, testComputerAuthority("attempt-b", "fence-b", "boot-a"))
+		if err != nil {
+			t.Fatalf("start after the aborted reset = %v", err)
+		}
+		if attachment.fresh {
+			t.Fatal("the restarted generation was treated as a fresh disk")
+		}
+		if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+			t.Fatal(err)
+		}
+		requireNoRetirement(t, diskRoot)
+		// The aborted reset, delivered late, must not fence the generation again.
+		if _, err := engine.ResetComputerStorage(t.Context(), reset); err == nil || !strings.Contains(err.Error(), "stale") {
+			t.Fatalf("late aborted reset = %v, want a stale refusal", err)
+		}
+		requireNoRetirement(t, diskRoot)
+	})
+	t.Run("Backup", func(t *testing.T) {
+		engine, storage, reset, diskRoot := abortedResetFence(t)
+		later := storage
+		later.IntentRevision = abortRevision + 1
+		authority := ComputerBackupAuthority{NodeID: reset.Authority.NodeID, BootSessionID: reset.Authority.BootSessionID,
+			HelperGeneration: 1, RootInstanceID: "managed-root-b", JobID: "backup-job", PriorJobID: reset.Authority.PriorJobID,
+			OperationRevision: later.IntentRevision, CleanupFence: "backup-fence"}
+		if _, _, err := engine.lockDetachedBackupSource(t.Context(), later, authority); err == nil {
+			t.Fatal("a Backup under another managed root cleared the fence")
+		}
+		authority.RootInstanceID = reset.Authority.RootInstanceID
+		_, release, err := engine.lockDetachedBackupSource(t.Context(), later, authority)
+		if err != nil {
+			t.Fatalf("Backup after the aborted reset = %v", err)
+		}
+		release()
+		requireNoRetirement(t, diskRoot)
+	})
+	t.Run("reset", func(t *testing.T) {
+		engine, _, reset, diskRoot := abortedResetFence(t)
+		// L1 reserves one past every recorded generation, skipping the
+		// aborted reset's retired staging row.
+		again := reset
+		again.NewGeneration = reset.NewGeneration + 1
+		again.Storage.IntentRevision = abortRevision + 1
+		again.Authority.IntentRevision = abortRevision + 1
+		again.Authority.JobID = "reset-job-2"
+		again.Authority.CleanupFence = "reset-fence-2"
+		if _, err := engine.ResetComputerStorage(t.Context(), again); err != nil {
+			t.Fatalf("new reset after the aborted one = %v", err)
+		}
+		manifest, _, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+		if err != nil || manifest.Retirement == nil || !sameComputerStorageResetAuthority(*manifest.Retirement, again.Authority) {
+			t.Fatalf("fence after the new reset = %+v err=%v, want the new reset's authority", manifest.Retirement, err)
+		}
+	})
 }

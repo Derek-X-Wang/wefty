@@ -33,6 +33,33 @@ func sameComputerStorageResetAuthority(left, right ComputerStorageResetAuthority
 		left.CleanupFence == right.CleanupFence
 }
 
+// clearSupersededResetRetirement lifts a reset's retirement fence from a
+// generation once L1 has moved past that reset without publishing it (#1609).
+// L1 advances a Computer's intent revision only from `stable` (or by abort or
+// removal), and publishes a reset only while the Computer still holds that
+// reset's revision. A request that names this exact generation as current at
+// a later revision therefore proves the fenced reset can never publish: it was
+// aborted or ended by its failure budget, and the generation is current again.
+// The fence's own Node must match, and its managed root must match when the
+// request names one (an attachment names none; the disk root lives under this
+// helper's runtime root). The caller holds the generation's attachment flock
+// and passes the manifest it read under that flock.
+func clearSupersededResetRetirement(diskRoot string, manifest *computerDiskManifest, storage ComputerStorageReference, nodeID, rootInstanceID string) error {
+	retirement := manifest.Retirement
+	if retirement == nil || !sameComputerStorageIdentity(manifest.Storage, storage) ||
+		storage.IntentRevision <= retirement.IntentRevision || retirement.NodeID != nodeID ||
+		rootInstanceID != "" && retirement.RootInstanceID != rootInstanceID {
+		return nil
+	}
+	cleared := *manifest
+	cleared.Retirement = nil
+	if err := writeComputerDiskManifest(diskRoot, cleared); err != nil {
+		return err
+	}
+	*manifest = cleared
+	return nil
+}
+
 func unverifiedComputerStorageResetPreparation(manifest computerDiskManifest) bool {
 	authority := manifest.Preparation
 	return authority != nil && manifest.PreparationReceipt == nil && !manifest.Prepared && manifest.Retirement == nil &&
@@ -137,6 +164,14 @@ func (engine *ContainerdEngine) fenceResetPredecessor(ctx context.Context, stora
 		if !sameComputerStorageIdentity(manifest.Storage, storage) || manifest.DiskImage != "disk.ext4" ||
 			manifest.MountDirectory != name || manifest.Attached != nil || manifest.Pending != nil {
 			return errors.New("Computer Storage reset lacks exact detached generation authority")
+		}
+		// A reset older than the generation's last attachment was superseded;
+		// it must not fence a generation that a later revision made current.
+		if authority.IntentRevision < manifest.Storage.IntentRevision {
+			return errors.New("Computer Storage reset intent revision is stale")
+		}
+		if err := clearSupersededResetRetirement(diskRoot, &manifest, storage, authority.NodeID, authority.RootInstanceID); err != nil {
+			return err
 		}
 		if manifest.Retirement != nil {
 			if !sameComputerStorageResetAuthority(*manifest.Retirement, authority) {
