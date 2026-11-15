@@ -690,7 +690,7 @@ func TestLinuxFleetUpgradeInterruptedDrainRecovery(t *testing.T) {
 			}
 			// Recovery restarted a service, so the stack did change (#1622).
 			if strings.Contains(err.Error(), "installed stack unchanged") || !strings.Contains(err.Error(), "upgrade fetch failed; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged") ||
-				!slices.Equal(report.RestartedServices, []string{"service"}) || report.ClaimsDisabled != operatorDisabled {
+				!slices.Equal(report.RestartedServices, []string{"service"}) || report.ClaimsDisabled != operatorDisabled || !report.InterruptedDrainRecovered {
 				t.Fatalf("preparation failure hides recovery: err=%v report=%+v", err, report)
 			}
 			if restarted != 1 || f.node.ClaimsEnabled == operatorDisabled || len(s.mutations()) != 0 {

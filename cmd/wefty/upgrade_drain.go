@@ -268,7 +268,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 			return node, err
 		}
 		if node.IntentRevision != receipt.Revision || node.ClaimsEnabled || node.IntentReason != receipt.Reason {
-			return node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed during upgrade drain; installed stack unchanged"}}
+			return node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed during upgrade drain; " + upgradeStackUnchanged}}
 		}
 		active = node.ActiveAttempts
 		receipt.counts = upgradeDrainCounts{}
@@ -406,12 +406,12 @@ func upgradeAttemptSettled(job l1.Job, id string) bool {
 // An operator may reopen admission while we wait, and a late claim may appear.
 func checkUpgradeReplacement(node l1.Node, receipt *upgradeDrainReceipt, yes bool) error {
 	if node.NodeID != receipt.NodeID || node.ClaimsEnabled || node.IntentRevision != receipt.Revision || node.IntentReason != receipt.Reason {
-		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed before node replacement; installed stack unchanged"}}
+		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed before node replacement; " + upgradeStackUnchanged}}
 	}
 	if !yes {
 		for _, attempt := range node.ActiveAttempts {
 			if attempt.Class != contract.JobClassService {
-				return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "one-shot became active before node replacement; installed stack unchanged"}}
+				return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "one-shot became active before node replacement; " + upgradeStackUnchanged}}
 			}
 		}
 	}
@@ -428,7 +428,7 @@ func (e *upgradeDrainTimeoutError) Unwrap() error { return &e.apiResponseError }
 
 func (e *upgradeDrainTimeoutError) setRetryable(claimsOpen bool) {
 	e.APIError.Retryable = claimsOpen
-	e.APIError.Message = "drain timed out; installed stack unchanged"
+	e.APIError.Message = "drain timed out; " + upgradeStackUnchanged
 	if claimsOpen {
 		e.APIError.Message += e.hint
 	}
@@ -519,24 +519,59 @@ func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, 
 	return receipt, err
 }
 
-// upgradePreparationLeft says what a failed preparation left alone. Recovery
-// of an interrupted drain earlier in the same command may have restarted
-// services, restored claims and removed its receipt, so "installed stack
-// unchanged" would be false then (#1622).
-func upgradePreparationLeft(recovered *upgradeDrainReceipt) string {
-	if recovered != nil {
-		return "interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged"
+const (
+	upgradeStackUnchanged = "installed stack unchanged"
+	upgradeRecoveryRan    = "interrupted-upgrade recovery ran first and keeps its effects"
+)
+
+// settleUpgradeRecovery applies one rule to every exit of an upgrade whose
+// interrupted-drain recovery ran earlier in the same command (#1622, #1655).
+// Recovery may have restarted services, reopened claims and removed its
+// receipt, so the report says that it ran and keeps what it restarted, and the
+// error names it. "installed stack unchanged" would be false, so it becomes
+// "installed files unchanged" after the recovery note. A drain that began
+// later owns the final claims state; services both restarted are listed once.
+func settleUpgradeRecovery(report upgradeReport, err error, recovered *upgradeDrainReceipt, drained bool) (upgradeReport, error) {
+	if recovered == nil {
+		return report, err
 	}
-	return "installed stack unchanged"
+	report.InterruptedDrainRecovered = true
+	restarted := slices.Clone(recovered.restarted)
+	for _, jobID := range report.RestartedServices {
+		if !slices.Contains(restarted, jobID) {
+			restarted = append(restarted, jobID)
+		}
+	}
+	report.RestartedServices = restarted
+	if !drained {
+		report.ClaimsDisabled = recovered.claimsDisabled
+	}
+	if err == nil {
+		return report, nil
+	}
+	// A typed refusal reports its API message in JSON, so it changes too.
+	var response *apiResponseError
+	if errors.As(err, &response) {
+		response.APIError.Message = noteUpgradeRecovery(response.APIError.Message)
+	}
+	return report, &recoveredUpgradeError{cause: err}
 }
 
-// recoveredUpgradeReport adds what recovery changed to a report.
-func recoveredUpgradeReport(report upgradeReport, recovered *upgradeDrainReceipt) upgradeReport {
-	if recovered != nil {
-		report.RestartedServices, report.ClaimsDisabled = slices.Clone(recovered.restarted), recovered.claimsDisabled
+func noteUpgradeRecovery(message string) string {
+	if strings.Contains(message, upgradeRecoveryRan) {
+		return message
 	}
-	return report
+	if strings.Contains(message, upgradeStackUnchanged) {
+		return strings.ReplaceAll(message, upgradeStackUnchanged, upgradeRecoveryRan+"; installed files unchanged")
+	}
+	return message + "; " + upgradeRecoveryRan
 }
+
+// recoveredUpgradeError keeps the cause for exit codes and typed checks.
+type recoveredUpgradeError struct{ cause error }
+
+func (e *recoveredUpgradeError) Error() string { return noteUpgradeRecovery(e.cause.Error()) }
+func (e *recoveredUpgradeError) Unwrap() error { return e.cause }
 
 func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, recovering bool, out io.Writer) (resultErr error) {
 	// This invocation knows no CAS was sent. Remove the receipt without an

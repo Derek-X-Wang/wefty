@@ -473,6 +473,97 @@ func TestUpgradeDrainInterruptedAfterShutdownBeforeNewBootRecoversNeverService(t
 	}
 }
 
+// pendingClaimsOnlyDrain leaves an interrupted drain whose recovery only
+// reopens claims: no service was running.
+func pendingClaimsOnlyDrain(t *testing.T, f *upgradeFixture) {
+	t.Helper()
+	f.node.ClaimsEnabled = false
+	f.node.IntentRevision = 1
+	f.node.IntentReason = "wefty upgrade claims-only"
+	paths, _ := resolveSetupPaths(f.home)
+	if err := writeUpgradeDrain(paths.config, &upgradeDrainReceipt{Home: f.home, Version: 1, NodeID: f.node.NodeID, Revision: 1, Reason: f.node.IntentReason, RestoreClaims: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Every exit after interrupted-drain recovery says that recovery ran, in the
+// message and in the JSON report (#1655).
+func TestUpgradeAfterDrainRecoveryEveryExitSaysSo(t *testing.T) {
+	t.Run("claims-only recovery then success", func(t *testing.T) {
+		f := newUpgradeFixture(t)
+		pendingClaimsOnlyDrain(t, f)
+		var stdout bytes.Buffer
+		if err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, true, &stdout, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		var report map[string]json.RawMessage
+		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || string(report["interrupted_drain_recovered"]) != "true" {
+			t.Fatalf("report hides claims-only recovery: %v %s", err, &stdout)
+		}
+		if !f.node.ClaimsEnabled {
+			t.Fatal("claims not reopened")
+		}
+		// An upgrade with no pending drain omits the field.
+		stdout.Reset()
+		if err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, true, &stdout, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(stdout.Bytes(), []byte("interrupted_drain_recovered")) {
+			t.Fatalf("report claims a recovery that did not run: %s", &stdout)
+		}
+	})
+	t.Run("drain timeout refusal", func(t *testing.T) {
+		f := newUpgradeFixture(t)
+		pendingClaimsOnlyDrain(t, f)
+		f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
+		var stdout bytes.Buffer
+		err := executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, false, &stdout, io.Discard, 12*time.Second)
+		const want = "drain timed out; interrupted-upgrade recovery ran first and keeps its effects; installed files unchanged; try again when the running one-shots finish"
+		var refusal *apiResponseError
+		if commandExitCode(err) != exitConflict || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "installed stack unchanged") ||
+			!errors.As(err, &refusal) || !strings.HasPrefix(refusal.APIError.Message, want) || !refusal.APIError.Retryable {
+			t.Fatalf("drain timeout hides recovery: %v", err)
+		}
+		var report upgradeReport
+		if e := json.Unmarshal(stdout.Bytes(), &report); e != nil || !report.InterruptedDrainRecovered {
+			t.Fatalf("report hides recovery: %v %s", e, &stdout)
+		}
+	})
+	t.Run("untyped exit keeps restarted services", func(t *testing.T) {
+		f := newUpgradeFixture(t)
+		pendingClaimsOnlyDrain(t, f)
+		paths, _ := resolveSetupPaths(f.home)
+		receipt, err := readUpgradeDrain(paths.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The old node agent stopped its service before the crash.
+		f.node.State = contract.NodeDraining
+		receipt.OldBoot = f.node.BootSessionID
+		receipt.Services = []l1.NodeActiveAttempt{{JobID: "app", AttemptID: "old-attempt", Class: contract.JobClassService}}
+		if err := writeUpgradeDrain(paths.config, receipt); err != nil {
+			t.Fatal(err)
+		}
+		f.operations.readJob = func(context.Context, connprofile.Profile, string) (l1.Job, error) {
+			return l1.Job{JobID: "app", State: contract.JobFailed, CurrentAttemptID: "old-attempt", ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredRunning, BoundNodeID: f.node.NodeID}}, nil
+		}
+		f.operations.restartService = func(context.Context, connprofile.Profile, string, string) (l1.Job, error) { return l1.Job{}, nil }
+		// A source path that is not a real folder is refused after recovery.
+		if err := os.WriteFile(filepath.Join(paths.data, upgradeSourceName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout bytes.Buffer
+		err = executeUpgradeWithHost(t.Context(), f.host, globalOptions{jsonOutput: true}, false, &stdout, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "must be a real folder; interrupted-upgrade recovery ran first and keeps its effects") {
+			t.Fatalf("refusal hides recovery: %v", err)
+		}
+		var report upgradeReport
+		if e := json.Unmarshal(stdout.Bytes(), &report); e != nil || !slices.Equal(report.RestartedServices, []string{"app"}) || !report.InterruptedDrainRecovered {
+			t.Fatalf("report hides recovery: %v %s", e, &stdout)
+		}
+	})
+}
+
 func TestUpgradeDrainTimeoutFlagControlsBoundAndProgress(t *testing.T) {
 	f := newUpgradeFixture(t)
 	f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}

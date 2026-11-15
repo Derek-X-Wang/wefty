@@ -94,12 +94,22 @@ never makes upgrade skip.
 
 A failed preparation says what it left alone. Its message ends the failed
 step with `installed stack unchanged`: fetch, build, version check, state
-snapshot or state preflight. When interrupted-drain recovery completed earlier
-in the same command, the stack did change, so the message says
-`interrupted-upgrade recovery ran first and keeps its effects; installed files
-unchanged` in that place. The upgrade report on stdout in JSON mode then
-carries that recovery's `restarted_services` and `claims_remain_disabled`.
-This holds for the plain Mac upgrade and the fleet upgrade.
+snapshot or state preflight. Refusals after preparation, such as a drain
+timeout or a changed node intent, say the same.
+
+When interrupted-drain recovery completed earlier in the same command, the
+stack did change. Every later exit of that command then says so. A message
+that would say `installed stack unchanged` says `interrupted-upgrade recovery
+ran first and keeps its effects; installed files unchanged` in that place, in
+human output and in the JSON error. Any other error message ends with
+`; interrupted-upgrade recovery ran first and keeps its effects`. The upgrade
+report, on success and on failure, has `interrupted_drain_recovered: true` and
+carries that recovery's `restarted_services` and `claims_remain_disabled`. A
+recovery that only reopened claims shows only `interrupted_drain_recovered`.
+When a new drain then runs, `restarted_services` lists the services of both,
+each once, and `claims_remain_disabled` is the state after the new drain.
+Without a recovery the field is absent. This holds for the plain Mac upgrade
+and the fleet upgrade.
 
 ## Running work and activation
 
@@ -1047,7 +1057,8 @@ message. Recovery reports `Rolling upgrade recovery: <state>; operation <id>.`.
 JSON uses the same upgrade report: `version`, `lease_renewal_ns`, `setup`,
 `running_work`, `already_at`, the three drain counts, and the existing optional
 `recovery_state`, `recovered_operation_id`, `version_warnings`,
-`restarted_services` and `claims_remain_disabled`. JSON suppresses human
+`restarted_services`, `claims_remain_disabled` and
+`interrupted_drain_recovered`. JSON suppresses human
 progress on stderr. On refusal, stdout contains the upgrade report and stderr
 contains the standard JSON error. Typed refusals retain the existing conflict
 error shape and exit 5. Status and doctor do not change.
