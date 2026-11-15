@@ -581,8 +581,13 @@ func TestRemovalRecoversACopyAStartupSweepDeferred(t *testing.T) {
 		deferredAt time.Duration
 		fault      bool
 		foreign    bool
+		copyHeld   bool
 	}{
 		{name: "rolls_back_before_manifest", checkpoint: computerStorageCopyCopied, attempts: 1},
+		// A copy in flight holds storageCopyMu from its quarantine check
+		// through its generation lock; a counted step that could quarantine
+		// waits for it and answers contended, counting nothing.
+		{name: "copy_in_flight_answers_contended", checkpoint: computerStorageCopyCopied, attempts: 1, copyHeld: true},
 		{name: "publishes_after_manifest", checkpoint: computerStorageCopyManifestWritten, attempts: 3},
 		{name: "fault_counts_one_attempt", checkpoint: computerStorageCopyManifestWritten, attempts: 1, fault: true},
 		{name: "fault_at_the_bound_quarantines", checkpoint: computerStorageCopyManifestWritten,
@@ -623,6 +628,22 @@ func TestRemovalRecoversACopyAStartupSweepDeferred(t *testing.T) {
 				RootInstanceID: request.Authority.RootInstanceID, ComputerStorage: &storage}
 			if test.foreign {
 				inventoryRequest.Removal.JobID, inventoryRequest.Removal.PriorJobID = "other-job", "other-job"
+			}
+			if test.copyHeld {
+				previous := computerStorageAdmissionWait
+				computerStorageAdmissionWait = 20 * time.Millisecond
+				t.Cleanup(func() { computerStorageAdmissionWait = previous })
+				engine.storageCopyMu.Lock()
+				_, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
+				engine.storageCopyMu.Unlock()
+				var contended *computerStorageAdmissionContendedError
+				if !errors.As(err, &contended) {
+					t.Fatalf("removal recovery beside an in-flight copy = %T %v", err, err)
+				}
+				manifest, present, readErr := readComputerStorageCopyManifest(recordPath)
+				if readErr != nil || !present || manifest.Recovery.Attempts != test.attempts {
+					t.Fatalf("contended removal changed the deferred record: %+v present=%t err=%v", manifest.Recovery, present, readErr)
+				}
 			}
 			inventory, err := engine.InventoryRemoval(t.Context(), inventoryRequest)
 			switch {
