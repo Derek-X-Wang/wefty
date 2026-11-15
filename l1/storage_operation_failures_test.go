@@ -380,51 +380,116 @@ func beginStoppedReset(t *testing.T, h *integrationHarness, node Node, computer 
 	return directives[0]
 }
 
-// Owner decision D1: until a fenced reset can heal (#1609), a reset is never
-// ended before publication, whatever the class -- quarantine included. Its
-// failures are counted and shown. With the switch on, the reset ends `failed`
-// on the old generation and the next reset is admitted, which needs the
-// rebuilt active-reset index.
-func TestStorageOperationFailureBudgetCountsButKeepsResetBeforePublication(t *testing.T) {
-	ctx := context.Background()
-	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 3)
-	directive := beginStoppedReset(t, h, node, computer, "counted-reset")
-	reporter := newFailureReporter(t, h, node, computer.ComputerID, ComputerStorageOperationReset,
-		directive.IntentRevision, ComputerStorageOperationPrepare, directive.CleanupFence)
-	for range MaximumStorageOperationFailures + 2 {
-		h.clock.Advance(3 * time.Minute)
-		reporter.report(ComputerStorageOperationFailureEngine, ComputerStorageOperationFailureCounted)
+// A reset that keeps failing before publication ends `failed` on the old
+// generation, held stopped, and the next reset is admitted, which needs the
+// rebuilt active-reset index (#1703). The helper may still hold the old
+// generation's reset fence; every way back -- start, Backup, a new reset --
+// names that generation at a later intent revision, which is the proof the
+// helper needs to clear that fence (#1609, #1702). A Computer that was running
+// keeps desired_state running while held stopped, so its way back is a restart.
+func TestStorageOperationFailureBudgetEndsResetBeforePublication(t *testing.T) {
+	endedReset := func(t *testing.T, running bool) (*integrationHarness, Node, Computer, ComputerStorageResetDirective) {
+		t.Helper()
+		ctx := context.Background()
+		var h *integrationHarness
+		var node Node
+		var directive ComputerStorageResetDirective
+		if running {
+			var computer Computer
+			h, node, computer = backupHarness(t, 2, nil)
+			computer, claim := startBackupComputer(t, h, node, computer)
+			if _, _, err := h.store.BeginComputerStorageReset(ctx, computer.ComputerID, ComputerStorageResetRequest{
+				ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "failed-reset", TerminateSessions: true}); err != nil {
+				t.Fatal(err)
+			}
+			finishBackupQuiescence(t, h, claim, "failed-reset-stop")
+			directives, err := h.store.ListNodeComputerStorageResetDirectives(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("reset directives = %#v err=%v", directives, err)
+			}
+			directive = directives[0]
+		} else {
+			var computer Computer
+			h, node, computer, _, _ = publishedBackupForStorageCopy(t, 3)
+			directive = beginStoppedReset(t, h, node, computer, "failed-reset")
+		}
+		reporter := newFailureReporter(t, h, node, directive.ComputerID, ComputerStorageOperationReset,
+			directive.IntentRevision, ComputerStorageOperationPrepare, directive.CleanupFence)
+		for range MaximumStorageOperationFailures - 1 {
+			reporter.report(ComputerStorageOperationFailureEngine, ComputerStorageOperationFailureCounted)
+		}
+		// The Node stays alive through the window, so the start below can claim.
+		for elapsed := time.Duration(0); elapsed < StorageOperationFailureWindow; elapsed += 30 * time.Second {
+			h.clock.Advance(30 * time.Second)
+			if _, err := h.store.HeartbeatNode(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if exhausted := reporter.report(ComputerStorageOperationFailureEngine, ComputerStorageOperationFailureExhausted); exhausted.OperationStatus != "failed" {
+			t.Fatalf("exhausted reset = %#v", exhausted)
+		}
+		ended, err := h.store.GetComputer(ctx, directive.ComputerID)
+		if err != nil || ended.ReconfigurationPhase != ComputerReconfigurationStable || ended.StorageGeneration != directive.OldGeneration ||
+			ended.CurrentJob.State != contract.JobStopped || ended.LastResetOperation == nil || ended.LastResetOperation.Status != "failed" ||
+			ended.LastResetOperation.FailureCode != "engine_failure" || ended.LastResetOperation.CompletedAt == nil ||
+			ended.LastResetOperation.Failure == nil || ended.LastResetOperation.Failure.FailedAttempts != MaximumStorageOperationFailures {
+			t.Fatalf("failed reset left Computer = %#v err=%v", ended, err)
+		}
+		if code := latchedFailureCode(t, h, ended.CurrentJobID); code != contract.SpawnFailureComputerStorageOperationFailed {
+			t.Fatalf("latched failure = %q", code)
+		}
+		if directives, err := h.store.ListNodeComputerStorageResetDirectives(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID); err != nil || len(directives) != 0 {
+			t.Fatalf("failed reset still dispatches = %#v err=%v", directives, err)
+		}
+		return h, node, ended, directive
 	}
-	reporter.report(ComputerStorageOperationFailureQuarantined, ComputerStorageOperationFailureCounted)
-	resetting, err := h.store.GetComputer(ctx, computer.ComputerID)
-	if err != nil || resetting.ReconfigurationPhase != ComputerReconfigurationResetting || resetting.LastResetOperation == nil ||
-		resetting.LastResetOperation.Status != "reserved" || resetting.LastResetOperation.Failure == nil ||
-		resetting.LastResetOperation.Failure.FailedAttempts != MaximumStorageOperationFailures+3 ||
-		resetting.LastResetOperation.Failure.Class != ComputerStorageOperationFailureQuarantined {
-		t.Fatalf("counted reset = %#v err=%v", resetting.LastResetOperation, err)
-	}
-	if directives, err := h.store.ListNodeComputerStorageResetDirectives(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID); err != nil || len(directives) != 1 {
-		t.Fatalf("counted reset no longer dispatches = %#v err=%v", directives, err)
-	}
-
-	storageResetPrepareEndsByBudget = true
-	t.Cleanup(func() { storageResetPrepareEndsByBudget = false })
-	if exhausted := reporter.report(ComputerStorageOperationFailureEngine, ComputerStorageOperationFailureExhausted); exhausted.OperationStatus != "failed" {
-		t.Fatalf("exhausted reset = %#v", exhausted)
-	}
-	ended, err := h.store.GetComputer(ctx, computer.ComputerID)
-	if err != nil || ended.ReconfigurationPhase != ComputerReconfigurationStable || ended.StorageGeneration != directive.OldGeneration ||
-		ended.LastResetOperation == nil || ended.LastResetOperation.Status != "failed" || ended.LastResetOperation.FailureCode != "engine_failure" ||
-		ended.LastResetOperation.CompletedAt == nil {
-		t.Fatalf("failed reset left Computer = %#v err=%v", ended, err)
-	}
-	if code := latchedFailureCode(t, h, ended.CurrentJobID); code != contract.SpawnFailureComputerStorageOperationFailed {
-		t.Fatalf("latched failure = %q", code)
-	}
-	next := beginStoppedReset(t, h, node, ended, "after-failed-reset")
-	if next.NewGeneration != directive.NewGeneration+1 {
-		t.Fatalf("next reset generation = %d after %d", next.NewGeneration, directive.NewGeneration)
-	}
+	t.Run("start", func(t *testing.T) {
+		h, node, ended, failed := endedReset(t, false)
+		if _, err := h.store.SetComputerDesiredState(context.Background(), ended.ComputerID, ComputerDesiredStateRequest{
+			ComputerMutationPrecondition: computerPrecondition(ended, "operator"), DesiredState: contract.ServiceDesiredRunning}); err != nil {
+			t.Fatal(err)
+		}
+		_, claim := startBackupComputer(t, h, node, ended)
+		if claim.ComputerStorage == nil || claim.ComputerStorage.StorageGeneration != failed.OldGeneration ||
+			claim.ComputerStorage.IntentRevision <= failed.IntentRevision {
+			t.Fatalf("start after failed reset at revision %d claims %#v", failed.IntentRevision, claim.ComputerStorage)
+		}
+	})
+	t.Run("restart of a running Computer", func(t *testing.T) {
+		h, node, ended, failed := endedReset(t, true)
+		if ended.DesiredState != contract.ServiceDesiredRunning {
+			t.Fatalf("ended running reset desired_state = %q", ended.DesiredState)
+		}
+		if _, _, err := h.store.RestartComputer(context.Background(), ended.ComputerID, ComputerRestartRequest{
+			ComputerMutationPrecondition: computerPrecondition(ended, "operator"), IdempotencyKey: "after-failed-reset"}); err != nil {
+			t.Fatal(err)
+		}
+		_, claim := startBackupComputer(t, h, node, ended)
+		if claim.ComputerStorage == nil || claim.ComputerStorage.StorageGeneration != failed.OldGeneration ||
+			claim.ComputerStorage.IntentRevision <= failed.IntentRevision {
+			t.Fatalf("restart after failed reset at revision %d claims %#v", failed.IntentRevision, claim.ComputerStorage)
+		}
+	})
+	t.Run("Backup", func(t *testing.T) {
+		h, node, ended, failed := endedReset(t, false)
+		if _, _, err := h.store.BeginComputerBackup(context.Background(), ended.ComputerID, ComputerBackupCreateRequest{
+			ComputerMutationPrecondition: computerPrecondition(ended, "operator"), IdempotencyKey: "after-failed-reset"}); err != nil {
+			t.Fatal(err)
+		}
+		directives, err := h.store.ListNodeComputerBackupDirectives(context.Background(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if err != nil || len(directives) != 1 || directives[0].StorageGeneration != failed.OldGeneration ||
+			directives[0].OperationRevision <= failed.IntentRevision {
+			t.Fatalf("Backup after failed reset at revision %d = %#v err=%v", failed.IntentRevision, directives, err)
+		}
+	})
+	t.Run("reset", func(t *testing.T) {
+		h, node, ended, failed := endedReset(t, false)
+		next := beginStoppedReset(t, h, node, ended, "after-failed-reset")
+		if next.OldGeneration != failed.OldGeneration || next.IntentRevision <= failed.IntentRevision ||
+			next.NewGeneration != failed.NewGeneration+1 {
+			t.Fatalf("reset after failed reset %#v = %#v", failed, next)
+		}
+	})
 }
 
 // A reset that published but cannot delete its predecessor ends

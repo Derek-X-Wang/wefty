@@ -124,17 +124,6 @@ var (
 	storageOperationFailureCodeFormat = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 )
 
-// storageResetPrepareEndsByBudget is false until a fenced reset can be healed
-// (#1609). The helper fences the old generation before it prepares the
-// successor, and nothing clears that fence, so ending a reset early would
-// strand a Computer that the same reset might still heal. Reset failures are
-// counted and shown meanwhile; turning this on is the whole change.
-var storageResetPrepareEndsByBudget = false
-
-func storageOperationStageEndsByBudget(verb ComputerStorageOperationVerb, stage ComputerStorageOperationStage) bool {
-	return verb != ComputerStorageOperationReset || stage != ComputerStorageOperationPrepare || storageResetPrepareEndsByBudget
-}
-
 // storageOperationFailureCode is the closed failure_code an operation ends
 // with, derived from the class of the report that spent its budget.
 func storageOperationFailureCode(class ComputerStorageOperationFailureClass) string {
@@ -358,10 +347,9 @@ func (s *Store) ReportComputerStorageOperationFailure(ctx context.Context, ident
 	}
 	// Only a counted report can spend the budget, so the operation's
 	// failure_code is always a counted class.
-	exhausted := counted && storageOperationStageEndsByBudget(request.Verb, request.Stage) &&
-		(request.Class == ComputerStorageOperationFailureQuarantined ||
-			(failures.failedAttempts >= MaximumStorageOperationFailures && failures.firstFailedNS.Valid &&
-				now.Sub(time.Unix(0, failures.firstFailedNS.Int64)) >= StorageOperationFailureWindow))
+	exhausted := counted && (request.Class == ComputerStorageOperationFailureQuarantined ||
+		(failures.failedAttempts >= MaximumStorageOperationFailures && failures.firstFailedNS.Valid &&
+			now.Sub(time.Unix(0, failures.firstFailedNS.Int64)) >= StorageOperationFailureWindow))
 	if exhausted {
 		failures.exhaustedNS = sql.NullInt64{Int64: nowNS, Valid: true}
 	}
@@ -536,8 +524,9 @@ func endComputerRestoreRetire(ctx context.Context, tx *sql.Tx, row computerStora
 
 // endComputerResetPrepare ends a reset before publication: the staging
 // generation retires and the Computer returns to `stable` on the old
-// generation, held stopped like a dead-Node abort. It is reachable only once
-// storageResetPrepareEndsByBudget is on (#1609).
+// generation, held stopped like a dead-Node abort. The helper's fence on the
+// old generation stays until the next start, Backup or reset names that
+// generation at a later intent revision and clears it (#1609).
 func endComputerResetPrepare(ctx context.Context, tx *sql.Tx, reset computerStorageResetRow, code string, latchedFailure []byte, now time.Time) error {
 	result, err := tx.ExecContext(ctx, `UPDATE computer_storage_resets SET status='failed', failure_code=?, completed_ns=?
 		WHERE computer_id=? AND intent_revision=? AND status IN ('reserved', 'prepared')`,
