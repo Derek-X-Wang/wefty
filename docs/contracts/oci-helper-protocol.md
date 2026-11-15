@@ -1811,8 +1811,12 @@ inventory, when the copy record names the removal's own Storage, Node, managed
 root and Job (or prior Job) and the destination is neither mounted nor
 loop-attached: before `manifest_written` the rollback leaves a lock-only root
 that removal proves absent, and from there on the local publication gives
-removal its verified receipt. A deferral record, or a failed recovery, is left
-for the sweep. The agent holds nothing: until L1's budget ends the copy, the next attempt
+removal its verified receipt. A record a startup sweep already deferred takes
+the counted recovery step an ordinary copy call takes: the attempt is counted,
+and the `resume_abandoned` bound quarantines the generation. After L1 ends the
+copy no copy call follows, so without this the residue waited for the next
+helper restart. A failed recovery is left for a later removal or the sweep. The
+agent holds nothing: until L1's budget ends the copy, the next attempt
 calls the copy again after L1's `retry_after_seconds`.
 
 Ending the clone deletes nothing: whatever the helper kept -- the
