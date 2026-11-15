@@ -138,6 +138,10 @@ func (engine *ContainerdEngine) lockDetachedBackupSource(ctx context.Context, st
 		release()
 		return "", nil, err
 	}
+	if err := clearSupersededResetRetirement(diskRoot, &manifest, storage, authority.NodeID, authority.RootInstanceID); err != nil {
+		release()
+		return "", nil, err
+	}
 	if present && sameComputerStorageIdentity(manifest.Storage, storage) && manifest.DiskImage == "disk.ext4" &&
 		manifest.MountDirectory == name && manifest.Attached == nil && manifest.Pending == nil &&
 		manifest.Retirement == nil && manifest.PreviousDetachment == nil {
