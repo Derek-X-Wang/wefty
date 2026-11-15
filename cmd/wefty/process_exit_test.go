@@ -231,6 +231,14 @@ func startStubLedger(t *testing.T, handler http.HandlerFunc) string {
 	return listener.Addr().String()
 }
 
+// stubLedgerAddress is the address a startStubLedger handler serves on, read
+// from the accepted connection. A handler that hands out its own address uses
+// it instead of the returned string: the test assigns that string while the
+// server already serves, so a handler reading it races the write (#1688).
+func stubLedgerAddress(r *http.Request) string {
+	return r.Context().Value(http.LocalAddrContextKey).(net.Addr).String()
+}
+
 // firstJSONDocument trims anything a command wrote around its JSON body.
 func firstJSONDocument(output string) string {
 	start := strings.Index(output, "{")

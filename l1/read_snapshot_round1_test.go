@@ -92,7 +92,12 @@ func TestReadSnapshotAdmissionBounded(t *testing.T) {
 	done := make(chan error, readSnapshotLimit)
 	for range readSnapshotLimit {
 		go func() {
-			ctx := t.Context()
+			// Filling the pool opens a fresh SQLite connection per reader and
+			// parses the schema on it. Under -race that takes longer than the
+			// production 200ms admission and hold limits, so the fillers would
+			// fail before they enter (#1657). Only the reader past capacity
+			// below must meet the production admission bound.
+			ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, testwait.Bound)
 			done <- s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error {
 				entered <- struct{}{}
 				<-release

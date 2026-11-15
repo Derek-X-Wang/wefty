@@ -30,10 +30,9 @@ func TestSeatScreenInputScreenshotSettles(t *testing.T) {
 				t.Fatal(err)
 			}
 			var incremental, baseline, full, syncs, events atomic.Int32
-			address := ""
-			address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/screen-target") {
-					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address})
+					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r)})
 					return
 				}
 				ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"binary"}})
@@ -167,13 +166,15 @@ func TestSeatScreenInputScreenshotSettles(t *testing.T) {
 				if !wantChange && elapsed < seatScreenSettleLimit-50*time.Millisecond {
 					t.Errorf("settle returned early: %s", elapsed)
 				}
-				if elapsed > seatScreenSettleLimit+800*time.Millisecond {
+				// SC-1: the plain build holds the product margin; -race widens
+				// only the margin, never the settle limit itself (#1688).
+				if elapsed > seatScreenSettleLimit+800*time.Millisecond*raceTimingScale {
 					t.Errorf("settle exceeded limit and margin: %s", elapsed)
 				}
 				if incremental.Load() == 0 || incremental.Load() > 60 {
 					t.Errorf("incremental requests=%d", incremental.Load())
 				}
-			} else if reply.Debug.Phases["capture_drained"] != 0 || reply.Debug.Phases["frame_baseline"] != 0 || reply.Debug.Phases["frame_update_seen"] != 0 || reply.Debug.Phases["frame_update_timeout"] != 0 || reply.After != nil || incremental.Load() != 0 || elapsed > 800*time.Millisecond {
+			} else if reply.Debug.Phases["capture_drained"] != 0 || reply.Debug.Phases["frame_baseline"] != 0 || reply.Debug.Phases["frame_update_seen"] != 0 || reply.Debug.Phases["frame_update_timeout"] != 0 || reply.After != nil || incremental.Load() != 0 || elapsed > 800*time.Millisecond*raceTimingScale {
 				t.Errorf("ordinary call changed: reply=%s incremental=%d elapsed=%s", out.String(), incremental.Load(), elapsed)
 			}
 			if scenario == "input-only" {

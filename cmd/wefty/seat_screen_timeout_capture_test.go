@@ -40,15 +40,14 @@ func TestSeatScreenTimeoutCapturesOnInputConnection(t *testing.T) {
 			var inputs, views, incremental, finals atomic.Int32
 			var heldAtFinal atomic.Bool
 			inputClosed, finalSeen := make(chan struct{}), make(chan struct{})
-			address := ""
-			address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get(l1.SeatCredentialHeader) != "capture-secret" {
 					t.Error("missing Seat credential")
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
 				if strings.HasSuffix(r.URL.Path, "/screen-target") {
-					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address})
+					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r)})
 					return
 				}
 				if strings.HasSuffix(r.URL.Path, "/view") {

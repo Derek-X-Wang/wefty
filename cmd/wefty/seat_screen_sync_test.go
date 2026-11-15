@@ -32,10 +32,9 @@ func TestSeatScreenSyncDeliversQueuedInputBeforeClose(t *testing.T) {
 	var delivered, syncs, incremental, views atomic.Int32
 	var closedBeforeDelivery atomic.Bool
 	inputClosed := make(chan struct{})
-	address := ""
-	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/screen-target") {
-			_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address})
+			_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r)})
 			return
 		}
 		isView := strings.HasSuffix(r.URL.Path, "/view")
@@ -167,7 +166,8 @@ func TestSeatScreenSyncDeliversQueuedInputBeforeClose(t *testing.T) {
 	if views.Load() != 0 {
 		t.Errorf("view connections=%d", views.Load())
 	}
-	if elapsed < 1150*time.Millisecond || elapsed > 1900*time.Millisecond {
+	// The fixture holds input 1.2s; -race widens only the overhead margin (#1688).
+	if elapsed < 1150*time.Millisecond || elapsed > 1200*time.Millisecond+700*time.Millisecond*raceTimingScale {
 		t.Errorf("wrong Sync/window latency: %s", elapsed)
 	}
 	var reply struct {
@@ -208,10 +208,9 @@ func TestSeatScreenSyncReportsChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			var syncs, incremental, events, views, full atomic.Int32
-			address := ""
-			address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/screen-target") {
-					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address})
+					_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + stubLedgerAddress(r)})
 					return
 				}
 				if strings.HasSuffix(r.URL.Path, "/view") {
