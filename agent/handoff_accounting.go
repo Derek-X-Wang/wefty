@@ -800,6 +800,10 @@ func (m *handoffManager) accountNodeEnforcing(ctx context.Context, enforce bool)
 	if m.stateRoot != "" {
 		guard, err := m.sharedLease("node-results-collection")
 		if errors.Is(err, errSharedLeaseBusy) {
+			// Another collection pass, in this agent or another generation,
+			// holds the lease. Say so: a skipped pass leaves the node's figures
+			// stale or absent until the next one (#1700).
+			m.log("agent: skip this retained-results accounting pass: another collection pass holds the node's collection lease")
 			return nil
 		}
 		if err != nil {

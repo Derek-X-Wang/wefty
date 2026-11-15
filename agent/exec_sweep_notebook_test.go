@@ -195,7 +195,7 @@ func TestExecSweepNotebookCollectorTicks(t *testing.T) {
 	calls := filepath.Join(t.TempDir(), "scans")
 	notebookScannerShim(t, fmt.Sprintf("printf 'scan\\n' >> %q\n[ \"$(cat %q)\" = complete ] || exit 2\nexit 0", calls, mode))
 	a := &Agent{clock: f.clock, handoffs: f.manager}
-	a.startResultCollector(t.Context())
+	a.startResultCollector(t.Context(), nil)
 	t.Cleanup(a.stopResultCollector)
 	if err := awaitFixtureCondition(t.Context(), "startup sweep and hourly collector timer", func() bool { return f.clock.hasDeadline(f.clock.Now().Add(time.Hour)) }); err != nil {
 		t.Fatal(err)
@@ -571,7 +571,7 @@ func TestExecSweepNotebookStartupDoesNotBlock(t *testing.T) {
 	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	f.manager.logf = func(string, ...any) { close(entered); <-release }
 	a := &Agent{clock: f.clock, handoffs: f.manager}
-	go func() { a.startResultCollector(t.Context()); close(returned) }()
+	go func() { a.startResultCollector(t.Context(), nil); close(returned) }()
 	t.Cleanup(func() {
 		close(release)
 		testwait.Receive(t, "collector start returns during cleanup", returned)
