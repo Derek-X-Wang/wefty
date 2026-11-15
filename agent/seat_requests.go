@@ -76,7 +76,7 @@ func (a *Agent) runSeatRequests(ctx context.Context) {
 			go func(input l1.SeatCallInput, poll l1.SeatCallPoll) {
 				defer workers.Done()
 				defer func() { mu.Lock(); delete(active, input.SeatID); mu.Unlock() }()
-				request := l1.SeatApprovalRequest{SeatID: input.SeatID, Harness: input.Harness, Folder: input.Folder, Form: input.Form, Network: input.Network, WindowHours: input.WindowHours}
+				request := l1.SeatApprovalRequest{SeatID: input.SeatID, Harness: input.Harness, Folder: input.Folder, Form: input.Form, Network: input.Network, WindowHours: input.WindowHours, Computer: input.Computer, StartComputer: input.StartComputer}
 				approval, err := a.RequestSeatApproval(ctx, request)
 				if err == nil && approval.State == "approved" {
 					// Re-read intent after an arbitrarily long owner dialog.

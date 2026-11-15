@@ -3680,6 +3680,11 @@ AND state=@job_queued
 					&storage.SeatLimit, &storage.IdleAction, &storage.Network, &storage.ImageSeatPlaces, &storage.SeatRequestMade); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
+			// The node runs Seats from this claim, so it carries the effective
+			// Seat places, including the default-image fallback (#1155).
+			if !storage.SeatRequestMade {
+				storage.ImageSeatPlaces = s.imageSeatPlaces(storage.ImageSeatPlaces, spec)
+			}
 			computerStorage = &storage
 		}
 	}

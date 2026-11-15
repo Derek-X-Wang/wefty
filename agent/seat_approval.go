@@ -332,7 +332,15 @@ func seatApprovalMessage(r l1.SeatApprovalRequest) string {
 			window += ", and requests without internet"
 		}
 	}
-	return fmt.Sprintf("Network: %s\nForm: %s\nApproval: %s\nHarness (not verified): %s\nFolder: %s", network, r.Form, window, seatApprovalDisplayText(r.Harness), seatApprovalDisplayText(r.Folder))
+	form := r.Form
+	if r.Form == l1.SeatFormByName {
+		// BN-2: the owner sees which Computer, and that approving starts it.
+		form = "by name: Computer " + seatApprovalDisplayText(r.Computer)
+		if r.StartComputer {
+			form += ", and start it"
+		}
+	}
+	return fmt.Sprintf("Network: %s\nForm: %s\nApproval: %s\nHarness (not verified): %s\nFolder: %s", network, form, window, seatApprovalDisplayText(r.Harness), seatApprovalDisplayText(r.Folder))
 }
 func seatApprovalDisplayText(value string) string {
 	text := []rune(strconv.Quote(strings.Join(strings.Fields(value), " ")))

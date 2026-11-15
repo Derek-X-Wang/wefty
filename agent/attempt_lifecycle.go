@@ -2090,7 +2090,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request.Execution = executionSpec
 	var result contract.ProcessResult
 	var runErr error
-	if computerService && claim.ComputerStorage != nil && claim.ComputerStorage.SeatRequestMade {
+	if computerService && computerTakesSeats(claim.ComputerStorage) {
 		seatRuntime, ok := runtimeAdapter.(computerSeatRuntime)
 		if !ok {
 			err := errors.New("Computer runtime does not support Seat observations")
@@ -2850,4 +2850,15 @@ func (lifecycle *attemptLifecycle) retirementPublicationSettled(ctx context.Cont
 		return false, err
 	}
 	return present && record.NodeID == lifecycle.dependencies.nodeID && record.AttemptID == claim.Lease.AttemptID && record.publishes(), nil
+}
+
+// computerTakesSeats reports whether this Attempt runs the Seat controller:
+// every Seat-request-made Computer, and an owner-made one with a positive
+// Seat limit whose image supports Seats (#1155). Only Seat-request-made
+// Computers get a mutable memory limit; owner-made Seats share a fixed one.
+func computerTakesSeats(storage *l1.ComputerStorageClaim) bool {
+	if storage == nil {
+		return false
+	}
+	return storage.SeatRequestMade || storage.ComputerSettings != nil && storage.SeatLimit > 0 && storage.ImageSeatPlaces > 0
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,23 @@ func TestSeatRequestHelpAndMissingNetworkRealBinary(t *testing.T) {
 	if code != 2 || !strings.Contains(out, "--network internet|none") {
 		t.Fatalf("missing network exit=%d output=%s", code, out)
 	}
+	if !strings.Contains(out, "--computer NAME") {
+		t.Fatalf("usage omits by name: %s", out)
+	}
+	// By name is its own form: it cannot also ask for a dedicated Computer.
+	// L1 allows 255 characters in a name, not 255 bytes.
+	if _, err := parseSeatRequestFlags([]string{"--network", "none", "--computer", strings.Repeat("桌", 255)}); err != nil {
+		t.Fatalf("a valid multibyte Computer name was refused: %v", err)
+	}
+	if _, err := parseSeatRequestFlags([]string{"--network", "none", "--computer", strings.Repeat("桌", 256)}); err == nil {
+		t.Fatal("a 256-character Computer name was accepted")
+	}
+	for _, args := range [][]string{{"--computer", "desk", "--dedicated"}, {"--dedicated", "--computer="}, {"--computer", ""}, {"--computer", " "}} {
+		code, out = runWefty(t, binary, 30*time.Second, append([]string{"seat", "request", "--network", "none"}, args...)...)
+		if code != 2 || !strings.Contains(out, "--dedicated | --computer NAME") {
+			t.Fatalf("by-name usage %q exit=%d output=%s", args, code, out)
+		}
+	}
 }
 
 func TestSeatRequestRefusalsAndCredentialFromRealBinary(t *testing.T) {
@@ -40,6 +58,11 @@ func TestSeatRequestRefusalsAndCredentialFromRealBinary(t *testing.T) {
 		{"the host VM is off", "seat_host_off"},
 		{"the owner turned the host VM off", "seat_host_off"},
 		{"Computer failed to start", "seat_start_failed"},
+		// By-name refusals (#1155): the fixed prefix types them, whatever the name.
+		{l1.SeatByNameNetworkPrefix + `Computer "full: x" has network internet; ask with --network internet`, "seat_computer_network"},
+		{l1.SeatByNameUnsupportedPrefix + `the image of Computer "desk" does not support Seats`, "seat_computer_unsupported"},
+		{l1.SeatByNameUnavailablePrefix + `Computer "desk" was removed`, "seat_computer_unavailable"},
+		{l1.SeatByNameFullPrefix + `Computer "desk" holds its 2 Seats`, "seat_computer_full"},
 	}
 	for _, c := range cases {
 		t.Run(c.code, func(t *testing.T) {
@@ -161,5 +184,42 @@ func TestSeatRequestAdditionalRefusalsRealBinary(t *testing.T) {
 				t.Fatalf("exit=%d response=%s err=%v", code, out, err)
 			}
 		})
+	}
+}
+
+// TestSeatRequestByNameSendsComputerBeforeDialog pins the CLI side of
+// spec 10.4: --computer sends form by_name with the name, and a refusal L1
+// records at once (BN-4) returns its typed code without waiting for a dialog.
+func TestSeatRequestByNameSendsComputerBeforeDialog(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	node := readyNode("mac")
+	node.AuthoritativeTags = []string{contract.StableNodeTagPrefix + "mac"}
+	var sent l1.SeatCallInput
+	reason := l1.SeatByNameNetworkPrefix + `Computer "desk" has network internet; ask with --network internet`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/nodes/mac":
+			json.NewEncoder(w).Encode(node)
+		case r.URL.Path == "/v1/seat-requests":
+			if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+				t.Error(err)
+			}
+			json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: sent.SeatID, State: l1.SeatRefused, Reason: reason}})
+		default:
+			json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: sent.SeatID, State: l1.SeatRefused, Reason: reason}})
+		}
+	}))
+	defer server.Close()
+	clients := &apiClients{l1: statusClient(t, "L1", "test", server), nodeConfigPath: filepath.Join(t.TempDir(), "node.json")}
+	if err := ocicontrol.WriteInstalledConfig(clients.nodeConfigPath, ocicontrol.InstalledConfig{Version: 1, NodeID: "mac"}); err != nil {
+		t.Fatal(err)
+	}
+	err := executeSeatRequest(t.Context(), clients, true, []string{"request", "--network", "none", "--computer", "desk"}, io.Discard, io.Discard)
+	if sent.Form != l1.SeatFormByName || sent.Computer != "desk" || sent.Network != "none" || sent.StartComputer {
+		t.Fatalf("by-name input = %+v", sent)
+	}
+	var refusal *apiResponseError
+	if !errors.As(err, &refusal) || refusal.APIError.Code != seatErrorComputerNetwork || refusal.APIError.Message != reason || commandExitCode(err) != 5 {
+		t.Fatalf("by-name refusal = %v", err)
 	}
 }

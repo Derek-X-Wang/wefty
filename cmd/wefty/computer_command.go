@@ -107,7 +107,7 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 	var idleAction string
 	var imageFlags imageFlagSet
 	flags.StringVar(&name, "name", "", "durable Computer name")
-	flags.Var(&seatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (default 2)")
+	flags.Var(&seatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (default 2); with Seats it has per-Seat screens only, so use 0 to keep the whole-Computer viewer and submission")
 	flags.StringVar(&idleAction, "idle-action", "", "nothing, stop or delete after the last Seat leaves (default nothing)")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable Computer creation key")
 	flags.Int64Var(&backupCap, "backup-cap", 0, "maximum retained Backups (shipped default 0)")

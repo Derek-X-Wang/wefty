@@ -1181,9 +1181,20 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer desired-state mutation")
 	}
-	tx := write.tx
 	defer write.rollback()
-	ctx = write.ctx
+	updated, err := s.setComputerDesiredStateTx(write.ctx, write.tx, now, computerID, request)
+	if err != nil {
+		return updated, err
+	}
+	if err := write.commit(); err != nil {
+		return Computer{}, internalError(err, "commit Computer desired state")
+	}
+	return updated, nil
+}
+
+// setComputerDesiredStateTx is the desired-state mutation inside a caller's
+// write fence, so a by-name Seat start commits with its room reservation.
+func (s *Store) setComputerDesiredStateTx(ctx context.Context, tx *sql.Tx, now time.Time, computerID string, request ComputerDesiredStateRequest) (Computer, error) {
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1261,10 +1272,6 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	updated.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, updated.IntentRevision)
 	if err != nil {
 		return Computer{}, err
-	}
-
-	if err := write.commit(); err != nil {
-		return Computer{}, internalError(err, "commit Computer desired state")
 	}
 	return updated, nil
 }
