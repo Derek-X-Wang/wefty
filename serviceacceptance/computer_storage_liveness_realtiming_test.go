@@ -326,11 +326,13 @@ func exerciseLiveResetBudget(t *testing.T, harness *acceptanceHarness, reference
 		"--expect-current", "--idempotency-key", "linux-native-reset-budget-retry", "--terminate-sessions")
 	healed := waitForComputerCLI(t, harness, target.ComputerID, 5*time.Minute, func(current l1.Computer) bool {
 		return current.IntentRevision >= retried.IntentRevision && current.ReconfigurationPhase == l1.ComputerReconfigurationStable &&
-			current.AppliedRevision == current.IntentRevision && current.StorageGeneration > target.StorageGeneration
+			current.AppliedRevision == current.IntentRevision && current.StorageGeneration > target.StorageGeneration &&
+			current.LastResetOperation != nil && current.LastResetOperation.OperationRevision == retried.IntentRevision
 	})
-	evidence := liveStorageBudgetEvidence{Passed: failedOnOld,
-		Detail: fmt.Sprintf("%s ended_status=%s ended_generation=%d healed_generation=%d", storageBudgetDetail(ended.LastResetOperation.Failure),
-			ended.LastResetOperation.Status, ended.StorageGeneration, healed.StorageGeneration)}
+	evidence := liveStorageBudgetEvidence{Passed: failedOnOld && strings.EqualFold(healed.LastResetOperation.Status, "retired"),
+		Detail: fmt.Sprintf("%s ended_status=%s ended_generation=%d healed_status=%s healed_generation=%d",
+			storageBudgetDetail(ended.LastResetOperation.Failure), ended.LastResetOperation.Status, ended.StorageGeneration,
+			healed.LastResetOperation.Status, healed.StorageGeneration)}
 	_ = removeAndWaitComputer(t, harness, healed, 5*time.Minute)
 	return evidence
 }

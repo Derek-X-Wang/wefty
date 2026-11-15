@@ -710,7 +710,10 @@ names the stage, the attempt count, and the last class and code. A reset
 fences the old generation on the Node before it prepares the successor, and
 ending the reset sends nothing to the Node. The next start, Backup or reset
 names that generation at a later intent revision, and the helper clears the
-fence then ([agent-local lifecycle](agent-local-lifecycle.md), #1609). This
+fence then ([agent-local lifecycle](agent-local-lifecycle.md), #1609). A
+Computer that was running keeps `desired_state=running` while held stopped,
+so its way back is a restart; a reimage preflight refuses the fenced
+generation until one of these has run. This
 replaced owner decision D1, which kept a failing reset `resetting` until every
 Node ran a helper that clears the fence (#1703).
 `cleanup_owed` is not `failed`: the data switch
