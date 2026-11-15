@@ -23,6 +23,13 @@ type commandReport struct {
 
 func decideCommandReport(err error) commandReport {
 	report := classifyCommandReport(err)
+	// An upgrade after interrupted-drain recovery says so on every exit, also
+	// in a JSON message taken from a typed cause (#1655).
+	var recovered *recoveredUpgradeError
+	if document, ok := report.errorDocument.(contract.ErrorResponse); ok && errors.As(err, &recovered) {
+		document.Error.Message = noteUpgradeRecovery(document.Error.Message)
+		report.errorDocument = document
+	}
 	// Usage always wins the exit code, independently of stderr reporting.
 	if errors.As(err, new(usageError)) {
 		report.exitCode = exitUsage

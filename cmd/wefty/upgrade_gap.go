@@ -66,7 +66,7 @@ func waitUpgradeGap(ctx context.Context, op upgradeHost, profile connprofile.Pro
 			return current, deadline, err
 		}
 		if current.NodeID != node.NodeID || !current.ClaimsEnabled || current.IntentRevision != revision || current.IntentReason != reason || current.BootSessionID != boot {
-			return current, deadline, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent or boot changed while waiting for upgrade gap; installed stack unchanged"}}
+			return current, deadline, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent or boot changed while waiting for upgrade gap; " + upgradeStackUnchanged}}
 		}
 		node = current
 	}
