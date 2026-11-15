@@ -138,7 +138,8 @@ concurrent claimant commits.
 A claim poll that would change nothing does not take the write lock, so empty
 polls cannot queue ahead of lease renewals. L1 first reads a snapshot. When
 the snapshot shows an alive, matching node that needs no liveness transition,
-no expired pre-start budget, and no claimable job, L1 answers the empty claim
+no proved sleep gap to persist, no expired pre-start budget, and no claimable
+job, L1 answers the empty claim
 from that snapshot. In every other case, refusals included, the claim
 transaction above decides and re-checks everything. If the snapshot is not
 available in time, L1 uses the claim transaction.

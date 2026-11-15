@@ -941,3 +941,52 @@ func TestLeaseSleepIntervalTighteningLeavesLowerBound(t *testing.T) {
 		t.Fatal("tightened interval double-credited sleep")
 	}
 }
+
+// #1686 review: an empty claim poll after a sleep must still persist the
+// proved sleep credit, as the claim transaction did, so a later clock failure
+// or a new host boot does not judge the Node by wall time alone.
+func TestLeaseSleepEmptyClaimPollPersistsCredit(t *testing.T) {
+	sleepThenPoll := func(t *testing.T) (*attemptClockFixture, *sleepTestClock) {
+		t.Helper()
+		f, c := newSleepLeaseFixture(t)
+		c.advance(0, 5*time.Minute)
+		reply, err := f.store.ClaimJobPoll(t.Context(), "agent-lease-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassOneShot)
+		if err != nil || reply.Claim != nil {
+			t.Fatalf("poll claim=%+v err=%v", reply.Claim, err)
+		}
+		return f, c
+	}
+	alive := func(t *testing.T, f *attemptClockFixture, result ReconcileResult, err error) {
+		t.Helper()
+		if err != nil || result.DeadNodes != 0 || result.ExpiredAttempts != 0 {
+			t.Fatalf("slept Node lost its credit: %+v err=%v", result, err)
+		}
+		var state contract.NodeState
+		if err := f.store.db.QueryRow(`SELECT state FROM nodes WHERE node_id=?`, f.node.NodeID).Scan(&state); err != nil || state != contract.NodeAlive {
+			t.Fatalf("node state=%s err=%v", state, err)
+		}
+	}
+	t.Run("clock failure", func(t *testing.T) {
+		f, c := sleepThenPoll(t)
+		c.awakeErr = errors.New("pausing clock unavailable")
+		result, err := f.store.Reconcile(t.Context())
+		alive(t, f, result, err)
+	})
+	t.Run("new boot", func(t *testing.T) {
+		f, c := sleepThenPoll(t)
+		if err := f.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		c.Advance(10 * time.Second)
+		c.boot = "next-boot"
+		c.elapsed = time.Minute
+		c.awake = time.Minute
+		var err error
+		f.store, err = openTestStore(t, f.path, f.options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := f.store.Reconcile(t.Context())
+		alive(t, f, result, err)
+	})
+}
