@@ -31,13 +31,21 @@ func TestRealtimingSupersededTriggerHasItsOwnConcurrencyGroup(t *testing.T) {
 	if workflow.Concurrency.Cancel != true {
 		t.Fatalf("cancel-in-progress = %v; the lane keeps cancelling superseded real runs", workflow.Concurrency.Cancel)
 	}
+	label := ""
 	group := func(event string, conclusion any, prNumber any, runID string) string {
 		ref := "refs/heads/main"
+		action := "completed"
 		if event == "pull_request" {
 			ref = fmt.Sprintf("refs/pull/%v/merge", prNumber)
+			action = "synchronize"
+			if label != "" {
+				action = "labeled"
+			}
 		}
 		return renderConcurrencyGroup(t, workflow.Concurrency.Group, map[string]any{
 			"github.event.workflow_run.conclusion": conclusion,
+			"github.event.action":                  action,
+			"github.event.label.name":              label,
 			"github.event.pull_request.number":     prNumber,
 			"github.ref":                           ref,
 			"github.run_id":                        runID,
@@ -55,6 +63,20 @@ func TestRealtimingSupersededTriggerHasItsOwnConcurrencyGroup(t *testing.T) {
 	if pr != "service-acceptance-realtiming-1605" || group("pull_request", "", 1605, "301") != pr {
 		t.Errorf("pull request run left its per-PR group: %q", pr)
 	}
+
+	// #1692: adding the full-ci label joins the PR's group (and replaces its
+	// skipped run); adding any other label gets its own group, so it cannot
+	// cancel a real run.
+	label = "full-ci"
+	if got := group("pull_request", nil, 1605, "302"); got != pr {
+		t.Errorf("full-ci labeled run left the per-PR group: %q", got)
+	}
+	label = "needs-triage"
+	otherA, otherB := group("pull_request", nil, 1605, "303"), group("pull_request", nil, 1605, "304")
+	if otherA == pr || otherA == otherB || !strings.HasPrefix(otherA, "service-acceptance-realtiming-") {
+		t.Errorf("non-full-ci labeled runs got groups %q and %q; they would cancel the real run %q", otherA, otherB, pr)
+	}
+	label = ""
 
 	first := group("workflow_run", "cancelled", nil, "100")
 	second := group("workflow_run", "cancelled", nil, "101")

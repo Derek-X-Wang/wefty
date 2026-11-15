@@ -2,12 +2,16 @@ name: service-acceptance-realtiming
 
 # Evidence lane only: this stays outside contract-gate's all-tests-pass
 # aggregation even when it runs for a pull request.
+# Pull requests run it only from batch/* heads or with the full-ci label (#1692):
+# member PRs skip it; batch PRs and labeled solo PRs carry the evidence. Adding
+# any other label starts a run that skips every job in its own concurrency group.
 on:
   workflow_run:
     workflows: [acceptance-image]
     types: [completed]
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     branches: [main]
     paths:
       - go.mod
@@ -31,13 +35,13 @@ permissions:
 concurrency:
   # A run whose acceptance-image trigger was cancelled (#1603) skips every job;
   # its own group keeps it from cancelling a newer real run (#1605).
-  group: service-acceptance-realtiming-${{ github.event.workflow_run.conclusion == 'cancelled' && format('cancelled-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  group: service-acceptance-realtiming-${{ github.event.workflow_run.conclusion == 'cancelled' && format('cancelled-{0}', github.run_id) || github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-pr-artifacts:
     name: build-pr-artifacts
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && (github.event_name != 'pull_request' || ((startsWith(github.head_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && (github.event.action != 'labeled' || github.event.label.name == 'full-ci')))
     uses: ./.github/workflows/acceptance-image-build.yml
     with:
       candidate_sha: ${{ github.event.pull_request.head.sha }}
@@ -53,7 +57,7 @@ jobs:
   resolve-published-artifact:
     name: resolve-artifact
     needs: [build-pr-artifacts]
-    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' && (github.event_name != 'pull_request' || ((startsWith(github.head_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))) }}
     runs-on: ubuntu-latest
     outputs:
       available: ${{ steps.resolve.outputs.available }}
@@ -632,7 +636,7 @@ jobs:
   realtiming-result:
     name: realtiming-result
     needs: [resolve-published-artifact, fabric-machine-identity, fabric-person-identity, service-acceptance-realtiming]
-    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ always() && github.event.workflow_run.conclusion != 'cancelled' && (github.event_name != 'pull_request' || ((startsWith(github.head_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out the receipt gate from the artifact-producing commit

@@ -1,8 +1,11 @@
 name: computer-seats
 
 # Independent image evidence. This is not an all-tests-pass dependency.
+# Pull requests run it only from batch/* heads or with the full-ci label (#1692);
+# push to main always runs. Any other label skips in its own concurrency group.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     branches: [main]
     paths:
       - examples/computer/**
@@ -38,7 +41,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: computer-seats-${{ github.event.pull_request.number || github.ref }}
+  group: computer-seats-${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -47,6 +50,7 @@ env:
 jobs:
   default-computer-seats:
     name: default-computer-seats / linux/${{ matrix.arch }}
+    if: (github.event_name != 'pull_request' || ((startsWith(github.head_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && (github.event.action != 'labeled' || github.event.label.name == 'full-ci')))
     strategy:
       fail-fast: false
       matrix:
