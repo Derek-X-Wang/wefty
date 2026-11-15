@@ -616,7 +616,9 @@ Input is never retried automatically.
 
 `person_driving` remains the existing typed HTTP 409 / CLI exit 5 refusal,
 with message `a person is driving`. A refused input sends no RFB input and
-writes no PNG. Screenshots remain available during a person's tenure.
+writes no PNG. A take that lands on an already open input stream ends it with
+the same refusal (#1680); when the input bytes were already written, the
+error also carries `action_done: true`, and the input must not be repeated. Screenshots remain available during a person's tenure.
 Release notes from successful screen handshake headers are printed on stderr.
 The shared Seat reply path prints the unread-events line on text stdout, or
 adds `unread_events_line` to a JSON reply when the count is nonzero. The JSON
