@@ -399,11 +399,16 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 			return false, err
 		}
 		if c.input.Form == SeatFormByName {
-			approval, err := s.readSeatApprovalRequest(ctx, c.input.SeatID)
-			if err != nil {
+			// The stored, immutable dialog input decides "and start it".
+			var approval SeatApproval
+			if err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
+				var err error
+				approval, err = readSeatApproval(ctx, reads.(*databaseReads).q, c.input.SeatID)
+				return err
+			}); err != nil {
 				return false, err
 			}
-			c.input.StartComputer = approval.StartComputer
+			c.input.StartComputer = approval.Request.StartComputer
 		}
 		// Include dispatch delay in the original deadline. Begin's immutable
 		// AnswerWait remains the node setting for approval replay.

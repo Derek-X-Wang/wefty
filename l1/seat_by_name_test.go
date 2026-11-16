@@ -133,7 +133,7 @@ func TestSeatByNameRefusalsComeBeforeTheDialog(t *testing.T) {
 		if value.State != SeatRefused || !strings.HasPrefix(value.Reason, test.prefix) || !strings.Contains(value.Reason, test.text) || offered != nil {
 			t.Fatalf("%s: %s = %+v offered=%v", test.name, id, value, offered != nil)
 		}
-		approval, err := f.store.readSeatApprovalRequest(t.Context(), id)
+		approval, err := readByNameApprovalRequest(t, f.store, id)
 		if err != nil || approval.Form != SeatFormByName || approval.Computer != test.name {
 			t.Fatalf("%s refusal record = %+v err=%v", test.name, approval, err)
 		}
@@ -241,7 +241,7 @@ func TestSeatByNameStartsAStoppedComputerOnlyWithApproval(t *testing.T) {
 	if value.State == SeatRefused || offered == nil || !offered.StartComputer {
 		t.Fatalf("stopped by-name request %+v offered=%+v", value, offered)
 	}
-	approval, err := f.store.readSeatApprovalRequest(t.Context(), id)
+	approval, err := readByNameApprovalRequest(t, f.store, id)
 	if err != nil || !approval.StartComputer || approval.Computer != "desk" {
 		t.Fatalf("approval request = %+v err=%v", approval, err)
 	}
@@ -332,4 +332,11 @@ func TestStageAOwnerComputerKeepsItsOrdinaryPath(t *testing.T) {
 	if value.State != SeatRefused || !strings.Contains(value.Reason, "Seat limit 0") || offered != nil {
 		t.Fatalf("by name reached a stage A Computer: %+v", value)
 	}
+}
+
+// readByNameApprovalRequest returns the stored, immutable dialog input.
+func readByNameApprovalRequest(t *testing.T, store *Store, id string) (SeatApprovalRequest, error) {
+	t.Helper()
+	value, err := readSeatApproval(t.Context(), store.db, id)
+	return value.Request, err
 }

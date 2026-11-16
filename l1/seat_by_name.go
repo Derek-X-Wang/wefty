@@ -113,17 +113,6 @@ func (s *Store) checkSeatByName(ctx context.Context, q queryer, nodeID, name, ne
 	return refuse(SeatByNameFullPrefix, "Computer %q holds its %d Seats", name, places)
 }
 
-// readSeatApprovalRequest returns the stored, immutable dialog input.
-func (s *Store) readSeatApprovalRequest(ctx context.Context, id string) (SeatApprovalRequest, error) {
-	var value SeatApproval
-	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
-		var err error
-		value, err = readSeatApproval(ctx, reads.(*databaseReads).q, id)
-		return err
-	})
-	return value.Request, err
-}
-
 // advanceByNameSeatCall runs after the dialog. The fresh by-name check, the
 // approval's expiry, the start of a stopped Computer and the room reservation
 // commit together: a crash or a refusal never leaves a started Computer
