@@ -97,10 +97,15 @@ const (
 	seatErrorRoomUnconfigured contract.ErrorCode = "seat_room_unconfigured"
 	seatErrorNodeUnavailable  contract.ErrorCode = "seat_node_unavailable"
 	seatErrorWindowNotAllowed contract.ErrorCode = "seat_window_not_allowed"
-	seatErrorEnded            contract.ErrorCode = "seat_ended"
-	seatErrorCopyFailed       contract.ErrorCode = "seat_copy_failed"
-	seatErrorPersonDriving    contract.ErrorCode = "person_driving"
-	seatErrorCopyWriteDenied  contract.ErrorCode = "seat_copy_write_denied"
+	// By-name refusals (#1155), all before the dialog (spec P12).
+	seatErrorComputerNetwork     contract.ErrorCode = "seat_computer_network"
+	seatErrorComputerUnsupported contract.ErrorCode = "seat_computer_unsupported"
+	seatErrorComputerUnavailable contract.ErrorCode = "seat_computer_unavailable"
+	seatErrorComputerFull        contract.ErrorCode = "seat_computer_full"
+	seatErrorEnded               contract.ErrorCode = "seat_ended"
+	seatErrorCopyFailed          contract.ErrorCode = "seat_copy_failed"
+	seatErrorPersonDriving       contract.ErrorCode = "person_driving"
+	seatErrorCopyWriteDenied     contract.ErrorCode = "seat_copy_write_denied"
 )
 
 func commandExitCode(err error) int {

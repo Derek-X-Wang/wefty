@@ -11,12 +11,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-const seatUsage = `usage: wefty seat request --network internet|none [--dedicated] [--window 1h|8h|24h]
+const seatUsage = `usage: wefty seat request --network internet|none [--dedicated | --computer NAME] [--window 1h|8h|24h]
        wefty seat wait SEAT_ID
        wefty seat release SEAT_ID
        wefty seat view SEAT_ID [--no-open]
@@ -26,6 +27,7 @@ const seatUsage = `usage: wefty seat request --network internet|none [--dedicate
 
 Request one Seat, or wait again by its ID after an interrupted call.
 The network must be named. Only the owner's native dialog can approve.
+--computer takes a Seat on one existing Computer of this Mac by name.
 `
 
 // seatCleanupWaitLimit bounds one CLI observation, not L1 cleanup authority.
@@ -36,6 +38,7 @@ var seatCLIIdentifier = regexp.MustCompile(`^seat_[0-9a-f]{32}$`)
 type seatRequestFlags struct {
 	network   string
 	dedicated bool
+	computer  string
 	window    string
 }
 
@@ -45,11 +48,16 @@ func parseSeatRequestFlags(args []string) (seatRequestFlags, error) {
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&result.network, "network", "", "internet or none (required)")
 	flags.BoolVar(&result.dedicated, "dedicated", false, "new Computer with a Seat limit of 1")
+	flags.StringVar(&result.computer, "computer", "", "a Seat on this existing Computer, by name")
 	flags.StringVar(&result.window, "window", "", "approval window: 1h, 8h or 24h")
 	if err := flags.Parse(args); err != nil {
 		return result, usageError(seatUsage + err.Error())
 	}
-	if flags.NArg() != 0 || (result.network != "internet" && result.network != "none") || (result.window != "" && result.window != "1h" && result.window != "8h" && result.window != "24h") {
+	// Presence, not value: an empty --computer must never fall back to *any*.
+	computerSet := false
+	flags.Visit(func(f *flag.Flag) { computerSet = computerSet || f.Name == "computer" })
+	if flags.NArg() != 0 || (result.network != "internet" && result.network != "none") || (result.window != "" && result.window != "1h" && result.window != "8h" && result.window != "24h") ||
+		computerSet && (result.dedicated || strings.TrimSpace(result.computer) == "" || result.computer != strings.TrimSpace(result.computer) || utf8.RuneCountInString(result.computer) > 255) {
 		return result, usageError(seatUsage)
 	}
 	return result, nil
@@ -105,9 +113,12 @@ func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput boo
 			return err
 		}
 		harness := seatHarnessLabel()
-		input := l1.SeatCallInput{SeatID: id, NodeID: local.NodeID, Harness: harness, Folder: folder, Network: flags.network, Form: "any"}
+		input := l1.SeatCallInput{SeatID: id, NodeID: local.NodeID, Harness: harness, Folder: folder, Network: flags.network, Form: l1.SeatFormAny}
 		if flags.dedicated {
-			input.Form = "dedicated"
+			input.Form = l1.SeatFormDedicated
+		}
+		if flags.computer != "" {
+			input.Form, input.Computer = l1.SeatFormByName, flags.computer
 		}
 		switch flags.window {
 		case "1h":
@@ -295,6 +306,15 @@ func seatCallRefusal(id, reason string) *apiResponseError {
 		code = seatErrorDenied
 	case reason == "the host VM is off" || reason == "the owner turned the host VM off":
 		code = seatErrorHostOff
+	case strings.HasPrefix(reason, l1.SeatByNameNetworkPrefix):
+		code = seatErrorComputerNetwork
+	case strings.HasPrefix(reason, l1.SeatByNameUnsupportedPrefix):
+		code = seatErrorComputerUnsupported
+	case strings.HasPrefix(reason, l1.SeatByNameUnavailablePrefix):
+		code = seatErrorComputerUnavailable
+	case strings.HasPrefix(reason, l1.SeatByNameFullPrefix):
+		code = seatErrorComputerFull
 	}
-	return &apiResponseError{APIError: contract.APIError{Code: code, Message: reason, Retryable: code == seatErrorRoomFull || code == seatErrorNoAnswer || code == seatErrorNodeUnavailable, Details: map[string]any{"seat_id": id}}}
+	retryable := code == seatErrorRoomFull || code == seatErrorNoAnswer || code == seatErrorNodeUnavailable || code == seatErrorComputerFull
+	return &apiResponseError{APIError: contract.APIError{Code: code, Message: reason, Retryable: retryable, Details: map[string]any{"seat_id": id}}}
 }

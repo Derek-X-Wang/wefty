@@ -102,7 +102,7 @@ func executeServiceCreate(
 	flags.StringVar(&computerName, "name", "", "durable Computer name (requires --computer)")
 	flags.Int64Var(&computerBackupCap, "backup-cap", 0, "maximum retained Computer Backups (requires --computer)")
 	flags.Var(&computerDiskBytes, "disk-bytes", "fully allocated Computer disk budget (requires --computer)")
-	flags.Var(&computerSeatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (requires --computer; default 2); an explicit value above 0 reads a custom image's Seat support from its registry")
+	flags.Var(&computerSeatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (requires --computer; default 2); an explicit value above 0 reads a custom image's Seat support from its registry; with Seats it has per-Seat screens only, so use 0 to keep the whole-Computer viewer and submission")
 	flags.StringVar(&computerIdleAction, "idle-action", "", "nothing, stop or delete after the last Seat leaves (requires --computer; default nothing)")
 	imageFlags.bind(flags)
 	flags.Var(&interpreters, "interpreter", "inline script interpreter argv entry (repeatable)")

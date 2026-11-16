@@ -282,6 +282,10 @@ func auditJSONFlagSource(file string, source *ast.File, valueFlags map[string]bo
 						report("boolean --wait swallowed --json for %s", verb)
 					}
 				}
+			} else if name == "computer" && file == "service_command.go" {
+				if !hasJSONFlag([]string{"services", "create", "--computer", "--json"}) {
+					report("boolean --computer swallowed --json for services create")
+				}
 			} else if valueFlags[name] {
 				report("boolean flag %s in %s appears in jsonValueFlags", name, file)
 			}
@@ -292,11 +296,30 @@ func auditJSONFlagSource(file string, source *ast.File, valueFlags map[string]bo
 	})
 }
 
+// --computer is a boolean on services create and a name on seat request
+// (#1155); --json after either keeps its meaning.
+func TestJSONFlagAfterComputer(t *testing.T) {
+	for _, test := range []struct {
+		args, want []string
+	}{
+		{[]string{"services", "create", "--computer", "--json", "--name", "desk"}, []string{"services", "create", "--computer", "--name", "desk"}},
+		{[]string{"seat", "request", "--computer", "desk", "--json"}, []string{"seat", "request", "--computer", "desk"}},
+		{[]string{"seat", "request", "--computer", "--json"}, []string{"seat", "request", "--computer", "--json"}},
+	} {
+		got, enabled, err := removeBoolFlag(test.args, "--json")
+		wantEnabled := len(got) < len(test.args)
+		if err != nil || !reflect.DeepEqual(got, test.want) || enabled != wantEnabled {
+			t.Errorf("%v: got %v json=%t err=%v, want %v", test.args, got, enabled, err, test.want)
+		}
+	}
+}
+
 func TestJSONValueFlagGuardRejectsHoles(t *testing.T) {
 	for _, fixture := range []struct{ name, file, source string }{
 		{"other receiver", "command.go", `package main; import "flag"; func command() { other := flag.NewFlagSet("x", 0); other.String("summary", "", "") }`},
 		{"other receiver method", "command.go", `package main; import "flag"; func command(other *flag.FlagSet) { other.Parse(nil) }`},
 		{"wait outside access", "command.go", `package main; import "flag"; func command(flags *flag.FlagSet) { flags.Bool("wait", false, "") }`},
+		{"computer outside services create", "command.go", `package main; import "flag"; func command(flags *flag.FlagSet) { flags.Bool("computer", false, "") }`},
 		{"imported function alias", "command.go", `package main; import "example.com/binder"; import "flag"; func command(flags *flag.FlagSet) { bind := binder.Bind; bind(flags) }`},
 		{"new imported binder", "command.go", `package main; import "example.com/binder"; import "flag"; func command(flags *flag.FlagSet) { binder.Bind(flags) }`},
 		{"aliased imported binder", "command.go", `package main; import alias "example.com/binder"; import "flag"; func command(flags *flag.FlagSet) { alias.Bind(flags) }`},
@@ -307,7 +330,7 @@ func TestJSONValueFlagGuardRejectsHoles(t *testing.T) {
 				t.Fatal(err)
 			}
 			rejected := false
-			auditJSONFlagSource(fixture.file, source, map[string]bool{"wait": true}, func(string) {}, func(string, ...any) { rejected = true })
+			auditJSONFlagSource(fixture.file, source, map[string]bool{"wait": true, "computer": true}, func(string) {}, func(string, ...any) { rejected = true })
 			if !rejected {
 				t.Fatal("guard accepted the hole")
 			}

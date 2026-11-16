@@ -24,7 +24,7 @@ out outcome params params-file path payload-file payload-json-file permission
 plain-device-id plain-fabric-id plain-identity plain-user-id policy-revision
 poll-interval probe-archive probe-digest probe-reference profile published-port ready-file reason
 reference restart revision role runtime-handler script session-token-file setup-state
-seat seat-limit idle-action socket state state-dir status step storage-generation storage-id submit-intent-revision
+seat seat-limit idle-action computer socket state state-dir status step storage-generation storage-id submit-intent-revision
 submitter summary tag tail timeout unit-directory wait wait-timeout workflow-ref
 vm-memory vm-cpus vm-disk window working-directory`
 
@@ -76,9 +76,13 @@ func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 }
 
 // --wait is boolean on grant/revoke and takes a duration elsewhere.
+// --computer is boolean on services create and takes a name on seat request.
 func flagArgumentTakesValue(arg string, command []string, valueFlags map[string]bool) bool {
 	flagName := strings.TrimLeft(arg, "-")
 	if flagName == "wait" && len(command) >= 2 && command[0] == "services" && (command[1] == "grant" || command[1] == "revoke") {
+		return false
+	}
+	if flagName == "computer" && len(command) >= 2 && command[0] == "services" && command[1] == "create" {
 		return false
 	}
 	return strings.HasPrefix(arg, "-") && valueFlags[flagName]

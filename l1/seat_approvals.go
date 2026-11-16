@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -25,7 +26,19 @@ type SeatApprovalRequest struct {
 	Network       string        `json:"network"` // internet or none; no default
 	WindowHours   int           `json:"window_hours"`
 	AnswerWait    time.Duration `json:"answer_wait"`
+	// Computer names the by-name target. StartComputer is decided by L1 at
+	// the first preflight: the dialog then says "and start it", and only such
+	// an approval may start a stopped Computer (spec 10.4; ADR-0004).
+	Computer      string `json:"computer,omitempty"`
+	StartComputer bool   `json:"start_computer,omitempty"`
 }
+
+// Request forms (spec 1.4). by_name arrives in stage B (#1155).
+const (
+	SeatFormAny       = "any"
+	SeatFormDedicated = "dedicated"
+	SeatFormByName    = "by_name"
+)
 
 type SeatApproval struct {
 	Request       SeatApprovalRequest `json:"request"`
@@ -81,7 +94,10 @@ var seatApprovalID = regexp.MustCompile(`^seat_[0-9a-f]{32}$`)
 func (r SeatApprovalRequest) Validate() error {
 	if !seatApprovalID.MatchString(r.SeatID) || r.NodeID == "" || r.BootSessionID == "" ||
 		utf8.RuneCountInString(r.Harness) > 256 || r.Folder == "" || utf8.RuneCountInString(r.Folder) > 4096 ||
-		(r.Form != "any" && r.Form != "dedicated") || (r.Network != "internet" && r.Network != "none") ||
+		(r.Form != SeatFormAny && r.Form != SeatFormDedicated && r.Form != SeatFormByName) ||
+		(r.Form == SeatFormByName) != (strings.TrimSpace(r.Computer) != "") || r.Computer != strings.TrimSpace(r.Computer) ||
+		utf8.RuneCountInString(r.Computer) > 255 || r.StartComputer && r.Form != SeatFormByName ||
+		(r.Network != "internet" && r.Network != "none") ||
 		r.AnswerWait <= 0 || r.AnswerWait > MaxSeatApprovalWait || (r.WindowHours != 0 && r.WindowHours != 1 && r.WindowHours != 8 && r.WindowHours != 24) {
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat approval request")
 	}

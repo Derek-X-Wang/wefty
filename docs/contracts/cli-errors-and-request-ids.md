@@ -405,10 +405,11 @@ the local protocol are tolerated by older clients; server requests stay strict.
 
 ## Seat requests (#1143)
 
-`wefty seat request --network internet|none [--dedicated] [--window 1h|8h|24h]`
+`wefty seat request --network internet|none [--dedicated | --computer NAME] [--window 1h|8h|24h]`
 prints `seat_<32 hex>` before submitting and waits for that request. The network
 has no default. Missing/unknown flags, a missing network, unsupported window
-lengths, and stage-B `--computer`/`--node` flags are usage errors (exit 2).
+lengths, `--dedicated` with `--computer`, and the stage-B `--node` flag are
+usage errors (exit 2).
 `wefty seat wait SEAT_ID` observes the same request. Neither command can approve.
 `wefty seat --help` lists the available Seat commands without opening Fabric.
 
@@ -470,7 +471,44 @@ JSON error document on stderr, with `details.seat_id` and these codes:
 | `seat_room_unconfigured` | Computer room is not configured on this node | 5 | false |
 | `seat_node_unavailable` | the node did not pick up the request | 5 | true |
 | `seat_window_not_allowed` | requested window is not enabled; names the allowed windows | 5 | false |
+| `seat_computer_network` | `Computer network differs: …`; names the Computer's network | 5 | false |
+| `seat_computer_unsupported` | `no Seat support: …`; Seat limit 0, or no Seat support recorded for the image (the reason names the owner's remedies) | 5 | false |
+| `seat_computer_unavailable` | `Computer unavailable: …`; not found, removed, failed, on another node, or stopped after the dialog | 5 | false |
+| `seat_computer_full` | `Computer full: …`; every Seat place is taken | 5 | true |
 | `seat_ended` | Seat ended: the recorded end reason | 5 | false |
+
+### By name (#1155)
+
+`--computer NAME` asks for a Seat on one existing Computer of this Mac (form
+`by_name`, spec 10.4). Every refusal that needs no owner answer runs before
+the dialog (spec P12): at the request itself, again at the node's preflight,
+and again after approval, because the owner may change the Computer during the
+dialog. The four `seat_computer_*` codes above type them; each L1 reason starts
+with a fixed prefix before the Computer's name, so a name cannot change the
+code. The order is: not found, removed, on another node (by name across Macs
+is #1156), failed (the start latch; the owner decides), network differs, Seat
+limit 0, image without Seat support, all places taken. A refused by-name
+request never makes or deletes a Computer.
+
+A Computer's Seat places are its Seat limit, capped for an owner-made Computer
+by its image's Seat places (`docs/contracts/computer-image.md`). An owner-made
+Computer's Seats share its fixed memory limit: they take no room, its memory
+limit never grows or shrinks, and the Mac's room does not change when they
+join or leave (BN-1). A Seat-request-made target keeps the per-Seat room charge.
+
+For a stopped Computer, L1 records `start_computer` in the immutable approval
+request at the first preflight, and the dialog says
+`Form: by name: Computer "NAME", and start it`. Only such an approval starts
+it, with actor `seat-request` (ADR-0004: the approval is the owner's intent;
+BN-2). The fresh by-name check, the approval's expiry, the start and the room
+reservation commit in one L1 write: a refused reservation leaves the Computer
+stopped, and a retry after a crash cannot start a Computer the owner has
+stopped since. The reservation itself accepts only the Computer the approval
+names and rechecks its image support and place range. A Computer that was
+running at the dialog but is stopped when the approval lands is refused with
+`seat_computer_unavailable`, never started. A
+caller that sets `start_computer` is refused. Approval windows cover by-name
+requests of their network like every other form.
 
 No new process exit number is added. The whitelist in `main.go`, the shared
 command reporter and real-binary tests pin these typed conflict outcomes.

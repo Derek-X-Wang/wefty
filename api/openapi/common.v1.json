@@ -578,8 +578,20 @@
             "type": "string",
             "enum": [
               "any",
-              "dedicated"
-            ]
+              "dedicated",
+              "by_name"
+            ],
+            "description": "by_name takes a Seat on the existing Computer that computer names (stage B, #1155)."
+          },
+          "computer": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "The by-name target's Computer name; present exactly when form is by_name."
+          },
+          "start_computer": {
+            "type": "boolean",
+            "description": "Set only by L1 at the first preflight: the target was stopped, the dialog says \"and start it\", and only such an approval starts it. A caller that sets it is refused."
           },
           "network": {
             "type": "string",
@@ -1442,8 +1454,20 @@
             "type": "string",
             "enum": [
               "any",
-              "dedicated"
-            ]
+              "dedicated",
+              "by_name"
+            ],
+            "description": "by_name takes a Seat on the existing Computer that computer names (stage B, #1155)."
+          },
+          "computer": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "The by-name target's Computer name; present exactly when form is by_name."
+          },
+          "start_computer": {
+            "type": "boolean",
+            "description": "Set only by L1 at the first preflight: the target was stopped, the dialog says \"and start it\", and only such an approval starts it. A caller that sets it is refused."
           },
           "network": {
             "type": "string",

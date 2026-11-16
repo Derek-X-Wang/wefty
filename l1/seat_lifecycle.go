@@ -219,10 +219,10 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 	if value.State != SeatApproved {
 		return value, protocolError(contract.ErrorConflict, "Seat request is not approved")
 	}
-	var node, network, desired string
+	var node, network, desired, name string
 	var limit int
 	var made bool
-	err = q.QueryRowContext(ctx, `SELECT placement_node_id,network,desired_state,seat_limit,seat_request_made FROM computers WHERE computer_id=?`, request.ComputerID).Scan(&node, &network, &desired, &limit, &made)
+	err = q.QueryRowContext(ctx, `SELECT placement_node_id,network,desired_state,seat_limit,seat_request_made,name FROM computers WHERE computer_id=?`, request.ComputerID).Scan(&node, &network, &desired, &limit, &made, &name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return value, protocolError(contract.ErrorNotFound, "Computer not found")
 	}
@@ -233,7 +233,25 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 	if err != nil {
 		return value, err
 	}
-	if approval.Request.BootSessionID != request.BootSessionID || node != request.NodeID || network != approval.Request.Network || !made || desired != string(contract.ServiceDesiredRunning) || request.Place > limit || ((approval.Request.Form == "dedicated") != (limit == 1)) {
+	// By name may take only the Computer it names, under its own Seat limit;
+	// the by-name check chose a free place within its image's places in this
+	// same write fence.
+	byName := approval.Request.Form == SeatFormByName
+	if byName && name != approval.Request.Computer {
+		return value, protocolError(contract.ErrorConflict, "Computer is not the one this by-name Seat approval names")
+	}
+	if byName {
+		// The node's reservation route must not skip the by-name checks:
+		// image Seat support, failure, network and the place range.
+		target, err := s.checkSeatByName(ctx, q, request.NodeID, name, approval.Request.Network, at)
+		if err != nil {
+			return value, err
+		}
+		if target.reason != "" || request.Place > s.computerSeatPlaces(target.computer) {
+			return value, protocolError(contract.ErrorConflict, "Computer does not match this approved Seat request: %s", target.reason)
+		}
+	}
+	if approval.Request.BootSessionID != request.BootSessionID || node != request.NodeID || network != approval.Request.Network || (!made && !byName) || desired != string(contract.ServiceDesiredRunning) || request.Place > limit || (!byName && (approval.Request.Form == SeatFormDedicated) != (limit == 1)) {
 		return value, protocolError(contract.ErrorConflict, "Computer does not match this approved Seat request")
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE computers SET wait_boot_id='',wait_started_ns=0 WHERE computer_id=?`, request.ComputerID); err != nil {
@@ -245,6 +263,15 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 	}
 	if occupied != 0 {
 		return value, protocolError(contract.ErrorConflict, "Seat place still needs cleanup")
+	}
+	if !made {
+		// An owner-made Computer's Seats share its fixed memory limit and
+		// take no room (BN-1): no room check, no charge change, and no
+		// memory-limit record, so its limit never grows or shrinks.
+		if err := insertSeatPlace(ctx, q, id, request); err != nil {
+			return value, err
+		}
+		return readSeatRequest(ctx, q, id)
 	}
 	usage, err := readSeatRoomUsage(ctx, q, request.NodeID)
 	if err != nil {
@@ -298,24 +325,7 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 		}
 		return value, nil
 	}
-	list, err := readComputerSeatList(ctx, q, request.ComputerID)
-	if err != nil {
-		return value, err
-	}
-	if list.Revision == math.MaxInt64 {
-		return value, protocolError(contract.ErrorConflict, "Seat revision exhausted")
-	}
-	var existing int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_seat_identities WHERE seat_id=?`, id).Scan(&existing); err != nil {
-		return value, err
-	}
-	if existing != 0 {
-		return value, protocolError(contract.ErrorConflict, "Seat ID was already used")
-	}
-	if _, err := q.ExecContext(ctx, `INSERT INTO computer_seat_identities(seat_id,computer_id,place,introduced_revision) VALUES(?,?,?,?)`, id, request.ComputerID, request.Place, list.Revision+1); err != nil {
-		return value, err
-	}
-	if _, err := q.ExecContext(ctx, `INSERT INTO computer_seat_room_reservations(seat_id,computer_id,node_id,memory_bytes) VALUES(?,?,?,?)`, id, request.ComputerID, request.NodeID, request.Room.SeatMemoryBytes); err != nil {
+	if err := insertSeatPlace(ctx, q, id, request); err != nil {
 		return value, err
 	}
 	value, err = readSeatRequest(ctx, q, id)
@@ -353,11 +363,14 @@ func readSeatRoomUsage(ctx context.Context, q queryer, node string) ([]ComputerR
 			return nil, err
 		}
 		u.Running = state == string(contract.JobClaimed) || state == string(contract.JobRunning) || state == string(contract.JobStopping) || state == string(contract.JobRemovalPending) || state == string(contract.JobAgentCleaned)
-		// Reservation bytes are authoritative even if the local share setting changes.
-		u.MemoryBytes = max(u.MemoryBytes, reserved)
-		if reserved > 0 {
-			u.Seats = 1
-		} // Only occupancy matters here; bytes carry the charge.
+		// Reservation bytes are authoritative even if the local share setting
+		// changes. An owner-made Computer's Seats are never charged (BN-1).
+		if u.SeatRequestMade {
+			u.MemoryBytes = max(u.MemoryBytes, reserved)
+			if reserved > 0 {
+				u.Seats = 1
+			} // Only occupancy matters here; bytes carry the charge.
+		}
 		if !u.SeatRequestMade || u.Running {
 			var spec contract.JobSpec
 			if err := json.Unmarshal(specBytes, &spec); err != nil {
@@ -771,4 +784,29 @@ func refuseLostSeatDialogs(ctx context.Context, q seatApprovalQuery, node, boot 
 		}
 	}
 	return nil
+}
+
+// insertSeatPlace records the Seat identity and its reservation. For an
+// owner-made Computer the reservation's bytes are never charged as room
+// (readSeatRoomUsage); the row still fences the place until cleanup.
+func insertSeatPlace(ctx context.Context, q seatApprovalQuery, id string, request SeatRoomReservationRequest) error {
+	list, err := readComputerSeatList(ctx, q, request.ComputerID)
+	if err != nil {
+		return err
+	}
+	if list.Revision == math.MaxInt64 {
+		return protocolError(contract.ErrorConflict, "Seat revision exhausted")
+	}
+	var existing int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_seat_identities WHERE seat_id=?`, id).Scan(&existing); err != nil {
+		return err
+	}
+	if existing != 0 {
+		return protocolError(contract.ErrorConflict, "Seat ID was already used")
+	}
+	if _, err := q.ExecContext(ctx, `INSERT INTO computer_seat_identities(seat_id,computer_id,place,introduced_revision) VALUES(?,?,?,?)`, id, request.ComputerID, request.Place, list.Revision+1); err != nil {
+		return err
+	}
+	_, err = q.ExecContext(ctx, `INSERT INTO computer_seat_room_reservations(seat_id,computer_id,node_id,memory_bytes) VALUES(?,?,?,?)`, id, request.ComputerID, request.NodeID, request.Room.SeatMemoryBytes)
+	return err
 }

@@ -790,6 +790,35 @@ call before, and a default create still makes none:
 A label that does not match the image's real behaviour still fails safely: the
 Seat misses its 60-second readiness deadline and its request is refused.
 
+**Default image counts as a Seat image (standing rule).** L1 treats an
+owner-made Computer whose current image digest equals the configured
+`--computer-default-image` as 4 places when its recorded reading is 0, for
+by-name checks and in its start claim; the Computer projection still shows the
+recorded reading. This rule stays: a default create reads no label, so that
+owner creates make no registry request, and the configured default image is
+known to be the 4-place Seat image. Seat-request-made Computers always use
+that default image and their own Seat limit.
+
+A by-name request to a Computer with no recorded reading, outside that rule,
+is refused before the dialog with the reason `no Seat support` and the owner's
+remedies: reimage to a new image digest with `--seat-support`, or create the
+Computer with an explicit `--seat-limit`.
+
+The node agent runs the Seat controller for every Seat-request-made Computer
+and for an owner-made Computer whose claim has a positive Seat limit and Seat
+places. Only Seat-request-made Computers get a mutable memory limit; an
+owner-made Computer's Seats share its fixed limit. Such an owner-made Computer
+runs the Seat service path, as a Seat-request-made one does: its screens are
+per Seat, and it has no whole-Computer take-over viewer and no Computer
+submission. The label therefore declares a Seat image: an image that also
+serves whole-Computer endpoints gets only its Seat interfaces when its
+Computer takes Seats. The default image opens no whole-Computer desktop (it
+binds no listener at the single-desktop ports), so it loses nothing. To keep
+the whole-Computer viewer and submission for an image with both, the owner
+creates its Computer with `--seat-limit 0`. An owner-made Computer whose
+image has no Seat label, or whose Seat limit is 0, keeps the ordinary Computer
+service path unchanged.
+
 ### Runtime required by every multi-Seat image
 
 Every multi-Seat image must provide executable `/usr/bin/python3`
