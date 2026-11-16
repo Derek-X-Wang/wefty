@@ -2985,7 +2985,15 @@ existing Computer defaults: `--seat-idle-wait`, `--seat-warning-wait`, and
 Computer settings receipt and installs them on L1 only. A setup rerun retains
 unspecified values; changing one restarts L1 without restarting the node service. A changed setting applies at the next check.
 `idle_action` remains on the Computer; no second settings store is introduced.
-This stage implements `delete` and `nothing`; `stop` remains stage B.
+The idle timer covers every Computer with idle action `delete` or `stop`,
+Seat-request-made or owner-made, once a Seat has used it; a Computer that no
+Seat has used is never idle, so a fresh owner-made Computer with `delete` is
+not removed 10 minutes after creation (#1155). `delete` removes the Computer
+through the removal path; `stop` sets desired state `stopped` with actor
+`idle action` and keeps its Storage; `nothing` does nothing. Both actions
+recheck idleness inside their own write fence. A stopped Computer is never
+acted on; it waits for the owner or a by-name Seat approval. A later intent
+revision on a timed Computer (an owner start, for example) restarts its wait.
 
 A Seat request's answer wait includes dispatch delay: capping the request
 deadline shortens the boot-clock wait by that delay without changing the

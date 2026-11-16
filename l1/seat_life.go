@@ -48,7 +48,9 @@ func (s *Store) CheckSeatLife(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		computers, err = seatIDs(ctx, q, `SELECT computer_id FROM computers WHERE seat_request_made=1 AND desired_state='running' AND idle_action='delete' AND EXISTS(SELECT 1 FROM computer_seat_identities i WHERE i.computer_id=computers.computer_id) ORDER BY computer_id`)
+		// Owner-made Computers join once a Seat has used them, never right after
+		// creation: a fresh Computer with idle action delete is not idle (#1155).
+		computers, err = seatIDs(ctx, q, `SELECT computer_id FROM computers WHERE desired_state='running' AND idle_action IN ('delete','stop') AND EXISTS(SELECT 1 FROM computer_seat_identities i WHERE i.computer_id=computers.computer_id) ORDER BY computer_id`)
 		return err
 	})
 	if err != nil {
@@ -118,7 +120,13 @@ func (s *Store) checkComputerIdle(ctx context.Context, id string) error {
 	if err = s.reconfigurationCheckpoint("computer_idle_selected"); err != nil {
 		return err
 	}
-	_, err = s.RemoveComputer(ctx, id, ComputerRemoveRequest{ComputerMutationPrecondition: ComputerMutationPrecondition{IntentRevision: computer.IntentRevision, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, Actor: "idle action"}, idleOnly: true})
+	precondition := ComputerMutationPrecondition{IntentRevision: computer.IntentRevision, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, Actor: "idle action"}
+	if computer.IdleAction == ComputerIdleStop {
+		// Stop keeps the Storage; the owner or a by-name approval starts it again.
+		_, err = s.SetComputerDesiredState(ctx, id, ComputerDesiredStateRequest{ComputerMutationPrecondition: precondition, DesiredState: contract.ServiceDesiredStopped, idleOnly: true})
+	} else {
+		_, err = s.RemoveComputer(ctx, id, ComputerRemoveRequest{ComputerMutationPrecondition: precondition, idleOnly: true})
+	}
 	// An owner mutation, another Seat, or another removal may win the fence.
 	switch errorCode(err) {
 	case contract.ErrorConflict, "stale_intent_revision", "storage_reference_conflict", contract.ErrorNotFound:
@@ -211,7 +219,7 @@ func (s *Store) computerIdleDue(ctx context.Context, q seatApprovalQuery, id str
 	if err != nil {
 		return false, err
 	}
-	if busy || desired != "running" || action != "delete" {
+	if busy || desired != "running" || action != string(ComputerIdleDelete) && action != string(ComputerIdleStop) {
 		_, err = q.ExecContext(ctx, `UPDATE computers SET wait_boot_id='',wait_started_ns=0 WHERE computer_id=? AND (wait_boot_id!='' OR wait_started_ns!=0)`, id)
 		return false, err
 	}
