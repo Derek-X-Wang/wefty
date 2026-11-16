@@ -174,6 +174,10 @@ func TestComputerReimageRecordsImageSeatPlacesOnlyForSeatComputers(t *testing.T)
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) || len(test.resolver.seatReads) != test.wantReads {
 					t.Fatalf("err=%v reads=%v, want %q", err, test.resolver.seatReads, test.wantErr)
 				}
+				// Refused opt-ins are usage errors (exit 2); a registry failure is not.
+				if wantUsage := test.wantErr != "registry offline"; (commandExitCode(err) == exitUsage) != wantUsage {
+					t.Fatalf("err=%v exit=%d, usage=%v", err, commandExitCode(err), wantUsage)
+				}
 				return
 			}
 			if err != nil || body.ImageSeatPlaces != test.wantPlaces || len(test.resolver.seatReads) != test.wantReads ||

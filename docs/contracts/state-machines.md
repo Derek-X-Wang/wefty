@@ -408,8 +408,9 @@ is fixed at creation; replacing a Job projection never changes these fields.
 Each Job projection also stores `image_seat_places`, its image's Seat support
 reading (0–4, 0 when not read; `docs/contracts/computer-image.md`); the Computer and its start
 claim expose the current projection's value. A reimage records the new image's
-reading; a generic projection keeps the current value only when the image
-digest does not change. Pre-Seat database rows read 0.
+reading (the CLI reads it only with `--seat-support` or for a Computer that
+already has a reading); a generic projection keeps the current value only when
+the image digest does not change. Pre-Seat database rows read 0.
 Owner-made Computers created before stage B, including pre-Seat database rows,
 have Seat limit 0 (no Seats), idle action `nothing`, network `internet`, and
 `seat_request_made=false`. Their existing memory limit, image, Storage and
