@@ -2202,7 +2202,7 @@
           "seat_limit": { "type": "integer", "minimum": 0 },
           "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"] },
           "network": { "type": "string", "enum": ["internet", "none"] },
-          "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "Seat places from the current image's dev.wefty.computer.seat-places label; 0 when the image does not support Seats (docs/contracts/computer-image.md)." },
+          "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "Seat places from the current image's dev.wefty.computer.seat-places label; 0 when the label was not read or the image does not support Seats (docs/contracts/computer-image.md)." },
           "seat_request_made": { "type": "boolean" },
           "computer_id": { "type": "string", "minLength": 1 },
           "name": { "type": "string", "minLength": 1, "maxLength": 255 },

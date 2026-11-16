@@ -756,31 +756,36 @@ count of Seat users (`seat1` … `seatN`). The default image's `seats` target se
 `4`. An image without a valid label does not support Seats; it may still run as
 an owner-made Computer.
 
-The CLI reads the label when `wefty services create --computer` or
-`wefty services reimage` names the image, after it has pinned the digest. For an
-image index it reads every Linux platform manifest and skips attestation
-entries (`os` `unknown`); all of them must carry the same valid value, or the
-reading is 0. Each manifest and config blob must match its digest. The CLI
-sends the reading as `image_seat_places`, and L1 stores it with the Job
-projection that carries that image: a staged reimage changes it only when its
-projection becomes current. The Computer and its start claim expose it as
-`image_seat_places`.
+The CLI reads the label from the image's registry only when the owner asks for
+Seats on a custom image, after it has pinned the digest. For an image index it
+reads every Linux platform manifest and skips attestation entries (`os`
+`unknown`); all of them must carry the same valid value, or the reading is 0.
+Each manifest and config blob must match its digest. The CLI sends the reading
+as `image_seat_places`, and L1 stores it with the Job projection that carries
+that image: a staged reimage changes it only when its projection becomes
+current. The Computer and its start claim expose it as `image_seat_places`.
 
-Creation gains no new hard network dependency. A digest-pinned image needed no
-registry call before; now:
+Creation gains no network dependency. A digest-pinned image made no registry
+call before, and a default create still makes none:
 
-- `--seat-limit 0` reads nothing and records 0.
-- With the default Seat limit, an unreadable registry or a missing label
-  records 0, keeps the Seat limit and prints one warning line. A later reimage
-  can record the label.
-- An explicit `--seat-limit N` (N ≥ 1) fails loudly when the label cannot be
-  read or is missing, and when N exceeds the image's places.
-- A reimage never fails for the label; it records 0 and warns. A reimage of a
-  Computer with Seat limit 0 reads nothing and records 0. The reading is not
-  part of the reimage's idempotency identity: a retry that reads it
-  differently still replays, and the first accepted reading stays.
-- The default Seat limit (2) never fails on an image with fewer places; the
-  image's places cap it.
+- Without `--seat-limit`, the CLI reads nothing and records 0, and the
+  Computer keeps the default Seat limit 2. The configured default image still
+  takes Seats, because L1 counts it as a Seat image (see the by-name rules); a
+  custom image takes Seats only after an explicit reading.
+- `--seat-limit 0` reads nothing, records 0 and stores Seat limit 0: the
+  Computer takes no Seats.
+- An explicit `--seat-limit N` (N ≥ 1) reads the label and fails loudly when it
+  cannot be read or is missing, and when N exceeds the image's places.
+- `wefty services reimage --seat-support` reads the new image's label and fails
+  loudly the same way. It needs a Seat limit above 0 and a new image digest: a
+  reimage to the current digest changes nothing. A retry after the reimage
+  completed finds its own reading on the current digest and replays without
+  reading again; a retry while the reimage is still pending reads again.
+- A reimage without `--seat-support` reads the label only when the Computer
+  already has a reading above 0. It then never fails for the label; it records
+  0 and warns. Other reimages make no registry request.
+- The reading is not part of the reimage's idempotency identity: a retry that
+  reads it differently still replays, and the first accepted reading stays.
 
 A label that does not match the image's real behaviour still fails safely: the
 Seat misses its 60-second readiness deadline and its request is refused.
