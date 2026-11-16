@@ -1059,9 +1059,12 @@ func (h *storageCLIHarness) startStorageCopyPreparationOutcome(code string) <-ch
 				if directive.Operation != "import" {
 					continue
 				}
-				_, err = h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
-					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-						IdempotencyKey: "preparation-outcome", PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
+				_, err = h.store.ReportComputerStorageOperationFailure(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageOperationFailureRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						ReportID: strings.Repeat("d", 32), Verb: l1.ComputerStorageOperationImport,
+						OperationRevision: directive.OperationRevision, Stage: l1.ComputerStorageOperationPrepare,
+						Fence: directive.CleanupFence, Class: l1.ComputerStorageOperationFailureResumeDeferred,
+						Code: code, HelperGeneration: 7, PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
 							Code: code, DestinationComputerID: directive.DestinationComputerID,
 							DestinationStorageID: directive.DestinationStorageID, DestinationGeneration: directive.DestinationGeneration,
 							IntentRevision: directive.OperationRevision, DiskBytes: directive.DestinationSize, HelperGeneration: 7,
@@ -1286,9 +1289,12 @@ func TestComputerCloneWaitReportsAnUnpreparableDestination(t *testing.T) {
 					continue
 				}
 				recordedAt := time.Now().UTC()
-				_, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
-					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-						IdempotencyKey: "preparation-quarantined",
+				_, err := h.store.ReportComputerStorageOperationFailure(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
+					l1.ComputerStorageOperationFailureRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
+						ReportID: strings.Repeat("e", 32), Verb: l1.ComputerStorageOperationClone,
+						OperationRevision: directive.OperationRevision, Stage: l1.ComputerStorageOperationPrepare,
+						Fence: directive.CleanupFence, Class: l1.ComputerStorageOperationFailureQuarantined,
+						Code: l1.ComputerStoragePreparationQuarantined, HelperGeneration: 9,
 						PreparationOutcome: &l1.ComputerStoragePreparationOutcome{
 							Code:                  l1.ComputerStoragePreparationQuarantined,
 							DestinationComputerID: directive.DestinationComputerID,
