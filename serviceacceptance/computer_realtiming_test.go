@@ -570,7 +570,7 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"stale_cas_rejected_live":      abortEvidence.StaleCASRejected,
 		"no_automatic_rollback_live":   abortEvidence.NoAutoRollback,
 		"grow_budget_failed_live":      growBudget.Passed,
-		"reset_budget_counted_live":    resetBudget.Passed,
+		"reset_budget_failed_live":     resetBudget.Passed,
 		"restore_abort_dead_node_live": copyAbort.Restore.Passed,
 		"clone_abort_dead_node_live":   copyAbort.Clone.Passed,
 	}, map[string]string{"intent_revision": fmt.Sprint(reimaged.IntentRevision), "spec_revision": fmt.Sprint(reimaged.CurrentSpecRevision),
