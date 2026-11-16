@@ -724,7 +724,6 @@ CREATE TABLE IF NOT EXISTS computer_job_projections (
   spec_revision INTEGER NOT NULL CHECK(spec_revision > 0),
   current INTEGER NOT NULL CHECK(current IN (0, 1)),
 	chown INTEGER NOT NULL DEFAULT 0 CHECK(chown IN (0, 1)),
-  image_seat_places INTEGER NOT NULL DEFAULT 0 CHECK(image_seat_places BETWEEN 0 AND 4),
   created_ns INTEGER NOT NULL,
   retired_ns INTEGER,
   PRIMARY KEY(computer_id, spec_revision)
@@ -1548,7 +1547,8 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return err
 	}
 	// The image's Seat label belongs to the projection that carries the image
-	// (#1155); rows from before it read 0, an image without Seat support.
+	// (#1155); rows from before it read 0, an image without Seat support. It is
+	// declared only here so a fresh store and an upgraded one share its DDL.
 	if err := s.ensureColumn(ctx, "computer_job_projections", "image_seat_places", "INTEGER NOT NULL DEFAULT 0 CHECK(image_seat_places BETWEEN 0 AND 4)"); err != nil {
 		return err
 	}
