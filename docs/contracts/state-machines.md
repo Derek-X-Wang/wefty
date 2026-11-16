@@ -729,10 +729,9 @@ that copy absent and owes nothing. Each operation read (`restore_operation`,
 latest stage's budget as `failure`: class, code, attempts, and the first and
 last failure times. Typed positive-absence receipts keep their own routes and
 end their operations at once, as below. `services restore --wait` ends on
-`cleanup_owed` with a warning, not an error. For one release, an agent of the
-previous release still sends its preparation outcomes on the copy
-acknowledgement, and L1 keeps the per-verb outcome paths below for it unchanged;
-they are removed afterwards (#1627).
+`cleanup_owed` with a warning, not an error. The copy acknowledgement no
+longer accepts preparation outcomes; an agent reports them on the failure
+report (#1627).
 
 A cold Backup is one explicitly disruptive Computer intent. L1 first commits
 the immutable logical Backup identity and its one planned V1 source-node copy
@@ -848,14 +847,10 @@ itself. The agent reports every failure and keeps no count; L1 counts them on
 its own clock, so an agent restart no longer starts the bound again. Once the
 budget is spent, L1 records the restore `failed` with the last class's code,
 retires the staging generation, and returns the Computer to `stable` on the
-old generation; the directive is no longer listed. For one release, an agent
-of the previous release still applies its own in-memory bound (5 failures and
-10 minutes) and then sends the exact-generation
-`computer_storage_preparation_interrupted` outcome with reason
-`engine_failure` on the copy acknowledgement. L1 records that restore `failed`
-with `failure_code=storage_copy_engine_failure`; an identical replay is
-resolved by the outcome's own `intent_revision` (#1627). Either abort deletes
-nothing. The helper may hold the partial copy under the retired staging
+old generation; the directive is no longer listed. A restore an agent of an
+earlier release ended with its own bound keeps
+`failure_code=storage_copy_engine_failure`; L1 no longer writes that code
+(#1627). The abort deletes nothing. The helper may hold the partial copy under the retired staging
 generation and, when "keep predecessor as Backup" was set, a finished
 predecessor Backup copy that was never cataloged. Removal of the Computer
 proves both absent: removal inventories every recorded generation and runs the
@@ -896,7 +891,8 @@ reports that the disk was too small.
 
 A clone whose destination generation is quarantined, whose helper session
 is lost while it copies, or whose copy the live helper session refuses with a
-typed engine failure (#1581), is terminal. The two interruptions share
+typed engine failure (#1581), ends through the failure budget: a quarantine at
+once, an interruption once the budget is spent. The two interruptions share
 `computer_storage_preparation_interrupted` and differ by reason
 (`runtime_loss` or `engine_failure`); the engine failure leaves the session and
 every other attempt on the Node running. Runtime loss proves a lost observation,
@@ -909,15 +905,15 @@ receipt beside the bytes. Neither path consults L1, and neither is L1
 publication: the generation L1 retired is never started, never attached, and
 never becomes a Computer's current Storage, whatever the helper holds. A local
 receipt that arrives after the terminal outcome is evidence of what the node
-did, not authority to publish. What the acknowledgement itself does is delete
+did, not authority to publish. What ending the clone does is delete
 nothing at all -- whatever the helper kept stays exactly where it is, readable
 for inspection, and ordinary removal is the one thing that clears it.
 
 L1's side is the same shape the capacity refusal has: the operation records
-`failed` with the exact typed code the helper authored
-(`computer_storage_quarantined` or `computer_storage_preparation_interrupted`),
-the never-published destination generation is retired, that same code is
-latched on the destination Job's `last_failure` with `next_restart_at` null,
+`failed` with the last class's code (`computer_storage_quarantined` for a
+quarantine), the never-published destination generation is retired,
+`computer_storage_operation_failed` is latched on the destination Job's
+`last_failure` with `next_restart_at` null,
 and the destination returns to `stable` and latched failed, so no later start
 can format an empty disk under an identity whose copy never happened. A
 `computer_storage_resume_deferred` outcome is not terminal: the helper kept the
@@ -926,8 +922,9 @@ observation a Custody import records and the directive stays live. The bound
 on that is not elapsed time alone -- ordinary reconciliation of a deferred
 destination runs the recovery step itself and counts the attempt, so a
 deferral either clears or reaches `resume_abandoned` quarantine, which ends
-here. Restore acquires no such path: its destination is a live Computer whose
-predecessor still owns the bytes. Removal is always available: a destination
+here. A restore ends through the same budget but keeps its old generation
+current: its destination is a live Computer whose predecessor still owns the
+bytes. Removal is always available: a destination
 rolled back to a lock-only root proves exact absence through the same removal
 inventory a refused clone uses.
 

@@ -1746,38 +1746,32 @@ Startup recovery also carries exact-generation
 Receipt-backed outcomes retain the sweep epoch, disk name, closed reason,
 attempt count, and deferral timestamps. All outcomes bind Computer ID, Storage
 ID, generation, intent revision, disk bytes, helper generation, and observation
-time; an identity mismatch never attaches to the copy it claims. L1 records the
-preparation idempotency key and body hash, accepts identical replay, and rejects
-an older helper generation or timestamp. A restore reports the same outcomes;
+time; an identity mismatch never attaches to the copy it claims. L1 keeps the
+newest outcome beside the operation and rejects an older helper generation or
+timestamp. A restore reports the same outcomes;
 the budget ends it with its old generation still current, because its
 predecessor still owns the bytes.
 
-The rest of this section is the per-verb rule an agent of the previous
-release still triggers for one release, by sending these outcomes on the copy
-acknowledgement instead of reporting them; L1 keeps it unchanged until it is
-removed (#1627). A current agent never takes it. For an import this evidence grants no publication
-or cleanup authority. A deferral, a quarantine, or a `runtime_loss`
-interruption leaves the reserved directive retryable, because the next
-session's startup sweep rolls a lost copy back or completes it; the evidence is
-cleared by later success, terminal failure, or supersession. An
-`engine_failure` interruption is terminal for an import, with the shape of a
-terminal clone below: the operation records `failed` with that code, the
-never-published generation is retired, the destination Job latches the code
-with `next_restart_at` null, and the destination leaves `importing` latched
-failed. Without that, the directive came back on every sweep to a live session
-that refuses it the same way (the #526 shape). The acknowledgement deletes
-nothing and keeps the Computer identity, because the helper may still hold
-bytes under it and only an absence receipt authorizes deleting them; ordinary
-removal of the latched Computer is the exit. L1's import ledger remains
+The copy acknowledgement no longer accepts these outcomes (#1627); only a
+failure report carries them. The evidence grants no publication or cleanup
+authority. A deferral leaves the reserved directive retryable, and a
+`runtime_loss` interruption is retried until the budget ends the copy, because
+the next session's startup sweep rolls a lost copy back or completes it. For a
+Custody import, later success or supersession clears the evidence. An import or clone the budget ends
+records `failed` with the last class's code, retires the never-published
+generation, latches the destination Job `computer_storage_operation_failed`
+with `next_restart_at` null, and leaves the destination latched failed. Ending
+it deletes nothing and keeps the Computer identity, because the helper may
+still hold bytes under it and only an absence receipt authorizes deleting them;
+ordinary removal of the latched Computer is the exit. L1's import ledger remains
 the immutable idempotency and provenance authority even after a terminal result
 has released the reserved Computer identity, so its row is not age-pruned.
 `services custody import --wait` no longer ends on an interrupted copy
 while the import is still `reserved`: L1 counts it and retries, and the wait
 prints the running failed-attempt count on stderr (#1643). It ends with the
-failed status when L1 ends the import `failed` (a spent budget of any class,
-a dead-Node abort, or a legacy `engine_failure` acknowledgement), with the
-quarantined status for a quarantine (L1's `failed` with that code, or a legacy
-quarantine outcome on a running import), with the deferred status on a
+failed status when L1 ends the import `failed` (a spent budget of any class
+or a dead-Node abort), with the quarantined status for a quarantine (L1's
+`failed` with that code), with the deferred status on a
 recorded deferral, and with the superseded status. A deferral can still clear
 on a later attempt; its status says deferred, not failed.
 
@@ -1793,10 +1787,10 @@ completed one replays its receipt -- a destination still faulted answers
 nothing advanced the bound: healthy heartbeats run no sweep, and the bound
 needs counted attempts as well as elapsed hours.
 
-Quarantine and either interruption (`runtime_loss` or `engine_failure`) are
-terminal for a clone instead. Without
-them the clone had no acknowledgement path at all and its directive came back
-on every sweep for as long as the destination existed. Runtime loss proves a
+For a clone, a quarantine ends the copy at once, and either interruption
+(`runtime_loss` or `engine_failure`) is counted until the budget ends it, so
+its directive does not come back on every sweep for as long as the destination
+exists. Runtime loss proves a
 lost observation, not unrecoverable bytes, and what survives it depends on the
 phase the copy had reached: before `manifest_written` recovery rolls the
 attempt back, deleting the staged image and the copy's own authority record
@@ -1821,20 +1815,19 @@ removal its verified receipt. A record a startup sweep already deferred takes
 the counted recovery step an ordinary copy call takes: the attempt is counted,
 and the `resume_abandoned` bound quarantines the generation. After L1 ends the
 copy no copy call follows, so without this the residue waited for the next
-helper restart. A failed recovery is left for a later removal or the sweep. An agent of the previous release holds the terminal outcome
-until L1 accepts it and resends only the acknowledgement, never the copy. A
-current agent holds nothing: until L1's budget ends the copy, the next attempt
+helper restart. A failed recovery is left for a later removal or the sweep. The
+agent holds nothing: until L1's budget ends the copy, the next attempt
 calls the copy again after L1's `retry_after_seconds`.
 
-The acknowledgement itself deletes nothing: whatever the helper kept -- the
+Ending the clone deletes nothing: whatever the helper kept -- the
 quarantined generation, the retained root and its receipt, or the lock-only
 residue of a rolled-back attempt -- stays exactly where the helper put it and
 remains readable for inspection, and only the never-published L1 generation is
 retired, the same reason a refused clone retires one, so no later start formats
 a fresh empty disk under an identity whose copy never happened. The operation
-records `failed` with `computer_storage_quarantined` or
-`computer_storage_preparation_interrupted`, the destination Job latches that
-same typed code on its ordinary failure surface with `next_restart_at` null and
+records `failed` with the last class's code (`computer_storage_quarantined`
+for a quarantine), the destination Job latches
+`computer_storage_operation_failed` on its ordinary failure surface with `next_restart_at` null and
 no `observed_available_bytes`, which belongs to the capacity refusal alone, and
 the destination leaves `cloning` latched failed. Nothing redispatches it,
 `services clone --wait` ends on it, and ordinary removal remains the exit: a
