@@ -46,6 +46,7 @@ import (
 // widens the reset, Storage copy and abort CHECKs (reset failed/cleanup_owed
 // with failure_code and completed_ns, copy cleanup_owed, abort restoring and
 // cloning), rebuilding the active-reset index over live statuses only.
+// #1155 adds the image's Seat places to computer_job_projections.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -65,8 +66,8 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	// The Storage operation failure budget (#1608).
-	const mainFingerprint = "19a26014c4ddb27a3c405ff05964240f85245383335f6c55b2c2066d04715432"
+	// The image's Seat places on Computer Job projections (#1155).
+	const mainFingerprint = "763818b512f004f712ccc35519941e1b6181f6b2c2a46266436d1f7db222bcf8"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
@@ -77,6 +78,10 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(t.Context(), `ALTER TABLE seat_approvals DROP COLUMN host_vm_wait_deadline_ns`); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `ALTER TABLE computer_job_projections DROP COLUMN image_seat_places`); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
