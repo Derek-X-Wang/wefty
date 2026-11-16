@@ -8,7 +8,15 @@ import (
 	distributionref "github.com/distribution/reference"
 )
 
-const DefaultSharedComputerSeatLimit = 2
+const (
+	DefaultSharedComputerSeatLimit = 2
+	// DefaultOwnerComputerSeatLimit is the stage B default for an owner-made
+	// Computer (spec P17; owner, 2026-10-22).
+	DefaultOwnerComputerSeatLimit = 2
+	// MaxComputerSeatPlaces is the Seat directive's place range (1–4) in
+	// docs/contracts/computer-image.md; no image can hold more Seats.
+	MaxComputerSeatPlaces = 4
+)
 
 func ValidateComputerDefaultImage(reference string) error {
 	if reference == "" {
@@ -76,15 +84,50 @@ const (
 )
 
 // ComputerSettings belong to the Computer, rather than its replaceable Job.
-// SeatLimit zero records an owner-made Computer that takes no Seats in stage A.
+// SeatLimit zero records an owner-made Computer that takes no Seats, such as
+// one created in stage A. ImageSeatPlaces records the current image's Seat
+// support label (0: the image does not support Seats); see
+// docs/contracts/computer-image.md.
 type ComputerSettings struct {
-	SeatLimit  int                `json:"seat_limit"`
-	IdleAction ComputerIdleAction `json:"idle_action"`
-	Network    ComputerNetwork    `json:"network"`
+	SeatLimit       int                `json:"seat_limit"`
+	IdleAction      ComputerIdleAction `json:"idle_action"`
+	Network         ComputerNetwork    `json:"network"`
+	ImageSeatPlaces int                `json:"image_seat_places"`
 }
 
-func ownerComputerSettings() ComputerSettings {
-	return ComputerSettings{IdleAction: ComputerIdleNothing, Network: ComputerNetworkInternet}
+// ownerSettings validates the owner-made settings once, at the create API
+// boundary. Owner-made Computers keep today's public egress (spec 1.2).
+func (request CreateComputerRequest) ownerSettings() (ComputerSettings, error) {
+	settings := ComputerSettings{SeatLimit: DefaultOwnerComputerSeatLimit, IdleAction: ComputerIdleNothing,
+		Network: ComputerNetworkInternet, ImageSeatPlaces: request.ImageSeatPlaces}
+	if request.SeatLimit != nil {
+		settings.SeatLimit = *request.SeatLimit
+	}
+	if request.IdleAction != "" {
+		settings.IdleAction = request.IdleAction
+	}
+	if request.SeatRequestSettings != nil && (request.SeatLimit != nil || request.IdleAction != "" || request.ImageSeatPlaces != 0) {
+		return ComputerSettings{}, protocolError(contract.ErrorInvalidRequest, "a Seat-request-made Computer takes no owner Seat settings")
+	}
+	if settings.SeatLimit < 0 || settings.SeatLimit > MaxComputerSeatPlaces {
+		return ComputerSettings{}, protocolError(contract.ErrorInvalidRequest, "seat_limit must be between 0 and %d", MaxComputerSeatPlaces)
+	}
+	if err := validateImageSeatPlaces(settings.ImageSeatPlaces); err != nil {
+		return ComputerSettings{}, err
+	}
+	switch settings.IdleAction {
+	case ComputerIdleNothing, ComputerIdleStop, ComputerIdleDelete:
+	default:
+		return ComputerSettings{}, protocolError(contract.ErrorInvalidRequest, "idle_action must be nothing, stop or delete")
+	}
+	return settings, nil
+}
+
+func validateImageSeatPlaces(places int) error {
+	if places < 0 || places > MaxComputerSeatPlaces {
+		return protocolError(contract.ErrorInvalidRequest, "image_seat_places must be between 0 and %d", MaxComputerSeatPlaces)
+	}
+	return nil
 }
 
 func (settings ComputerSettings) validateSeatRequest() error {

@@ -43,7 +43,8 @@ func TestOwnerComputerSettingsSurviveRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]any{
-		"seat_limit": float64(0), "idle_action": "nothing", "network": "internet", "seat_request_made": false,
+		"seat_limit": float64(2), "idle_action": "nothing", "network": "internet", "seat_request_made": false,
+		"image_seat_places": float64(0),
 	} {
 		if fields[key] != want {
 			t.Errorf("Computer %s = %v, want %v", key, fields[key], want)
@@ -117,6 +118,10 @@ func TestPreSeatComputerUpgradeKeepsOwnerSettings(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := store.db.Exec("ALTER TABLE computer_job_projections DROP COLUMN image_seat_places"); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +134,7 @@ func TestPreSeatComputerUpgradeKeepsOwnerSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ComputerSettings != ownerComputerSettings() || got.SeatRequestMade ||
+	if got.ComputerSettings != (ComputerSettings{IdleAction: ComputerIdleNothing, Network: ComputerNetworkInternet}) || got.SeatRequestMade ||
 		!reflect.DeepEqual(got.CurrentJob.Spec, computer.CurrentJob.Spec) ||
 		got.StorageID != computer.StorageID || got.DesiredState != computer.DesiredState {
 		t.Fatalf("upgrade changed an existing Computer: %+v", got)

@@ -103,8 +103,12 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 	var name, idempotencyKey string
 	var backupCap int64
 	var diskBytes optionalInt64Flag
+	var seatLimit seatLimitFlag
+	var idleAction string
 	var imageFlags imageFlagSet
 	flags.StringVar(&name, "name", "", "durable Computer name")
+	flags.Var(&seatLimit, "seat-limit", "Seats the Computer holds, 0 to 4 (default 2); an explicit value above 0 reads a custom image's Seat support from its registry")
+	flags.StringVar(&idleAction, "idle-action", "", "nothing, stop or delete after the last Seat leaves (default nothing)")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable Computer creation key")
 	flags.Int64Var(&backupCap, "backup-cap", 0, "maximum retained Backups (shipped default 0)")
 	flags.Var(&diskBytes, "disk-bytes", "fully allocated Computer disk budget")
@@ -113,7 +117,16 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(name) == "" || strings.TrimSpace(imageFlags.reference) == "" || strings.TrimSpace(imageFlags.nodeID) == "" || backupCap < 0 {
-		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--argv ARG] [--working-directory PATH] [--mount NODE_PATH:CONTAINER_PATH[:ro]] [--memory-bytes BYTES] [--cpu-millicores VALUE] [--runtime-handler NAME] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
+		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--argv ARG] [--working-directory PATH] [--mount NODE_PATH:CONTAINER_PATH[:ro]] [--memory-bytes BYTES] [--cpu-millicores VALUE] [--runtime-handler NAME] [--disk-bytes BYTES] [--backup-cap COUNT] [--seat-limit N] [--idle-action nothing|stop|delete] [--idempotency-key KEY]")
+	}
+	limit := l1.DefaultOwnerComputerSeatLimit
+	if seatLimit.set {
+		limit = seatLimit.value
+	}
+	switch l1.ComputerIdleAction(idleAction) {
+	case "", l1.ComputerIdleNothing, l1.ComputerIdleStop, l1.ComputerIdleDelete:
+	default:
+		return usageError("--idle-action must be nothing, stop or delete")
 	}
 	if !imageFlags.memoryBytes.set {
 		imageFlags.memoryBytes = optionalInt64Flag{value: defaultComputerMemoryBytes, set: true}
@@ -144,6 +157,20 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 	if err := contract.ValidateImageProgram(*program, contract.JobClassService); err != nil {
 		return usageError(fmt.Sprintf("invalid Computer image program: %v", err))
 	}
+	// The image's Seat support is read only on an explicit --seat-limit above
+	// 0 (#1155), so a default create makes no registry request and works
+	// offline and with private registries. L1 counts the configured default
+	// image as a Seat image without a reading.
+	places := 0
+	if seatLimit.set && limit > 0 {
+		places, err = readImageSeatPlaces(ctx, clients, program.Reference, *program.Digest, true, stderr)
+		if err != nil {
+			return err
+		}
+		if limit > places {
+			return usageError(fmt.Sprintf("--seat-limit %d exceeds the %d Seat places of the image", limit, places))
+		}
+	}
 	if idempotencyKey == "" {
 		digest := sha256.Sum256([]byte(strings.TrimSpace(name)))
 		idempotencyKey = "computer-" + hex.EncodeToString(digest[:])
@@ -169,9 +196,16 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 			}, DiskBytes: diskBytes.value},
 		}},
 	}
-	computer, receipt, err := clients.createComputer(ctx, l1.CreateComputerRequest{
-		Name: strings.TrimSpace(name), Spec: spec, BackupCap: &backupCap,
-	})
+	// Unset flags take L1's defaults, so replaying a creation made before
+	// Seat settings existed still matches it.
+	request := l1.CreateComputerRequest{Name: strings.TrimSpace(name), Spec: spec, BackupCap: &backupCap, ImageSeatPlaces: places}
+	if seatLimit.set {
+		request.SeatLimit = &seatLimit.value
+	}
+	if idleAction != "" {
+		request.IdleAction = l1.ComputerIdleAction(idleAction)
+	}
+	computer, receipt, err := clients.createComputer(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -311,16 +345,17 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	var image string
-	var chown, terminateSessions bool
+	var chown, terminateSessions, seatSupport bool
 	mutation.bind(flags, true)
 	flags.StringVar(&image, "image", "", "new OCI image reference with optional @sha256 digest")
+	flags.BoolVar(&seatSupport, "seat-support", false, "read the new image's Seat label from its registry and fail if it cannot be read (a Computer with a Seat limit above 0)")
 	flags.BoolVar(&chown, "chown", false, "authorize the crash-resumable ownership migration")
 	flags.BoolVar(&terminateSessions, "terminate-sessions", false, "close live take-over sessions before reimage")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(image) == "" {
-		return usageError("usage: wefty services reimage COMPUTER --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
+		return usageError("usage: wefty services reimage COMPUTER --image IMAGE --idempotency-key KEY [--seat-support] [CAS flags | --expect-current]")
 	}
 	if err := mutation.validate(true); err != nil {
 		return err
@@ -352,10 +387,39 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 		}
 		digest = &resolved
 	}
+	// Only a Computer that opted in reads the new image's label: with
+	// --seat-support (fails loudly), or because a reading is already recorded
+	// (warns and records 0 when unreadable). Other reimages make no registry
+	// request (#1155).
+	current, err := clients.getComputer(ctx, computerID)
+	if err != nil {
+		return err
+	}
+	places := 0
+	switch {
+	case seatSupport && current.SeatLimit == 0:
+		return usageError("--seat-support needs a Computer with a Seat limit above 0; this Computer takes no Seats")
+	case seatSupport && computerImageDigest(current) == *digest:
+		// A reimage to the current digest is a no-op in L1. A reading already
+		// recorded there is this opt-in's own result (a retry or replay); send
+		// it so L1 can replay. Without one, nothing could record it.
+		if current.ImageSeatPlaces == 0 {
+			return usageError("--seat-support needs a new image digest; a reimage to the current digest changes nothing, so create the Computer with --seat-limit or reimage to a new build")
+		}
+		places = current.ImageSeatPlaces
+	case seatSupport:
+		if places, err = readImageSeatPlaces(ctx, clients, reference, *digest, true, stderr); err != nil {
+			return err
+		}
+	case current.SeatLimit > 0 && current.ImageSeatPlaces > 0:
+		if places, err = readImageSeatPlaces(ctx, clients, reference, *digest, false, stderr); err != nil {
+			return err
+		}
+	}
 	computer, receipt, err := clients.reimageComputer(ctx, computerID, l1.ComputerReimageRequest{
 		ComputerMutationPrecondition: precondition,
 		Image:                        contract.OCIImageSpec{Reference: reference, Digest: digest}, Chown: chown,
-		TerminateSessions: terminateSessions, IdempotencyKey: key,
+		TerminateSessions: terminateSessions, IdempotencyKey: key, ImageSeatPlaces: places,
 	})
 	if err != nil {
 		return err
@@ -815,4 +879,60 @@ func computerActionsColumn(actions []contract.AllowedAction) string {
 	}
 	data, _ := json.Marshal(actions)
 	return string(data)
+}
+
+// computerImageDigest is the digest of the Computer's current image.
+func computerImageDigest(computer l1.Computer) string {
+	if oci := computer.CurrentJob.Spec.Execution.OCI; oci != nil && oci.Image.Digest != nil {
+		return *oci.Image.Digest
+	}
+	return ""
+}
+
+// readImageSeatPlaces reads the image's Seat label from its registry. When the
+// owner asked for Seats (required), an unreadable or missing label fails;
+// otherwise it records 0 places and warns once.
+func readImageSeatPlaces(ctx context.Context, clients *apiClients, reference, digest string, required bool, stderr io.Writer) (int, error) {
+	reader, ok := clients.images.(imageSeatLabelReader)
+	if !ok {
+		reader = newRegistryResolver(nil)
+	}
+	places, err := reader.ImageSeatPlaces(ctx, reference, digest)
+	if err != nil {
+		if required {
+			return 0, fmt.Errorf("read the image's Seat support (label %s): %w; omit --seat-limit or pass --seat-limit 0 for a Computer without a reading", imageSeatLabel, err)
+		}
+		fmt.Fprintf(stderr, "warning: could not read the image's Seat support (%v); by-name Seat requests to this Computer are refused until a reimage with --seat-support records it\n", err)
+		return 0, nil
+	}
+	if places == 0 && required {
+		return 0, usageError(fmt.Sprintf("the image has no valid %s label, so it does not support Seats; pass --seat-limit 0 for a Computer without Seats", imageSeatLabel))
+	}
+	if places == 0 {
+		fmt.Fprintf(stderr, "warning: the image has no %s label, so it does not support Seats; by-name Seat requests to this Computer are refused\n", imageSeatLabel)
+	}
+	return places, nil
+}
+
+// seatLimitFlag accepts 0 (a Computer without Seats) to the Seat directive's
+// highest place.
+type seatLimitFlag struct {
+	value int
+	set   bool
+}
+
+func (f *seatLimitFlag) Set(value string) error {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 || parsed > l1.MaxComputerSeatPlaces {
+		return fmt.Errorf("must be between 0 and %d", l1.MaxComputerSeatPlaces)
+	}
+	f.value, f.set = parsed, true
+	return nil
+}
+
+func (f *seatLimitFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	return strconv.Itoa(f.value)
 }

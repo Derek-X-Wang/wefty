@@ -145,7 +145,13 @@ type CreateComputerRequest struct {
 	Name      string           `json:"name"`
 	Spec      contract.JobSpec `json:"spec"`
 	BackupCap *int64           `json:"backup_cap,omitempty"`
-	Actor     string           `json:"-"`
+	// Owner-made Seat settings (spec P17). A nil SeatLimit means the default
+	// 2; an empty IdleAction means nothing. ImageSeatPlaces is the CLI's
+	// reading of the image's Seat label, 0 when the image has none.
+	SeatLimit       *int               `json:"seat_limit,omitempty"`
+	IdleAction      ComputerIdleAction `json:"idle_action,omitempty"`
+	ImageSeatPlaces int                `json:"image_seat_places,omitempty"`
+	Actor           string             `json:"-"`
 	// SeatRequestSettings is supplied only by the trusted Seat-request flow.
 	// The owner-facing create API cannot turn a Computer into an on-demand one.
 	SeatRequestSettings *ComputerSettings `json:"-"`
@@ -178,6 +184,10 @@ type ComputerRemoveRequest struct {
 type ComputerProjectionRequest struct {
 	ComputerMutationPrecondition
 	Spec contract.JobSpec `json:"spec"`
+	// imageSeatPlaces is the new projection's image Seat label. Reimage takes
+	// it from its request; a generic projection keeps the current value only
+	// when the image digest does not change.
+	imageSeatPlaces int
 }
 
 // ComputerReimageRequest changes only the tenant image of the current
@@ -189,6 +199,9 @@ type ComputerReimageRequest struct {
 	Chown             bool                  `json:"chown,omitempty"`
 	TerminateSessions bool                  `json:"terminate_sessions,omitempty"`
 	IdempotencyKey    string                `json:"idempotency_key"`
+	// ImageSeatPlaces is the CLI's reading of the new image's Seat label
+	// (docs/contracts/computer-image.md); 0 when it has none.
+	ImageSeatPlaces int `json:"image_seat_places,omitempty"`
 }
 
 type ComputerReimagePreflightDirective struct {
@@ -375,7 +388,10 @@ func (s *Store) createComputerTx(ctx context.Context, tx *sql.Tx, now time.Time,
 	if backupCap < 0 {
 		return Computer{}, false, protocolError(contract.ErrorInvalidRequest, "backup_cap must be non-negative")
 	}
-	settings := ownerComputerSettings()
+	settings, err := request.ownerSettings()
+	if err != nil {
+		return Computer{}, false, err
+	}
 	if request.SeatRequestSettings != nil {
 		settings = *request.SeatRequestSettings
 		if err := settings.validateSeatRequest(); err != nil {
@@ -412,7 +428,19 @@ func (s *Store) createComputerTx(ctx context.Context, tx *sql.Tx, now time.Time,
 				WHERE computer_id=? AND intent_revision=?`, computer.ComputerID, initialComputerRevision).Scan(&creationActor)
 		}
 		capMismatch := request.BackupCap != nil && computer.BackupCap != *request.BackupCap
-		settingsMismatch := computer.ComputerSettings != settings || computer.SeatRequestMade != (request.SeatRequestSettings != nil)
+		// Image Seat places is the CLI's reading of the image, which a later
+		// reimage replaces; it is not creation intent, so replay ignores it.
+		// An omitted owner setting replays any stored value, so a creation
+		// made before Seat settings existed still replays (#1155).
+		replayed := computer.ComputerSettings
+		replayed.ImageSeatPlaces = settings.ImageSeatPlaces
+		if request.SeatRequestSettings == nil && request.SeatLimit == nil {
+			replayed.SeatLimit = settings.SeatLimit
+		}
+		if request.SeatRequestSettings == nil && request.IdleAction == "" {
+			replayed.IdleAction = settings.IdleAction
+		}
+		settingsMismatch := replayed != settings || computer.SeatRequestMade != (request.SeatRequestSettings != nil)
 		if computerErr != nil || computer.Name != request.Name || creationActor != request.Actor || capMismatch || settingsMismatch {
 			return Computer{}, false, protocolError(contract.ErrorDispatchKeyConflict,
 				"dispatch key %q does not identify this Computer", request.Spec.DispatchKey)
@@ -475,8 +503,8 @@ func (s *Store) createComputerTx(ctx context.Context, tx *sql.Tx, now time.Time,
 		return Computer{}, false, internalError(err, "store Computer")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(
-		computer_id, job_id, spec_revision, current, created_ns
-	) VALUES(?, ?, 1, 1, ?)`, computerID, job.JobID, now.UnixNano()); err != nil {
+		computer_id, job_id, spec_revision, current, image_seat_places, created_ns
+	) VALUES(?, ?, 1, 1, ?, ?)`, computerID, job.JobID, settings.ImageSeatPlaces, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "store initial Computer projection")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_storage_generations(
@@ -782,7 +810,9 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
 		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
-		submit_policy_revision, removal_outcome, created_ns, updated_ns, seat_limit, idle_action, network, seat_request_made
+		submit_policy_revision, removal_outcome, created_ns, updated_ns, seat_limit, idle_action, network,
+		COALESCE((SELECT p.image_seat_places FROM computer_job_projections p WHERE p.computer_id=computers.computer_id AND p.job_id=computers.current_job_id),0),
+		seat_request_made
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
 		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.DesiredDiskBytes, &computer.BackupCap, &computer.DesiredState,
@@ -790,7 +820,7 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
 		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
 		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &computer.RemovalOutcome, &createdNS, &updatedNS,
-		&computer.SeatLimit, &computer.IdleAction, &computer.Network, &computer.SeatRequestMade)
+		&computer.SeatLimit, &computer.IdleAction, &computer.Network, &computer.ImageSeatPlaces, &computer.SeatRequestMade)
 	if err != nil {
 		return Computer{}, err
 	}
@@ -1727,7 +1757,15 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 	if request.Image.Digest == nil || strings.TrimSpace(*request.Image.Digest) == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Computer reimage target must be digest pinned")
 	}
-	reimagePayload, err := json.Marshal(request)
+	if err := validateImageSeatPlaces(request.ImageSeatPlaces); err != nil {
+		return Computer{}, err
+	}
+	// The image's Seat reading is derived from the registry, not reimage
+	// authority: a retry that reads it differently (an outage, for example)
+	// must still replay. The first accepted reading stays on the projection.
+	hashed := request
+	hashed.ImageSeatPlaces = 0
+	reimagePayload, err := json.Marshal(hashed)
 	if err != nil {
 		return Computer{}, internalError(err, "encode Computer reimage request")
 	}
@@ -1780,7 +1818,7 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 	nextOCI.Image = request.Image
 	nextSpec.Execution.OCI = &nextOCI
 	nextSpec.DispatchKey = dispatchKey
-	projection := ComputerProjectionRequest{ComputerMutationPrecondition: request.ComputerMutationPrecondition, Spec: nextSpec}
+	projection := ComputerProjectionRequest{ComputerMutationPrecondition: request.ComputerMutationPrecondition, Spec: nextSpec, imageSeatPlaces: request.ImageSeatPlaces}
 	return s.installComputerProjection(ctx, computerID, projection, ComputerIntentReimage,
 		ComputerReconfigurationReimaging, request.Chown, request.IdempotencyKey, reimageRequestHash, replayed)
 }
@@ -1882,14 +1920,17 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if err != nil {
 		return Computer{}, err
 	}
+	if operation == ComputerIntentProject && sameImageDigest(computer.CurrentJob.Spec, request.Spec) {
+		request.imageSeatPlaces = computer.ImageSeatPlaces
+	}
 	var nextSpecRevision int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(spec_revision), 0) + 1
 		FROM computer_job_projections WHERE computer_id=?`, computerID).Scan(&nextSpecRevision); err != nil {
 		return Computer{}, internalError(err, "reserve monotonic Computer spec revision")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(
-		computer_id, job_id, spec_revision, current, chown, created_ns
-	) VALUES(?, ?, ?, 0, ?, ?)`, computerID, job.JobID, nextSpecRevision, chown, now.UnixNano()); err != nil {
+		computer_id, job_id, spec_revision, current, chown, image_seat_places, created_ns
+	) VALUES(?, ?, ?, 0, ?, ?, ?)`, computerID, job.JobID, nextSpecRevision, chown, request.imageSeatPlaces, now.UnixNano()); err != nil {
 		return Computer{}, internalError(err, "store staging Computer Job projection")
 	}
 	nextRevision := computer.IntentRevision + 1
@@ -2143,4 +2184,12 @@ func (r *databaseReads) computerReimageReplayHash(ctx context.Context, computerI
 	err := r.q.QueryRowContext(ctx, `SELECT request_hash FROM computer_reimage_operations
 		WHERE computer_id=? AND idempotency_key=?`, computerID, key).Scan(&hash)
 	return hash, err
+}
+
+func sameImageDigest(current, next contract.JobSpec) bool {
+	if current.Execution.OCI == nil || next.Execution.OCI == nil {
+		return false
+	}
+	a, b := current.Execution.OCI.Image.Digest, next.Execution.OCI.Image.Digest
+	return a != nil && b != nil && *a == *b
 }

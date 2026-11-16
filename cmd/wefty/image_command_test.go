@@ -25,6 +25,15 @@ type fakeImageResolver struct {
 	digest     string
 	digests    []string
 	references []string
+	// Seat label reading (#1155): seatPlaces or seatErr answer every read.
+	seatPlaces int
+	seatErr    error
+	seatReads  []string
+}
+
+func (r *fakeImageResolver) ImageSeatPlaces(_ context.Context, reference, digest string) (int, error) {
+	r.seatReads = append(r.seatReads, reference+"@"+digest)
+	return r.seatPlaces, r.seatErr
 }
 
 func (r *fakeImageResolver) ResolveDigest(_ context.Context, reference string) (string, error) {

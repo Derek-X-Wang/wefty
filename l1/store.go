@@ -1546,6 +1546,12 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "computer_job_projections", "chown", "INTEGER NOT NULL DEFAULT 0 CHECK(chown IN (0, 1))"); err != nil {
 		return err
 	}
+	// The image's Seat label belongs to the projection that carries the image
+	// (#1155); rows from before it read 0, an image without Seat support. It is
+	// declared only here so a fresh store and an upgraded one share its DDL.
+	if err := s.ensureColumn(ctx, "computer_job_projections", "image_seat_places", "INTEGER NOT NULL DEFAULT 0 CHECK(image_seat_places BETWEEN 0 AND 4)"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "computer_storage_resets", "resume_desired_running", "INTEGER NOT NULL DEFAULT 0 CHECK(resume_desired_running IN (0, 1))"); err != nil {
 		return err
 	}
@@ -3665,13 +3671,13 @@ AND state=@job_queued
 			if err := tx.QueryRowContext(ctx, `SELECT c.computer_id, c.storage_id, c.storage_generation, c.intent_revision,
 				c.submit_enabled, c.submit_intent_revision, c.submit_max_inflight, c.submit_policy_revision,
 				c.desired_disk_bytes,
-				p.chown, c.seat_limit, c.idle_action, c.network, c.seat_request_made
+				p.chown, c.seat_limit, c.idle_action, c.network, p.image_seat_places, c.seat_request_made
 				FROM computers c JOIN computer_job_projections p ON p.computer_id=c.computer_id AND p.job_id=c.current_job_id
 				WHERE c.computer_id=? AND c.current_job_id=?`, computerID, jobID).
 				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision,
 					&storage.SubmitEnabled, &storage.SubmitIntentRevision, &storage.SubmitMaxInflight,
 					&storage.SubmitPolicyRevision, &storage.DiskBytes, &storage.Chown,
-					&storage.SeatLimit, &storage.IdleAction, &storage.Network, &storage.SeatRequestMade); err != nil {
+					&storage.SeatLimit, &storage.IdleAction, &storage.Network, &storage.ImageSeatPlaces, &storage.SeatRequestMade); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
 			computerStorage = &storage

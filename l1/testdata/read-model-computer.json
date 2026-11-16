@@ -364,6 +364,7 @@
   "display_endpoint": null,
   "grants": [],
   "idle_action": "nothing",
+  "image_seat_places": 0,
   "intent_revision": 1,
   "last_condition": {
     "code": "computer_intent_create",
@@ -380,7 +381,7 @@
   "network": "internet",
   "placement_node_id": "computer-node",
   "reconfiguration_phase": "stable",
-  "seat_limit": 0,
+  "seat_limit": 2,
   "seat_request_made": false,
   "storage_generation": 1,
   "storage_id": "STORAGE",
