@@ -790,14 +790,19 @@ call before, and a default create still makes none:
 A label that does not match the image's real behaviour still fails safely: the
 Seat misses its 60-second readiness deadline and its request is refused.
 
-**Default-image fallback (temporary).** Installed configs pin a default
-Computer image digest built before the label existed. L1 therefore treats an
+**Default image counts as a Seat image (standing rule).** L1 treats an
 owner-made Computer whose current image digest equals the configured
 `--computer-default-image` as 4 places when its recorded reading is 0, for
 by-name checks and in its start claim; the Computer projection still shows the
-recorded reading. Remove this fallback once every install's default image
-carries the label. Seat-request-made Computers always use that default image
-and their own Seat limit.
+recorded reading. This rule stays: a default create reads no label, so that
+owner creates make no registry request, and the configured default image is
+known to be the 4-place Seat image. Seat-request-made Computers always use
+that default image and their own Seat limit.
+
+A by-name request to a Computer with no recorded reading, outside that rule,
+is refused before the dialog with the reason `no Seat support` and the owner's
+remedies: reimage to a new image digest with `--seat-support`, or create the
+Computer with an explicit `--seat-limit`.
 
 The node agent runs the Seat controller for every Seat-request-made Computer
 and for an owner-made Computer whose claim has a positive Seat limit and Seat

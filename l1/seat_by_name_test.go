@@ -123,7 +123,7 @@ func TestSeatByNameRefusalsComeBeforeTheDialog(t *testing.T) {
 		name, network, prefix, text string
 	}{
 		{"desk", "none", SeatByNameNetworkPrefix, `"desk" has network internet`},
-		{"plain", "internet", SeatByNameUnsupportedPrefix, "does not support Seats"},
+		{"plain", "internet", SeatByNameUnsupportedPrefix, "--seat-support` for a new image digest, or create the Computer with --seat-limit"},
 		{"no-seats", "internet", SeatByNameUnsupportedPrefix, "Seat limit 0"},
 		{"broken", "internet", SeatByNameUnavailablePrefix, "failed; the owner decides"},
 		{"gone", "internet", SeatByNameUnavailablePrefix, "was removed"},

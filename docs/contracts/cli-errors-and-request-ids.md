@@ -472,7 +472,7 @@ JSON error document on stderr, with `details.seat_id` and these codes:
 | `seat_node_unavailable` | the node did not pick up the request | 5 | true |
 | `seat_window_not_allowed` | requested window is not enabled; names the allowed windows | 5 | false |
 | `seat_computer_network` | `Computer network differs: …`; names the Computer's network | 5 | false |
-| `seat_computer_unsupported` | `no Seat support: …`; the image does not support Seats, or Seat limit 0 | 5 | false |
+| `seat_computer_unsupported` | `no Seat support: …`; Seat limit 0, or no Seat support recorded for the image (the reason names the owner's remedies) | 5 | false |
 | `seat_computer_unavailable` | `Computer unavailable: …`; not found, removed, failed, on another node, or stopped after the dialog | 5 | false |
 | `seat_computer_full` | `Computer full: …`; every Seat place is taken | 5 | true |
 | `seat_ended` | Seat ended: the recorded end reason | 5 | false |

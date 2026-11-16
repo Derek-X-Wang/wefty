@@ -38,11 +38,10 @@ func (s *Store) computerSeatPlaces(computer Computer) int {
 	return min(computer.SeatLimit, s.imageSeatPlaces(computer.ImageSeatPlaces, computer.CurrentJob.Spec))
 }
 
-// imageSeatPlaces applies one fallback to a recorded label reading: an
-// installed config pins a default image digest built before the Seat label
-// existed, and that image is the 4-place default image. Remove the fallback
-// once every install's default image carries the label (#1155;
-// docs/contracts/computer-image.md).
+// imageSeatPlaces applies one standing rule to a recorded label reading: the
+// configured default image is the 4-place Seat image. A default create reads
+// no label (#1155 keeps owner creates free of registry requests), so this rule
+// is how a default-image Computer takes Seats (docs/contracts/computer-image.md).
 func (s *Store) imageSeatPlaces(recorded int, spec contract.JobSpec) int {
 	if recorded == 0 && spec.Execution.OCI != nil && s.computerDefaultImage != "" &&
 		computerDefaultImageMatches(s.computerDefaultImage, spec.Execution.OCI.Image) {
@@ -86,7 +85,9 @@ func (s *Store) checkSeatByName(ctx context.Context, q queryer, nodeID, name, ne
 	}
 	places := s.computerSeatPlaces(computer)
 	if places == 0 {
-		return refuse(SeatByNameUnsupportedPrefix, "the image of Computer %q does not support Seats", name)
+		// Nothing is recorded: no reading was asked for, or the image has no
+		// label. Name the owner's real remedies (#1155).
+		return refuse(SeatByNameUnsupportedPrefix, "the image of Computer %q does not support Seats, or its Seat support was never read; the owner can record it with `wefty services reimage %s --image IMAGE --seat-support` for a new image digest, or create the Computer with --seat-limit", name, name)
 	}
 	rows, err := q.QueryContext(ctx, `SELECT i.place FROM computer_seat_identities i JOIN computer_seat_room_reservations r ON r.seat_id=i.seat_id WHERE i.computer_id=? AND r.cleanup_complete=0`, id)
 	if err != nil {
