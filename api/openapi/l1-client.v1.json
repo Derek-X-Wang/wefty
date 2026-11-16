@@ -1707,7 +1707,7 @@
                   "backup_cap": { "type": "integer", "format": "int64", "minimum": 0, "description": "Optional per-Computer override; zero disables Backup creation." },
                   "seat_limit": { "type": "integer", "minimum": 0, "maximum": 4, "description": "Owner-made Seat limit (spec P17); omitted means 2. A replay that omits it matches any stored limit." },
                   "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"], "description": "Applied after the last Seat leaves; omitted means nothing. A replay that omits it matches any stored action." },
-                  "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "The caller's reading of the image's Seat label; 0 or omitted when the image does not support Seats. Replay ignores it." }
+                  "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "The caller's reading of the image's Seat label; 0 or omitted when it was not read or the image does not support Seats. Replay ignores it." }
                 }
               }
             }
@@ -1919,7 +1919,7 @@
             "chown": { "type": "boolean", "default": false },
             "terminate_sessions": { "type": "boolean", "default": false },
             "idempotency_key": { "type": "string", "minLength": 1 },
-            "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "The caller's reading of the new image's Seat label; 0 or omitted when it does not support Seats." }
+            "image_seat_places": { "type": "integer", "minimum": 0, "maximum": 4, "description": "The caller's reading of the new image's Seat label; 0 or omitted when it was not read or the image does not support Seats." }
           }
         } } } },
         "responses": {

@@ -406,7 +406,7 @@ The Computer also stores `seat_limit`, `idle_action` (`delete`, `stop`, or
 `nothing`), `network` (`internet` or `none`), and `seat_request_made`. Network
 is fixed at creation; replacing a Job projection never changes these fields.
 Each Job projection also stores `image_seat_places`, its image's Seat support
-reading (0–4, `docs/contracts/computer-image.md`); the Computer and its start
+reading (0–4, 0 when not read; `docs/contracts/computer-image.md`); the Computer and its start
 claim expose the current projection's value. A reimage records the new image's
 reading; a generic projection keeps the current value only when the image
 digest does not change. Pre-Seat database rows read 0.
