@@ -138,7 +138,7 @@ func (h *storageCLIHarness) refuseCloneCopy(t *testing.T, observedAvailableBytes
 		FailureCode: "insufficient_disk", DestinationAbsent: true, ObservedAvailableBytes: observedAvailableBytes}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", d.DestinationComputerID,
 		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt}); err != nil {
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}); err != nil {
 		t.Fatal(err)
 	}
 }

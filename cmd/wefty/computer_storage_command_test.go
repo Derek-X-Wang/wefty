@@ -1016,7 +1016,7 @@ func (h *storageCLIHarness) startStorageCopyHelperDelayed(operation, destination
 					SourceUnchanged: true, DestinationPrepared: true,
 					FilesystemExpanded: (operation == "clone" || operation == "import") && directive.DestinationSize > directive.SourceSize}
 				request := l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-					IdempotencyKey: receipt.ReceiptID, Receipt: receipt}
+					IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}
 				if directive.KeepOldBackup {
 					old := l1.ComputerBackupCopyReceipt{Kind: "computer_backup_copy_verified", ReceiptID: "old-" + directive.OldCopyID,
 						BackupID: directive.OldBackupID, CopyID: directive.OldCopyID, ComputerID: directive.DestinationComputerID,
@@ -1110,7 +1110,7 @@ func (h *storageCLIHarness) startStorageCopyFailure() <-chan error {
 					SourceDigest: directive.SourceDigest, FailureCode: "manifest_invalid", DestinationAbsent: true}
 				_, err = h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
 					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+						IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 				done <- err
 				return
 			}
@@ -1231,7 +1231,7 @@ func TestComputerCloneWaitReportsTheCapacityRefusal(t *testing.T) {
 					ObservedAvailableBytes: observedAvailableBytes}
 				_, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", directive.DestinationComputerID,
 					l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-						IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+						IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 				done <- err
 				return
 			}

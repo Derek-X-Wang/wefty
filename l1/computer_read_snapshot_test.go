@@ -73,7 +73,7 @@ func TestComputerSnapshotImportFailureBetweenIntentReads(t *testing.T) {
 		failure.FailureCode = "manifest_invalid"
 		failure.DestinationAbsent = true
 		ctx, fired := observeOnce(t, t.Context(), "computer_intents_owner", func() {
-			_, err := h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure})
+			_, err := h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: &failure})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -2246,17 +2246,21 @@
       "post": {
         "operationId": "acknowledgeComputerStorageCopy",
         "summary": "Publish an assertion-derived restore, clone, or Custody import destination",
-        "description": "A success/failure receipt binds source bytes and destination Storage authority. A failed copy attempt and its preparation outcome are reported on storage-operation-failure, not here (#1608, #1627).",
+        "description": "A success/failure receipt binds source bytes and destination Storage authority. A failed copy attempt and its preparation outcome are reported on storage-operation-failure, not here (#1608, #1627). A restore with keep_old_as_backup whose old-generation Backup failed or is absent copies nothing: it sends only old_backup_receipt, without receipt, and L1 aborts the restore with a typed conflict while the old generation stays current (#1717).",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
-      "required": ["node_id", "boot_session_id", "idempotency_key", "receipt"],
+          "required": ["node_id", "boot_session_id", "idempotency_key"],
           "properties": {
             "node_id": { "type": "string", "minLength": 1 },
             "boot_session_id": { "type": "string", "minLength": 1 },
             "idempotency_key": { "type": "string", "minLength": 1 },
             "receipt": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageCopyReceipt" },
-            "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false." }
-          }
+            "old_backup_receipt": { "type": "object", "description": "Exact Computer Backup copy receipt for the precommitted old generation; forbidden when keep_old_as_backup was false. Without receipt it must be a computer_backup_copy_failed_absent receipt." }
+          },
+          "oneOf": [
+            { "required": ["receipt"] },
+            { "required": ["old_backup_receipt"], "not": { "required": ["receipt"] } }
+          ]
         } } } },
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },

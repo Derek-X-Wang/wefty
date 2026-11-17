@@ -34,7 +34,7 @@ func TestStorageResetAfterAbortedRestoreSkipsTheRetiredGeneration(t *testing.T) 
 		computerBackupFailureReceiptKind, "", "insufficient_disk", true
 	if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: copyReceipt.ReceiptID, Receipt: copyReceipt, OldBackupReceipt: &oldReceipt}); errorCode(err) != contract.ErrorConflict {
+			IdempotencyKey: copyReceipt.ReceiptID, Receipt: &copyReceipt, OldBackupReceipt: &oldReceipt}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("failed predecessor copy = %v, want the typed abort", err)
 	}
 	aborted, err := testReads(h.store).GetComputer(ctx, computer.ComputerID)

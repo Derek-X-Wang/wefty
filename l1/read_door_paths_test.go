@@ -194,7 +194,7 @@ func TestCustodyImportAcknowledgementUsesOneWrite(t *testing.T) {
 	clock := &snapshotClock{}
 	clock.at.Store(h.clock.Now().UnixNano())
 	h.store.clock = clock
-	_, err = h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure})
+	_, err = h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: &failure})
 	if err != nil || clock.calls.Load() != 1 {
 		t.Fatalf("import write clock samples=%d err=%v", clock.calls.Load(), err)
 	}

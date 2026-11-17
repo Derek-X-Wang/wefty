@@ -92,7 +92,7 @@ func (h *storageCLIHarness) failRestorePredecessorCopy(t *testing.T, failureCode
 		Encryption: l1.BackupEncryptionNone, FailureCode: failureCode, CopyAbsent: true}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(h.ctx, "fabric-storage-node", d.DestinationComputerID,
 		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt, OldBackupReceipt: &old}); err == nil {
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt, OldBackupReceipt: &old}); err == nil {
 		t.Fatal("failed predecessor copy was accepted as a completed restore")
 	}
 	aborted := mustStorageComputer(t, h)

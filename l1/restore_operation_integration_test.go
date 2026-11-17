@@ -49,7 +49,7 @@ func TestRestoreBeginNamesItsOwnOperationAndTheReadReturnsItsOutcome(t *testing.
 		d := directives[0]
 		receipt := successfulStorageCopyReceipt(d)
 		request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt}
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}
 		if oldFailure != "" {
 			old := successfulOldGenerationBackupReceipt(d)
 			old.Kind, old.ContentDigest, old.FailureCode, old.CopyAbsent = computerBackupFailureReceiptKind, "", string(oldFailure), true

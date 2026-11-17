@@ -136,7 +136,7 @@ func (controller *storageCopyController) attempt(ctx context.Context, directive 
 	_, err = controller.client.AcknowledgeComputerStorageCopy(ctx, directive.DestinationComputerID,
 		l1.ComputerStorageCopyAcknowledgementRequest{NodeID: controller.nodeID,
 			BootSessionID: controller.bootSessionID, IdempotencyKey: receipt.ReceiptID,
-			Receipt: receipt, OldBackupReceipt: oldBackupReceipt})
+			Receipt: &receipt, OldBackupReceipt: oldBackupReceipt})
 	return err
 }
 

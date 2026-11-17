@@ -42,7 +42,7 @@ func TestRestoreAbortsWhenItsBoundNodeDies(t *testing.T) {
 			if stage == "published" {
 				if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
 					ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-						IdempotencyKey: receipt.ReceiptID, Receipt: receipt, OldBackupReceipt: &oldReceipt}); err != nil {
+						IdempotencyKey: receipt.ReceiptID, Receipt: &receipt, OldBackupReceipt: &oldReceipt}); err != nil {
 					t.Fatal(err)
 				}
 				wantGeneration = directive.DestinationGeneration
@@ -80,7 +80,7 @@ func TestRestoreAbortsWhenItsBoundNodeDies(t *testing.T) {
 			if stage == ComputerStorageOperationPrepare {
 				if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
 					ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-						IdempotencyKey: receipt.ReceiptID, Receipt: receipt, OldBackupReceipt: &oldReceipt}); err == nil {
+						IdempotencyKey: receipt.ReceiptID, Receipt: &receipt, OldBackupReceipt: &oldReceipt}); err == nil {
 					t.Fatal("a late copy receipt published an aborted restore")
 				}
 			}
@@ -190,7 +190,7 @@ func TestCloneAbortsWhenItsBoundNodeDies(t *testing.T) {
 	receipt := successfulStorageCopyReceipt(directive)
 	if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt}); err == nil {
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}); err == nil {
 		t.Fatal("a late copy receipt completed an aborted clone")
 	}
 	// The name is free for a new clone.
