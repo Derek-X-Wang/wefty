@@ -135,12 +135,16 @@ type ComputerStorageCopyDirective struct {
 
 type ComputerStorageCopyReceipt = contract.ComputerStorageCopyReceipt
 
+// ComputerStorageCopyAcknowledgementRequest has two shapes. The usual one
+// carries the copy Receipt. A restore that keeps its old generation as a Backup
+// and finds that Backup failed or absent never copies: it carries only the
+// OldBackupReceipt, and a nil Receipt is that shape (#1717).
 type ComputerStorageCopyAcknowledgementRequest struct {
-	NodeID           string                     `json:"node_id"`
-	BootSessionID    string                     `json:"boot_session_id"`
-	IdempotencyKey   string                     `json:"idempotency_key"`
-	Receipt          ComputerStorageCopyReceipt `json:"receipt"`
-	OldBackupReceipt *ComputerBackupCopyReceipt `json:"old_backup_receipt,omitempty"`
+	NodeID           string                      `json:"node_id"`
+	BootSessionID    string                      `json:"boot_session_id"`
+	IdempotencyKey   string                      `json:"idempotency_key"`
+	Receipt          *ComputerStorageCopyReceipt `json:"receipt,omitempty"`
+	OldBackupReceipt *ComputerBackupCopyReceipt  `json:"old_backup_receipt,omitempty"`
 }
 
 const (
@@ -1180,7 +1184,8 @@ func closeTerminalComputerCopy(ctx context.Context, tx *sql.Tx, row computerStor
 }
 
 func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest) (Computer, error) {
-	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
+	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" ||
+		(request.Receipt == nil && request.OldBackupReceipt == nil) {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer Storage copy acknowledgement fields are required")
 	}
 	write, err := s.beginWriteTransaction(ctx, nil)
@@ -1237,7 +1242,11 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 			"failure_code": request.OldBackupReceipt.FailureCode,
 		}, "restore predecessor Backup copy failed; the old generation remains current")
 	}
-	if err := validateStorageCopyReceipt(row, request.Receipt); err != nil {
+	if request.Receipt == nil {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest,
+			"only a failed restore predecessor Backup is acknowledged without a Computer Storage copy receipt")
+	}
+	if err := validateStorageCopyReceipt(row, *request.Receipt); err != nil {
 		return Computer{}, err
 	}
 	if err := validateOldBackupReceipt(row, request.OldBackupReceipt); err != nil {
@@ -1330,8 +1339,8 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 		destinationComputerID, operationRevision).Scan(&receiptJSON, &oldReceiptJSON); err != nil {
 		return Computer{}, internalError(err, "read Computer Storage copy verification evidence")
 	}
-	var request ComputerStorageCopyAcknowledgementRequest
-	if err := json.Unmarshal(receiptJSON, &request.Receipt); err != nil {
+	request := ComputerStorageCopyAcknowledgementRequest{Receipt: &ComputerStorageCopyReceipt{}}
+	if err := json.Unmarshal(receiptJSON, request.Receipt); err != nil {
 		return Computer{}, internalError(err, "decode Computer Storage copy verification evidence")
 	}
 	if oldReceiptJSON.Valid {

@@ -185,7 +185,7 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 		mutate(&tampered)
 		if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 			operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
-				BootSessionID: node.BootSessionID, IdempotencyKey: "tampered", Receipt: tampered}); errorCode(err) != contract.ErrorStorageReferenceConflict {
+				BootSessionID: node.BootSessionID, IdempotencyKey: "tampered", Receipt: &tampered}); errorCode(err) != contract.ErrorStorageReferenceConflict {
 			t.Fatalf("tampered Custody import receipt row %d = %v", index, err)
 		}
 	}
@@ -203,7 +203,7 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 	}
 	imported, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil || imported.ComputerID == source.ComputerID || imported.StorageID == source.StorageID ||
 		len(imported.Grants) != 0 || imported.DesiredState != contract.ServiceDesiredStopped {
 		t.Fatalf("verified Custody import = %#v err=%v", imported, err)
@@ -248,7 +248,7 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 	cloneReceipt := successfulStorageCopyReceipt(copyDirectives[0])
 	clone, err = h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: cloneReceipt.ReceiptID, Receipt: cloneReceipt})
+			IdempotencyKey: cloneReceipt.ReceiptID, Receipt: &cloneReceipt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,13 +704,13 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	failure.DestinationAbsent = true
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure}); err == nil {
+			BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: &failure}); err == nil {
 		t.Fatal("receipt-selected clone validator bypassed the stored import verb")
 	}
 	failure.Operation = "import"
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID,
-			BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure}); err != nil {
+			BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: &failure}); err != nil {
 		t.Fatal(err)
 	}
 	var status string
@@ -864,7 +864,7 @@ func TestCustodyImportSurvivesExportingDatabaseLossAndUsesCurrentDestinationRoot
 	receipt := successfulStorageCopyReceipt(directives[0])
 	imported, err := destination.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-import-node",
 		operation.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: destinationNode.NodeID,
-			BootSessionID: destinationNode.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			BootSessionID: destinationNode.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil {
 		t.Fatal(err)
 	}

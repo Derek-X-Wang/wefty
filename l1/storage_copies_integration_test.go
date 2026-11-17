@@ -275,14 +275,14 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 		receipt := refusedStorageCopyReceipt(directive, code, observedAvailableBytes)
 		if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 			ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-				IdempotencyKey: "integrity-" + code, Receipt: receipt}); errorCode(err) != contract.ErrorInvalidRequest {
+				IdempotencyKey: "integrity-" + code, Receipt: &receipt}); errorCode(err) != contract.ErrorInvalidRequest {
 			t.Fatalf("clone failure code %q error = %v, want invalid_request", code, err)
 		}
 	}
 	receipt := refusedStorageCopyReceipt(directive, "insufficient_disk", observedAvailableBytes)
 	refused, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil || refused.ReconfigurationPhase != ComputerReconfigurationStable || refused.ReconfigurationRevision != nil ||
 		refused.AppliedRevision != 1 || refused.DesiredState != contract.ServiceDesiredStopped ||
 		refused.CurrentJob.State != contract.JobFailed {
@@ -315,13 +315,13 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 	}
 	replayed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil || replayed.AppliedRevision != 1 || replayed.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("refused clone replay = %#v err=%v", replayed, err)
 	}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: "late-success", Receipt: successfulStorageCopyReceipt(directive)}); err == nil {
+			IdempotencyKey: "late-success", Receipt: new(successfulStorageCopyReceipt(directive))}); err == nil {
 		t.Fatal("late verified receipt was accepted after a terminal clone refusal")
 	}
 	unchanged, err := testReads(h.store).GetComputer(context.Background(), sourceComputer.ComputerID)
@@ -349,7 +349,7 @@ func TestRefusedComputerCloneCannotStartAnEmptyReplacementDisk(t *testing.T) {
 	receipt := refusedStorageCopyReceipt(directives[0], "insufficient_disk", 25112510464)
 	refused, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +485,7 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 	oldReceipt := successfulOldGenerationBackupReceipt(directives[0])
 	published, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt, OldBackupReceipt: &oldReceipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt, OldBackupReceipt: &oldReceipt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +625,7 @@ func TestComputerCloneCreatesNewStoppedIdentityWithoutGrantsAndExpands(t *testin
 	receipt := successfulStorageCopyReceipt(directives[0])
 	completed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil || completed.ReconfigurationPhase != ComputerReconfigurationStable || completed.AppliedRevision != 1 ||
 		completed.DesiredState != contract.ServiceDesiredStopped || len(completed.Grants) != 0 {
 		t.Fatalf("completed clone = %#v err=%v", completed, err)
@@ -675,7 +675,7 @@ func TestComputerCloneCustodyRemovalReducesThenCoordinatedRemovalVerifies(t *tes
 	receipt := successfulStorageCopyReceipt(directives[0])
 	clone, err = h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,7 +772,7 @@ func TestComputerStorageCopyReceiptMutationRowsFailTwentyOfTwenty(t *testing.T) 
 		mutate(&receipt)
 		if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID,
 			ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-				IdempotencyKey: "negative", Receipt: receipt}); err == nil {
+				IdempotencyKey: "negative", Receipt: &receipt}); err == nil {
 			t.Errorf("negative receipt row %d was accepted", index)
 		}
 	}
@@ -896,7 +896,7 @@ func TestComputerStorageCopyAcknowledgementRequiresBoundNodeSessionAndRoot(t *te
 	}
 	receipt := successfulStorageCopyReceipt(directives[0])
 	request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-		IdempotencyKey: receipt.ReceiptID, Receipt: receipt}
+		IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "different-fabric-node", clone.ComputerID, request); err == nil {
 		t.Fatal("different Fabric node acknowledged Computer Storage copy")
 	}
@@ -905,14 +905,50 @@ func TestComputerStorageCopyAcknowledgementRequiresBoundNodeSessionAndRoot(t *te
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID, wrongBoot); err == nil {
 		t.Fatal("stale boot session acknowledged Computer Storage copy")
 	}
+	staleRoot := receipt
+	staleRoot.RootInstanceID = "stale-root"
 	wrongRoot := request
-	wrongRoot.Receipt.RootInstanceID = "stale-root"
+	wrongRoot.Receipt = &staleRoot
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID, wrongRoot); err == nil {
 		t.Fatal("stale managed-root instance acknowledged Computer Storage copy")
 	}
 	completed, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", clone.ComputerID, request)
 	if err != nil || completed.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("current bound acknowledgement = %#v err=%v", completed, err)
+	}
+}
+
+// The agent acknowledges a failed old-generation Backup without a copy
+// receipt, because it never copied (#1717). L1 aborts the restore on that
+// shape. A body with no receipt at all, or with no copy receipt beside a
+// verified old-generation Backup, is refused as incomplete.
+func TestRestorePredecessorFailureShapeCarriesNoCopyReceipt(t *testing.T) {
+	ctx := context.Background()
+	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 3)
+	directive := beginRevokedRestore(t, h, node, computer, backup, "predecessor-shape")
+	acknowledge := func(old *ComputerBackupCopyReceipt) error {
+		_, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
+			ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+				IdempotencyKey: "predecessor-shape", OldBackupReceipt: old})
+		return err
+	}
+	if err := acknowledge(nil); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("acknowledgement without any receipt = %v, want invalid_request", err)
+	}
+	verified := successfulOldGenerationBackupReceipt(directive)
+	if err := acknowledge(&verified); errorCode(err) != contract.ErrorInvalidRequest {
+		t.Fatalf("verified predecessor Backup without a copy receipt = %v, want invalid_request", err)
+	}
+	failed := verified
+	failed.Kind, failed.ContentDigest, failed.FailureCode, failed.CopyAbsent =
+		computerBackupFailureReceiptKind, "", string(ComputerBackupFailureInsufficientDisk), true
+	if err := acknowledge(&failed); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("failed predecessor Backup without a copy receipt = %v, want the typed abort", err)
+	}
+	stable, err := testReads(h.store).GetComputer(ctx, computer.ComputerID)
+	if err != nil || stable.ReconfigurationPhase != ComputerReconfigurationStable ||
+		stable.StorageGeneration != computer.StorageGeneration {
+		t.Fatalf("aborted restore left Computer = %#v err=%v", stable, err)
 	}
 }
 
@@ -939,7 +975,7 @@ func TestComputerRestoreRejectsFailedPredecessorBackupBeforeSwitchover(t *testin
 	oldReceipt.CopyAbsent = true
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: copyReceipt.ReceiptID, Receipt: copyReceipt, OldBackupReceipt: &oldReceipt}); errorCode(err) != contract.ErrorConflict {
+			IdempotencyKey: copyReceipt.ReceiptID, Receipt: &copyReceipt, OldBackupReceipt: &oldReceipt}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("failed predecessor receipt error = %v, want typed conflict", err)
 	}
 	unchanged, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
@@ -981,7 +1017,7 @@ func TestRestorePublicationRequiresDurableRetriedAuthorityRevocation(t *testing.
 		t.Fatalf("legacy timestamp-only revocation admitted helper directive = %#v err=%v", directives, err)
 	}
 	request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-		IdempotencyKey: receipt.ReceiptID, Receipt: receipt}
+		IdempotencyKey: receipt.ReceiptID, Receipt: &receipt}
 	if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("publication without durable revocation = %v", err)
 	}
@@ -1141,7 +1177,7 @@ func TestRestoreRevocationUpgradesOnlyActiveLegacyEvidence(t *testing.T) {
 			replacement.TokenRevocation.CommittedAt = h.clock.Now().Add(-2 * time.Minute)
 			if mode == "legacy" {
 				request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-					IdempotencyKey: "legacy-blocked", Receipt: successfulStorageCopyReceipt(directives[0])}
+					IdempotencyKey: "legacy-blocked", Receipt: new(successfulStorageCopyReceipt(directives[0]))}
 				if _, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 					t.Fatalf("legacy publication=%v", err)
 				}
@@ -1217,7 +1253,7 @@ func TestRestoreRevocationUpgradesOnlyActiveLegacyEvidence(t *testing.T) {
 				t.Fatalf("bound receipt still pending=%#v err=%v", pending, err)
 			}
 			request := ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-				IdempotencyKey: "legacy-blocked", Receipt: successfulStorageCopyReceipt(directives[0])}
+				IdempotencyKey: "legacy-blocked", Receipt: new(successfulStorageCopyReceipt(directives[0]))}
 			if published, err := h.store.AcknowledgeComputerStorageCopy(context.Background(), "fabric-computer-node", computer.ComputerID, request); err != nil || published.StorageGeneration != computer.StorageGeneration+1 {
 				t.Fatalf("upgraded publication=%#v err=%v", published, err)
 			}

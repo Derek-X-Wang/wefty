@@ -300,7 +300,7 @@ func TestRemovalSkipsPredecessorCopyProvenAbsentByReceipt(t *testing.T) {
 		string(ComputerBackupFailureInsufficientDisk), true, ""
 	if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: "predecessor-failed", Receipt: successfulStorageCopyReceipt(directive), OldBackupReceipt: &receipt}); errorCode(err) != contract.ErrorConflict {
+			IdempotencyKey: "predecessor-failed", Receipt: new(successfulStorageCopyReceipt(directive)), OldBackupReceipt: &receipt}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("predecessor failure receipt = %v", err)
 	}
 	stable, err := h.store.GetComputer(ctx, computer.ComputerID)
@@ -333,7 +333,7 @@ func TestStorageOperationFailureBudgetEndsPublishedRestoreCleanupOwed(t *testing
 	oldReceipt := successfulOldGenerationBackupReceipt(directive)
 	if _, err := h.store.AcknowledgeComputerStorageCopy(ctx, "fabric-computer-node", computer.ComputerID,
 		ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
-			IdempotencyKey: receipt.ReceiptID, Receipt: receipt, OldBackupReceipt: &oldReceipt}); err != nil {
+			IdempotencyKey: receipt.ReceiptID, Receipt: &receipt, OldBackupReceipt: &oldReceipt}); err != nil {
 		t.Fatal(err)
 	}
 	reporter := newFailureReporter(t, h, node, computer.ComputerID, ComputerStorageOperationRestore,

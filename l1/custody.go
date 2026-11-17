@@ -866,7 +866,10 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 	if err := validateBackupAcknowledgementAuthority(ctx, tx, identityNodeID, request.NodeID, row.BoundNodeID, row.RootInstanceID); err != nil {
 		return Computer{}, err
 	}
-	receipt := request.Receipt
+	if request.Receipt == nil {
+		return Computer{}, protocolError(contract.ErrorInvalidRequest, "Custody import acknowledgement requires its copy receipt")
+	}
+	receipt := *request.Receipt
 	if err := validateStorageCopyReceipt(row, receipt); err != nil {
 		return Computer{}, err
 	}
