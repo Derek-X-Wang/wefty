@@ -65,6 +65,10 @@ join code from the control plane.
 
 ## 0. Before you start
 
+The README section [Before you install](../../README.md#before-you-install)
+lists what each machine needs and how wefty checks it. This section gives the
+steps.
+
 ### 0.1 Network account and policy
 
 1. **Where:** the admin console of your private network provider. Sign in
