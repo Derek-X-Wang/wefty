@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	goversion "go/version"
 	"io"
 	"io/fs"
 	"net/http"
@@ -231,6 +232,9 @@ func upgradeOperations(host setupHost) upgradeHost {
 			if err != nil {
 				return err
 			}
+			if err := checkUpgradeGo(ctx, operations, source, destination, goBinary, upgradeBuildEnvironment(loginPATH)); err != nil {
+				return err
+			}
 			_, err = operations.command(ctx, source, upgradeBuildEnvironment(loginPATH), goBinary, "build", "-trimpath", "-ldflags=-X main.version="+commit, "-o", destination+string(filepath.Separator), "./cmd/wefty", "./cmd/wefty-l1", "./cmd/wefty-l3", "./cmd/wefty-agent")
 			return err
 		}
@@ -289,6 +293,50 @@ func findUpgradeTool(loginPATH, name string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%s is missing from the node agent's recorded login-shell PATH; run wefty setup after installing it", name)
+}
+
+// checkUpgradeGo refuses before the build when the recorded go cannot build
+// the fetched source's go.mod version (#1727). An older go still passes when
+// its GOTOOLCHAIN policy (auto, the default, or path) lets the build switch
+// toolchains itself; only a policy that forbids the switch, such as local or
+// a pinned older version, refuses.
+func checkUpgradeGo(ctx context.Context, operations upgradeHost, source, directory, goBinary string, environment []string) error {
+	payload, err := os.ReadFile(filepath.Join(source, "go.mod"))
+	if err != nil {
+		return fmt.Errorf("read the source's go.mod: %w", err)
+	}
+	need := ""
+	for _, line := range strings.Split(string(payload), "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == "go" {
+			need = "go" + fields[1]
+			break
+		}
+	}
+	if !goversion.IsValid(need) {
+		return errors.New("the source's go.mod names no valid go version")
+	}
+	// Run outside the source, so its go.mod cannot switch toolchains here.
+	output, err := operations.command(ctx, directory, environment, goBinary, "env", "-json", "GOVERSION", "GOTOOLCHAIN")
+	if err != nil {
+		return err
+	}
+	var goEnv struct{ GOVERSION, GOTOOLCHAIN string }
+	if err := json.Unmarshal(output, &goEnv); err != nil {
+		return fmt.Errorf("read go env output: %w", err)
+	}
+	have, _, _ := strings.Cut(goEnv.GOVERSION, " ")
+	// A development toolchain has no comparable version; the build decides.
+	if !goversion.IsValid(have) || goversion.Compare(have, need) >= 0 {
+		return nil
+	}
+	mode := goEnv.GOTOOLCHAIN
+	if _, suffix, found := strings.Cut(mode, "+"); found {
+		mode = suffix
+	}
+	if mode == "auto" || mode == "path" {
+		return nil
+	}
+	return fmt.Errorf("this commit needs Go %s, but the go on the node agent's recorded login-shell PATH is %s and GOTOOLCHAIN=%s does not allow another toolchain; install Go %s or newer there, or allow GOTOOLCHAIN=auto, then rerun wefty upgrade", strings.TrimPrefix(need, "go"), strings.TrimPrefix(have, "go"), goEnv.GOTOOLCHAIN, strings.TrimPrefix(need, "go"))
 }
 
 func runUpgradeCommand(ctx context.Context, directory string, environment []string, name string, args ...string) ([]byte, error) {

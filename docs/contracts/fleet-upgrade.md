@@ -27,6 +27,13 @@ before recovery, source cleanup, or preparation. It uses the existing owned
 `upgrade-source.git`, exact main export (or the pinned commit on main), confined staging, build environment,
 version checks and bounded preparation. Binaries come only from that export.
 The recorded node-agent login PATH supplies the build tools and service PATH.
+Before the build, upgrade reads the `go` version in the export's `go.mod` and
+runs `go env` outside the export. If that go is older and its `GOTOOLCHAIN`
+policy forbids another toolchain (`local`, or a version without `+auto` or
+`+path`), upgrade refuses with the needed Go version. Nothing is built, drained
+or stopped, and the installed stack stays unchanged. With `auto` (the default)
+or `path`, the build switches toolchains itself, so the check passes. Plain
+upgrade runs the same check.
 
 | Role | Built and version-checked binaries | Local activation order | Database preflight |
 | --- | --- | --- | --- |

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -624,5 +625,41 @@ func TestFleetDoctorMissingGitStillFails(t *testing.T) {
 		if finding.Check == "tool:git" && finding.Severity != "error" {
 			t.Fatalf("git severity changed: %+v", finding)
 		}
+	}
+}
+
+// Doctor shows the tools in two groups: what wefty needs (git, an error) and
+// tools for the owner's work (advisory warnings). Severities stay (#1727).
+func TestFleetDoctorGroupsWeftyAndWorkTools(t *testing.T) {
+	f := healthyDoctorFixture(t, serviceplan.Join)
+	if err := os.Remove(filepath.Join(f.home, "tools", "codex")); err != nil {
+		t.Fatal(err)
+	}
+	paths, _ := resolveSetupPaths(f.home)
+	report, err := runFleetDoctor(t.Context(), f.host, globalOptions{}, paths, serviceplan.Join)
+	if err != nil || !report.Healthy {
+		t.Fatalf("an advisory tool changed the verdict: healthy=%v err=%v", report.Healthy, err)
+	}
+	var out bytes.Buffer
+	if err := writeDoctorReport(&out, report, false); err != nil {
+		t.Fatal(err)
+	}
+	var tools []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, "tool:") || strings.HasPrefix(line, "  Fix: install codex") {
+			tools = append(tools, line)
+		}
+	}
+	want := []string{
+		"tool:git\tok\twefty needs this tool: found on the node agent's recorded login-shell PATH",
+		"tool:go\tok\ttool for your work (advisory; wefty upgrade also builds with it): found on the node agent's recorded login-shell PATH",
+		"tool:node\tok\ttool for your work (advisory): found on the node agent's recorded login-shell PATH",
+		"tool:gh\tok\ttool for your work (advisory): found on the node agent's recorded login-shell PATH",
+		"tool:claude\tok\ttool for your work (advisory): found on the node agent's recorded login-shell PATH",
+		"tool:codex\twarning\ttool for your work (advisory): missing from the node agent's recorded login-shell PATH",
+		"  Fix: install codex or add it to the login-shell PATH, then rerun setup",
+	}
+	if !slices.Equal(tools, want) {
+		t.Fatalf("tool groups:\n%s\nwant:\n%s", strings.Join(tools, "\n"), strings.Join(want, "\n"))
 	}
 }

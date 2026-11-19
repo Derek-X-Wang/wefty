@@ -54,7 +54,12 @@ host warnings are advisory: they retain their warning severity and fix advice,
 but do not change `healthy` or the exit code. A missing optional tool (`go`,
 `node`, `gh`, `claude` or `codex`) on the recorded PATH is advisory in the same
 way, so a machine that runs only scripts or OCI work can be healthy. Missing
-`git` stays an error. Other findings retain their existing severity and effect.
+`git` stays an error. The tool findings show two groups, `git` first: its
+detail starts with `wefty needs this tool`, because `wefty exec` and
+`wefty upgrade` use it. The other details start with `tool for your work
+(advisory)`; the `go` detail adds that `wefty upgrade` also builds with it.
+Check names stay `tool:NAME`. Plain doctor text keeps its original bytes.
+Other findings retain their existing severity and effect.
 
 ## Report and exits
 
