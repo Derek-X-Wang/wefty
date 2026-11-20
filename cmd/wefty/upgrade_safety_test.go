@@ -189,6 +189,7 @@ func TestUpgradeBuildUsesHostEnvironment(t *testing.T) {
 	t.Setenv("GOFLAGS", "-race")
 	t.Setenv("CGO_ENABLED", "1")
 	f := newUpgradeFixture(t)
+	addUpgradeFixtureGoMod(t, f)
 	tools := t.TempDir()
 	goPath := filepath.Join(tools, "go")
 	if err := os.WriteFile(goPath, []byte("#!/bin/sh\nexit 99\n"), 0755); err != nil {
@@ -203,6 +204,9 @@ func TestUpgradeBuildUsesHostEnvironment(t *testing.T) {
 	called := false
 	f.operations.build = nil
 	f.operations.command = func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
+		if name == goPath && args[0] == "env" {
+			return []byte(upgradeFixtureGoEnv), nil
+		}
 		if name == goPath {
 			called = true
 			values := map[string]string{}
