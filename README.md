@@ -42,7 +42,7 @@ needs.
 | 1. Run wefty | The wefty binaries | You build them; `wefty setup` copies them into place | Setup refuses when one is missing |
 | 1. Run wefty | launchd (macOS), or systemd 242 or newer (Linux) | The operating system | Linux setup refuses an older or unknown systemd |
 | 1. Run wefty | git, when the machine sends or runs `wefty exec` work | You | Doctor error |
-| 2. Build or upgrade | Go at the `go` version in `go.mod` | You | Doctor warning; a failed upgrade build leaves the installed stack unchanged |
+| 2. Build or upgrade | Go at the `go` version in `go.mod` | You | Doctor warning; before it builds, upgrade refuses an older Go that `GOTOOLCHAIN` does not let switch versions, and the installed stack stays unchanged |
 | 2. Build or upgrade | git | You | Doctor error |
 | 2. Build or upgrade | Access to github.com | You | Not checked; a failed upgrade fetch leaves the installed stack unchanged |
 | 3. Your own work | go, node, gh, claude, codex, and other tools your agents use | You | Doctor warning only; wefty does not need them |
