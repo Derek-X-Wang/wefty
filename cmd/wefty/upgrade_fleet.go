@@ -166,6 +166,9 @@ func fleetUpgradeOperations(host setupHost, paths setupPaths, p connprofile.Prof
 			if err != nil {
 				return err
 			}
+			if err := checkUpgradeGo(ctx, op, source, dest, tool, upgradeBuildEnvironment(loginPATH)); err != nil {
+				return err
+			}
 			args := []string{"build", "-trimpath", "-ldflags=-X main.version=" + commit, "-o", dest + string(filepath.Separator)}
 			for _, name := range fleetUpgradeBinaries(plan) {
 				args = append(args, "./cmd/"+name)

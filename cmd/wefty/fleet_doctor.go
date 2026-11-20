@@ -263,13 +263,24 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 		add("node-agent-PATH", "error", "cannot read the node agent's recorded login-shell PATH", "rerun setup to capture the login-shell PATH")
 	} else {
 		add("node-agent-PATH", "ok", "recorded login-shell PATH is present", "")
-		for _, tool := range []string{"go", "git", "node", "gh", "claude", "codex"} {
+		// Two groups (#1727): wefty itself needs git, because `wefty exec`
+		// captures and restores work with it and `wefty upgrade` fetches
+		// with it. The other tools serve the owner's work.
+		for _, tool := range []string{"git", "go", "node", "gh", "claude", "codex"} {
 			severity, detail := "ok", "found on the node agent's recorded login-shell PATH"
 			if !doctorFindTool(loginPATH, paths.data, tool) {
 				severity, detail = "warning", "missing from the node agent's recorded login-shell PATH"
 				if tool == "git" {
 					severity = "error"
 				}
+			}
+			switch tool {
+			case "git":
+				detail = "wefty needs this tool: " + detail
+			case "go":
+				detail = "tool for your work (advisory; wefty upgrade also builds with it): " + detail
+			default:
+				detail = "tool for your work (advisory): " + detail
 			}
 			healthy := report.Healthy
 			add("tool:"+tool, severity, detail, "install "+tool+" or add it to the login-shell PATH, then rerun setup")

@@ -478,6 +478,7 @@ func TestUpgradeRenewalRequiresHeartbeatAndAttemptLeaseAfterRestarts(t *testing.
 
 func TestUpgradeUsesRecordedGoAndCommitBuildFlags(t *testing.T) {
 	f := newUpgradeFixture(t)
+	addUpgradeFixtureGoMod(t, f)
 	toolRoot := t.TempDir()
 	goPath := filepath.Join(toolRoot, "go")
 	if err := os.WriteFile(goPath, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
@@ -497,6 +498,9 @@ func TestUpgradeUsesRecordedGoAndCommitBuildFlags(t *testing.T) {
 	f.operations.build = nil
 	called := false
 	f.operations.command = func(ctx context.Context, directory string, environment []string, name string, args ...string) ([]byte, error) {
+		if name == goPath && args[0] == "env" {
+			return []byte(upgradeFixtureGoEnv), nil
+		}
 		if name == goPath {
 			called = true
 			if !slices.Contains(args, "-ldflags=-X main.version="+f.commit) || !slices.Contains(args, "./cmd/wefty-agent") || !slices.Contains(args, "./cmd/wefty-l3") || !slices.Contains(args, "./cmd/wefty-l1") || !slices.Contains(args, "./cmd/wefty") {

@@ -139,6 +139,7 @@ func newFleetUpgradeFixture(t *testing.T, role serviceplan.Role) *upgradeFixture
 	}
 	// Test the selected build command by forcing the real build planner through
 	// the command seam. No Go compiler, network or real service is invoked.
+	addUpgradeFixtureGoMod(t, f)
 	f.operations.build = nil
 	command := f.operations.command
 	f.operations.command = func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
@@ -161,12 +162,12 @@ func newFleetUpgradeFixture(t *testing.T, role serviceplan.Role) *upgradeFixture
 		}
 		return command(ctx, dir, env, name, args...)
 	}
-	// Supply a harmless Go executable solely for findUpgradeTool.
+	// Supply a harmless Go executable for findUpgradeTool and the Go version check.
 	goPath := filepath.Join(f.home, "tools")
 	if err := os.Mkdir(goPath, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(goPath, "go"), []byte("#!/bin/sh\nexit 99\n"), 0755); err != nil {
+	if err := os.WriteFile(filepath.Join(goPath, "go"), []byte("#!/bin/sh\n[ \"$1\" = env ] && echo '"+upgradeFixtureGoEnv+"' && exit 0\nexit 99\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	plistPath := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
