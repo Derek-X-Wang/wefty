@@ -30,6 +30,40 @@ directly to nodes, and L1 remains the only job queue. See the
 [v1 design](docs/2026-08-06-wefty-v1-design.md) for the architecture and build
 order.
 
+## Before you install
+
+Wefty installs only its own binaries. You, or your AI agent, install
+everything else. The table puts each item in one of three layers: what wefty
+needs to run, what wefty needs to build or upgrade, and what your own work
+needs.
+
+| Layer | Item | Who installs it | How wefty checks it |
+| --- | --- | --- | --- |
+| 1. Run wefty | The wefty binaries | You build them; `wefty setup` copies them into place | Setup refuses when one is missing |
+| 1. Run wefty | launchd (macOS), or systemd 242 or newer (Linux) | The operating system | Linux setup refuses an older or unknown systemd |
+| 1. Run wefty | git, when the machine sends or runs `wefty exec` work | You | Doctor error |
+| 2. Build or upgrade | Go at the `go` version in `go.mod` | You | Doctor warning; a failed upgrade build leaves the installed stack unchanged |
+| 2. Build or upgrade | git | You | Doctor error |
+| 2. Build or upgrade | Access to github.com | You | Not checked; a failed upgrade fetch leaves the installed stack unchanged |
+| 3. Your own work | go, node, gh, claude, codex, and other tools your agents use | You | Doctor warning only; wefty does not need them |
+
+- There are no releases yet. `wefty upgrade` fetches `main` from GitHub and
+  builds it on each machine, so every machine needs layer 2
+  ([#1726](https://github.com/Derek-X-Wang/wefty/issues/1726) tracks signed
+  releases). An older Go can download the needed version itself when
+  `GOTOOLCHAIN` allows it (`auto` is the default).
+- Doctor and upgrade look for tools on the node agent's recorded login-shell
+  `PATH`. After you install a tool, run `wefty setup` again.
+- Wefty checks these host settings but never changes them. On the fleet
+  control-plane Mac, doctor warns about system sleep and FileVault. On Linux,
+  doctor warns when lingering is off and prints the `loginctl enable-linger`
+  command.
+- A fleet also needs two steps in your private network account. Merge the
+  policy that `wefty doctor --print-policy` prints. Then make one single-use,
+  tagged key per participant, right before that machine's setup. The
+  [fleet cutover runbook](docs/runbooks/fleet-cutover.md#0-before-you-start)
+  gives each step.
+
 ## Daily installation: `wefty setup`
 
 For a **fresh fleet control-plane Mac or Linux machine**, build the four binaries
