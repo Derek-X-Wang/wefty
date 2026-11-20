@@ -153,7 +153,7 @@ cross-build for Linux works.
    ```
 
    **Success:** a commit hash. Write it down as `COMMIT`. The build needs the
-   Go version in `go.mod` (Go 1.27.3 or newer). Any machine that will later
+   Go version in `go.mod` (Go 1.27.4 or newer). Any machine that will later
    run `wefty upgrade` needs Go and git too, because upgrade builds from
    source.
 3. **Where:** the build machine. Build the four Mac binaries. This is the same

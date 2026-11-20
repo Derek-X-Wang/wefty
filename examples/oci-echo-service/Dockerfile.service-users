@@ -11,8 +11,8 @@
 # the user, so the build stage and the pinned roots below are the same ones
 # examples/oci-echo-service/Dockerfile uses, and a contract test holds them
 # together. Neither variant is a default target: always build with --target.
-# golang:1.27.3-alpine multi-platform index
-ARG GO_IMAGE=docker.io/library/golang@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb
+# golang:1.27.4-alpine multi-platform index
+ARG GO_IMAGE=docker.io/library/golang@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280
 ARG BUSYBOX_IMAGE=docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
 ARG SOURCE_DATE_EPOCH=0
 
