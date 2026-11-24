@@ -159,20 +159,10 @@ func TestForceForgetLeavesCleanupStandingForReturningNode(t *testing.T) {
 	}
 
 	harness.restartAgent(t)
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Lstat(serviceRoot); os.IsNotExist(err) {
-			break
-		}
-		if harness.agent.exited() {
-			t.Fatalf("returning agent exited before cleanup: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if _, err := os.Lstat(serviceRoot); !os.IsNotExist(err) {
-		t.Fatalf("returning node left force-forgotten managed root: %v", err)
-	}
-	deadline = time.Now().Add(5 * time.Second)
+	// The standing directive arrives on a heartbeat after registration. Wait for
+	// its acknowledgement with the same return-to-cleanup margin as the
+	// production-timing lane, rather than timing root deletion from process start.
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		status, body = harness.doJSON(t, http.MethodGet, "/v1/jobs/"+created.JobID+"?class=service", nil, &forgotten)
 		if status != http.StatusOK {
@@ -181,10 +171,16 @@ func TestForceForgetLeavesCleanupStandingForReturningNode(t *testing.T) {
 		if forgotten.Removal != nil && forgotten.Removal.CleanupAcknowledgedAt != nil {
 			break
 		}
+		if harness.agent.exited() {
+			t.Fatalf("returning agent exited before cleanup: %v\n%s", harness.agent.waitError(), harness.agent.outputString())
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if forgotten.State != contract.JobForgottenCleanupUnverified || forgotten.Removal == nil || forgotten.Removal.CleanupAcknowledgedAt == nil {
-		t.Fatalf("returning node did not attest force-forgotten cleanup: %#v", forgotten)
+		t.Fatalf("returning node did not attest force-forgotten cleanup: %#v\n%s", forgotten, harness.agent.outputString())
+	}
+	if _, err := os.Lstat(serviceRoot); !os.IsNotExist(err) {
+		t.Fatalf("returning node left force-forgotten managed root: %v\n%s", err, harness.agent.outputString())
 	}
 	assertWorkingDirectoryUntouched(t, harness.workingDirectories[created.JobID])
 }
